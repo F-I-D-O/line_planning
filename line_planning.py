@@ -109,7 +109,7 @@ class line_planning_solver:
 				coef.append(lines_cost[l])
 
 		print('Budget', self.line_instance.B)
-		budget_constraint = master.addConstr(LinExpr(coef,var), "<=", self.line_instance.B, name="budget_constraint")
+		budget_constraint = master.addConstr(LinExpr(coef, var) <= self.line_instance.B, name="budget_constraint")
 		master.update()
 		
 		#Define dual variables and constraints
@@ -411,7 +411,7 @@ if __name__ == "__main__":
 	time_ILP = 0
 	
 	max_frequency = 1
-	nb_l = 1000
+	nb_l = 10
 	#nb_p = 13847
 	#nb_p = 12301
 	nb_p = 13851
