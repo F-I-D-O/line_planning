@@ -17,7 +17,7 @@ class line_instance:
 	#instance_category = 'grid_network' allows to create line_instance from a grid_network and random OD matrix
 	#instance_category = 'random' allows to create a random instance without underlying network 
 	
-	def __init__(self,nb_lines, nb_pass, B, cost, max_length, min_length, proba, capacity, instance_category = 'random', n= None, nb_stops = None, detour_factor = None, min_start_end_distance = None, method = 0, granularity = 1, date=None):
+	def __init__(self,nb_lines, nb_pass, B, cost, max_length, min_length, proba, capacity, instance_category = 'random', n= None, nb_stops = None, detour_factor = None, min_start_end_distance = None, method = 0, granularity = 1, date=None, demand_file=None):
 		self.nb_lines = nb_lines * granularity #number of lines in the candidate set.
 		self. granularity = granularity
 		self.B = B #Budget for opening lines
@@ -31,6 +31,7 @@ class line_instance:
 		self.lengths_travel_times = None #used only for the manhattan instance
 		self.capacity = capacity
 		self.date = None
+		self.demand_file = demand_file
 
 		#random instance of the problem 
 		if instance_category == 'random': 
@@ -48,14 +49,17 @@ class line_instance:
 		if instance_category == 'manhattan':
 			if nb_lines != 10 and nb_lines != 100 and nb_lines != 1000 and nb_lines != 5000 and nb_lines!= 2000:
 				raise NameError('Not a valid number of lines')
-			if date == 'april':
-				self.nb_pass = 13851
-			elif date == 'march':
-				self.nb_pass = 12301
-			elif date == 'feb':
-				self.nb_pass = 13847
-			else:
-				raise NameError('Not a valid date')
+            if demand_file is not None:
+                self.nb_pass = len(np.loadtxt(demand_file))
+            else:
+                if date == 'april':
+                    self.nb_pass = 13851
+                elif date == 'march':
+                    self.nb_pass = 12301
+                elif date == 'feb':
+                    self.nb_pass = 13847
+                else:
+                    raise NameError('Not a valid date')
 			self.set_of_lines, self.pass_to_lines, self.values, self.lines_to_passengers, self.edge_to_passengers, self.candidate_set_of_lines, self.lengths_travel_times = self.manhattan_instance(nb_lines, detour_factor, date)
 		
 
@@ -468,7 +472,7 @@ class line_instance:
 		#my_list = [line.split(' ') for line in open('all_lines_nodes_{}.txt'.format(nb_lines))]
 		#my_list = [line.split(' ') for line in open('all_lines_nodes_{}_c3.txt'.format(nb_lines))]
 		#my_list = [line.split(' ') for line in open('all_lines_nodes_{}_c4.txt'.format(nb_lines))]
-		my_list = [line.split(' ') for line in open('all_lines_nodes_1000_c5.txt')]
+		my_list = [line.split(' ') for line in open('all_lines_nodes_{}_c5.txt'.format(nb_lines))]
 
 		candidate_set_of_lines = [[int(float(i.strip())) for i in my_list[j]] for j in range(len(my_list))]
 
@@ -750,9 +754,6 @@ class line_instance:
 
 	
 if __name__ == "__main__":
-
-	
-
 	f1 = open("manhattan_dist_1.txt", "r")
 	f2 = open("manhattan_dist_2.txt", "r")
 	f3 = open("manhattan_dist_3.txt", "r")
@@ -776,27 +777,22 @@ if __name__ == "__main__":
 	# calculate travel time (seconds) for all edges
 	G = ox.add_edge_travel_times(G)
 
-
-
 	f1 = open("bus_stop_number2.txt", "r")
 	stops_arr = np.loadtxt(f1)
 	stops_floats = stops_arr.tolist()
 	stops = [int(stops_floats[i]) for i in range(len(stops_floats))]
-
 
 	node_id = list(G.nodes())
 	
 	dic_id_to_index = {} #get node number (from 0 t0 4579) from node osmid
 	for i in range(len(node_id)):
 		dic_id_to_index[node_id[i]] = i
-
 	
 	nb_lines = 1000
 	min_length = 10
 	max_length = 30
 	min_start_end_distance = 200
 	detour_skeleton=2
-
 
 	all_lines, all_routes = line_inst.generate_lines_skeleton_manhattan(nb_lines, stops, min_length, max_length, distances, min_start_end_distance, detour_skeleton, G)
 	print('nb_lines_final', len(all_lines))
