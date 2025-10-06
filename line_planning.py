@@ -401,7 +401,7 @@ if __name__ == "__main__":
     # month = 'march'
     # month = 'feb'
     np.random.seed(127)
-    demand_file = "OD_matrix_april_fhv_10_percent.txt" # override the month setting and uses a custom demand file
+    demand_file = "OD_matrix_april_fhv_1_percent.txt" # override the month setting and uses a custom demand file
 
     average_value_LP = 0
     average_value_ILP = 0
@@ -410,10 +410,11 @@ if __name__ == "__main__":
     time_ILP = 0
 
     max_frequency = 1
-    nb_l = 100
+    nb_l = 10
     # nb_p = 13847
     # nb_p = 12301
-    nb_p = 13851
+    # nb_p = 13851
+    nb_p = 130
 
     Budget = 0
     line_inst = line_instance(
