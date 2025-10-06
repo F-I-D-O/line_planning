@@ -5,7 +5,6 @@ import time
 from copy import deepcopy
 
 
-
 EPS = 1.e-5
 allowed_time = 1200
 
@@ -398,112 +397,127 @@ class line_planning_solver:
 
 if __name__ == "__main__":
 
-	month = 'april'
-	#month = 'march'
-	#month = 'feb'
-	np.random.seed(127)
-	
+    month = "april"
+    # month = 'march'
+    # month = 'feb'
+    np.random.seed(127)
+    demand_file = "OD_matrix_april_fhv_10_percent.txt" # override the month setting and uses a custom demand file
 
-	average_value_LP = 0
-	average_value_ILP = 0 
-	obj_val = 0 
-	time_LP = 0
-	time_ILP = 0
-	
-	max_frequency = 1
-	nb_l = 10
-	#nb_p = 13847
-	#nb_p = 12301
-	nb_p = 13851
+    average_value_LP = 0
+    average_value_ILP = 0
+    obj_val = 0
+    time_LP = 0
+    time_ILP = 0
 
-	Budget = 0
-	line_inst = line_instance(nb_lines = nb_l, nb_pass = nb_p, B = 0.95 * Budget, cost=1, max_length = 15, min_length = 8, proba = 0.1, capacity = 30, instance_category = 'manhattan', detour_factor = 3, method = 3, granularity = 1 , date = month)
+    max_frequency = 1
+    nb_l = 100
+    # nb_p = 13847
+    # nb_p = 12301
+    nb_p = 13851
 
+    Budget = 0
+    line_inst = line_instance(
+        nb_lines=nb_l,
+        nb_pass=nb_p,
+        B=0.95 * Budget,
+        cost=1,
+        max_length=15,
+        min_length=8,
+        proba=0.1,
+        capacity=30,
+        instance_category="manhattan",
+        detour_factor=3,
+        method=3,
+        granularity=1,
+        date=month,
+		demand_file=demand_file,
+    )
 
+    for ind in range(0, 6):
+        if ind == 0:
+            Budget = 10000
+            max_frequency = 1
+            line_inst.B = Budget * 0.95
+        if ind == 1:
+            Budget = 20000
+            max_frequency = 1
+            line_inst.B = Budget * 0.95
+        if ind == 2:
+            Budget = 30000
+            max_frequency = 1
+            line_inst.B = Budget * 0.95
+        if ind == 3:
+            Budget = 40000
+            max_frequency = 1
+            line_inst.B = Budget * 0.95
+        if ind == 4:
+            Budget = 50000
+            max_frequency = 1
+            line_inst.B = Budget * 0.95
+        if ind == 5:
+            Budget = 100000
+            max_frequency = 1
+            line_inst.B = Budget * 0.95
+        if ind == 6:
+            Budget = 200000
+            max_frequency = 1
+            line_inst.B = Budget * 0.95
+        print("iter", ind, Budget, max_frequency)
 
-	for ind in range(0,6):
-		if ind == 0:
-			Budget = 10000
-			max_frequency = 1
-			line_inst.B =Budget * 0.95
-		if ind == 1:
-			Budget = 20000
-			max_frequency = 1
-			line_inst.B =Budget * 0.95
-		if ind == 2:
-			Budget = 30000
-			max_frequency = 1
-			line_inst.B =Budget * 0.95
-		if ind == 3:
-			Budget = 40000
-			max_frequency = 1
-			line_inst.B =Budget * 0.95
-		if ind == 4:
-			Budget = 50000
-			max_frequency = 1
-			line_inst.B =Budget * 0.95
-		if ind == 5:
-			Budget = 100000
-			max_frequency = 1
-			line_inst.B =Budget * 0.95
-		if ind == 6:
-			Budget = 200000
-			max_frequency = 1
-			line_inst.B =Budget * 0.95
-		print('iter', ind, Budget, max_frequency)
+        candidate_set_of_lines = line_inst.candidate_set_of_lines
+        print("candidate_set_of_lines")
+        solver = line_planning_solver(line_inst)
 
-		
+        print("LP")
+        solution, active_sets, sets, execution_time = solver.solve_master_LP()
+        time_LP += execution_time
+        best_value = 0
+        budg = 0
+        iter = 0
+        op = []
+        mean = 0
+        nb_respect = 0
+        v = None
+        pass_ass = None  # for sanity check
 
-		candidate_set_of_lines = line_inst.candidate_set_of_lines
-		print('candidate_set_of_lines')
-		solver = line_planning_solver(line_inst)
-		
-		
-		print('LP')
-		solution, active_sets, sets, execution_time = solver.solve_master_LP()
-		time_LP += execution_time
-		best_value = 0
-		budg = 0
-		iter = 0
-		op = []
-		mean = 0 
-		nb_respect = 0
-		v = None
-		pass_ass = None #for sanity check
+        # Do 10000 iterations of the rounfind process and keep the best one
+        while iter <= 10000:
+            used_budget, value, opened_lines, passenger_assignment, values = (
+                solver.rounding(solution, active_sets, sets)
+            )
+            if used_budget <= Budget:
+                if value > best_value:
+                    best_value = value
+                    budg = used_budget
+                    v = values
+                    pass_ass = passenger_assignment
+                    op = [
+                        [
+                            opened_lines[l] // max_frequency,
+                            opened_lines[l] % max_frequency,
+                        ]
+                        for l in range(len(opened_lines))
+                    ]  # contains [l,f_l] for the lines l opened with frequency f_l
+                mean += value
+                nb_respect += 1
+            iter += 1
+        average_value_LP += best_value
+        print("best value", best_value, "budget", budg)
+        print("nb_respect", nb_respect)
+        if nb_respect > 0:
+            print("opened", op)
+            for l in range(len(op)):
+                print("line", l, "nodes", candidate_set_of_lines[op[l][0]])
+            tot_assigned = 0
+            for p in range(len(values)):
+                if values[p] > 0:
+                    tot_assigned += 1
+            print("nb_assigned", tot_assigned)
 
-		#Do 10000 iterations of the rounfind process and keep the best one
-		while iter <= 10000:
-		    used_budget, value, opened_lines, passenger_assignment, values = solver.rounding(solution, active_sets, sets)
-		    if used_budget <= Budget:
-		        if value > best_value:
-		            best_value = value
-		            budg = used_budget
-		            v = values
-		            pass_ass = passenger_assignment
-		            op = [[opened_lines[l]//max_frequency,opened_lines[l]%max_frequency] for l in range(len(opened_lines))] #contains [l,f_l] for the lines l opened with frequency f_l
-		        mean += value
-		        nb_respect +=1
-		    iter += 1
-		average_value_LP += best_value
-		print('best value', best_value, 'budget', budg)
-		print('nb_respect', nb_respect)
-		if nb_respect > 0 :
-			print('opened', op)
-			for l in range(len(op)):
-				print('line', l, 'nodes', candidate_set_of_lines[op[l][0]])
-			tot_assigned = 0
-			for p in range(len(values)):
-				if values[p]>0: tot_assigned +=1
-			print('nb_assigned', tot_assigned)
-			
-		
+        try:
+            print("ILP")
+            solver.line_instance.B = Budget
+            obj_val, run_time_ILP = solver.solve_ILP()
 
-		try: 
-			print('ILP')
-			solver.line_instance.B = Budget
-			obj_val, run_time_ILP = solver.solve_ILP()
-
-		except:
-			print('error with ILP')
-			
-		
+        except:
+            print("error with ILP")
