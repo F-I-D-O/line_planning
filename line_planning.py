@@ -1,8 +1,11 @@
+import logging
 import numpy as np
 from gurobipy import *
 from instance import *
 import time
 from copy import deepcopy
+
+import log
 
 
 EPS = 1.e-5
@@ -335,7 +338,6 @@ class line_planning_solver:
         master.Params.Presolve =0
         master.Params.PreCrush = 1
         master.Params.Cuts = 0
-        master.Params.NoRelHeuristic = 0
 
 
         print('method', master.Params.Method)
@@ -401,7 +403,8 @@ if __name__ == "__main__":
     # month = 'march'
     # month = 'feb'
     np.random.seed(127)
-    demand_file = "OD_matrix_april_fhv_1_percent.txt" # override the month setting and uses a custom demand file
+    # demand_file = "OD_matrix_april_fhv_1_percent.txt" # override the month setting and uses a custom demand file
+    demand_file = None
 
     average_value_LP = 0
     average_value_ILP = 0
@@ -410,11 +413,11 @@ if __name__ == "__main__":
     time_ILP = 0
 
     max_frequency = 1
-    nb_l = 10
+    nb_l = 1000
     # nb_p = 13847
     # nb_p = 12301
-    # nb_p = 13851
-    nb_p = 130
+    nb_p = 13851
+    # nb_p = 130
 
     Budget = 0
     line_inst = line_instance(
@@ -434,7 +437,7 @@ if __name__ == "__main__":
         demand_file=demand_file,
     )
 
-    for ind in range(0, 6):
+    for ind in range(0, 1):
         if ind == 0:
             Budget = 10000
             max_frequency = 1
@@ -516,9 +519,8 @@ if __name__ == "__main__":
             print("nb_assigned", tot_assigned)
 
         try:
-            print("ILP")
+            logging.info("Solving the line planning problem with ILP")
             solver.line_instance.B = Budget
             obj_val, run_time_ILP = solver.solve_ILP()
-
-        except:
-            print("error with ILP")
+        except Exception as e:
+            logging.error("error with ILP: %s", e)
