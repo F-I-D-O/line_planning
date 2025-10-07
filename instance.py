@@ -413,7 +413,7 @@ class line_instance:
             lines_to_passengers.append([])
             edge_to_passengers.append([[] for k in range(length)])
             for p in range(self.nb_pass):
-                value, enter_node, exit_node = self.optimal_trip(passengers[p], candidate_set_of_lines[l], travel_times_on_lines[l], distances, detour_factor)
+                value, enter_node, exit_node = self.get_optimal_trip(passengers[p], candidate_set_of_lines[l], travel_times_on_lines[l], distances, detour_factor)
                 if value > 0:
                     pass_covered.append([p, [enter_node,exit_node], value])
                     pass_to_lines[p].append(l)
@@ -555,7 +555,7 @@ class line_instance:
             lines_to_passengers.append([])
             edge_to_passengers.append([[] for k in range(length)])
             for p in range(nb_pass):
-                value, enter_node, exit_node = self.optimal_trip(passengers[p], candidate_set_of_lines[l], travel_times_on_lines[l], distances, detour_factor)
+                value, enter_node, exit_node = self.get_optimal_trip(passengers[p], candidate_set_of_lines[l], travel_times_on_lines[l], distances, detour_factor)
                 if value > 0:
                     pass_covered.append([p, [enter_node,exit_node], value])
                     pass_to_lines[p].append(l)
@@ -688,23 +688,33 @@ class line_instance:
         # print('value', value)
         return value, enter_node, exit_node
 
-    def optimal_trip(self, passenger, line, travel_times_on_line, distances, detour_factor):
-        n = len(line)
-        start = passenger[0]
-        end = passenger[1]
-        t_car = distances[start][end]
+    def get_optimal_trip(self, passenger, line, travel_times_on_line, distances, detour_factor):
+        """
+        Return the optimal trip option for a given passenger on a given line (\omega_{\ell,p}).
+        passenger = [origin, destination]
+        line = [list of nodes in the line]
+        travel_times_on_line[i][j] contains the time to travel from node number i to node number j on the line
+        distances[i][j] distance matrix
+        detour_factor = maximum detour factor allowed
+        Return Mass transit pickup and drop off nodes, and other trip information
+        """
+        line_length = len(line)
+        origin = passenger[0]
+        destination = passenger[1]
+        shortest_travel_time = distances[origin][destination]
         t_bus = 0
         value = 0
         enter_node = -1
         exit_node = -1
-        # compute the value of the trip
-        for j in range(n-1):
-            for i in range(j+1,n):
-                t_trip_car = distances[start][line[j]] + distances[line[i]][end]
+
+        # compute the optimal trip option, consider all possible pairs of enter and exit nodes for MT
+        for j in range(line_length - 1):
+            for i in range(j + 1, line_length):
+                t_trip_car = distances[origin][line[j]] + distances[line[i]][destination]
                 t_trip_bus = travel_times_on_line[j][i]
                 t_total = t_trip_car + t_trip_bus
-                if ((t_car - t_trip_car > value and t_total <= detour_factor * t_car) or (t_car - t_trip_car == value and t_trip_bus < t_bus)):
-                    value = t_car - t_trip_car
+                if ((shortest_travel_time - t_trip_car > value and t_total <= detour_factor * shortest_travel_time) or (shortest_travel_time - t_trip_car == value and t_trip_bus < t_bus)):
+                    value = shortest_travel_time - t_trip_car
                     enter_node = j
                     exit_node = i
                     t_bus = t_trip_bus
