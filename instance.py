@@ -1,13 +1,27 @@
 import numpy as np
 import random
+import logging
 from graph_class import *
 from copy import deepcopy
+from collections import namedtuple
+from typing import NamedTuple, Optional, List
 
 # import osmnx as ox, geopandas as gpd
 
 import networkx as nx
 
+import log
+
 # ox.config(log_console=True, use_cache=True)
+
+
+class TripOption(NamedTuple):
+    value: float
+    mt_pickup_node: int
+    mt_drop_off_node: int
+    first_mile_cost: float
+    last_mile_cost: float
+    mt_cost: float
 
 class line_instance:
 
@@ -531,20 +545,26 @@ class line_instance:
 
         return set_of_lines, pass_to_lines, values, lines_to_passengers, edge_to_passengers, candidate_set_of_lines, lengths_travel_times
 
-    def preprocessing(self,candidate_set_of_lines, passengers, travel_times_on_lines, distances, detour_factor, nb_lines, nb_pass):
-
+    def preprocessing(
+        self,
+        candidate_set_of_lines,
+        passengers,
+        travel_times_on_lines,
+        distances,
+        detour_factor,
+        nb_lines,
+        nb_pass
+    ) -> (list, list, List[List[TripOption]], list, list):
+        logging.info('Preprocessing started')
         set_of_lines = []
-        pass_to_lines = []
+        pass_to_lines = [[] for _ in range(nb_pass)]
         value = 0
-        values = []
+
+        # optimal trip option for each passenger-line combination
+        optimal_trip_options: List[List[TripOption]] = [[] for _ in range(nb_pass)]
+
         lines_to_passengers = []
         edge_to_passengers = []
-
-        for i in range(nb_pass):
-            pass_to_lines.append([])
-            values.append([])
-
-        print('preprocessing')
 
         for l in range(nb_lines):
             if l%100==0:
@@ -555,20 +575,26 @@ class line_instance:
             lines_to_passengers.append([])
             edge_to_passengers.append([[] for k in range(length)])
             for p in range(nb_pass):
-                value, enter_node, exit_node = self.get_optimal_trip(passengers[p], candidate_set_of_lines[l], travel_times_on_lines[l], distances, detour_factor)
-                if value > 0:
-                    pass_covered.append([p, [enter_node,exit_node], value])
+                optimal_trip_option = self.get_optimal_trip(
+                    passengers[p],
+                    candidate_set_of_lines[l],
+                    travel_times_on_lines[l],
+                    distances,
+                    detour_factor
+                )
+                if optimal_trip_option.value > 0:
+                    pass_covered.append([p, [optimal_trip_option.mt_pickup_node,optimal_trip_option.mt_drop_off_node], optimal_trip_option.value])
                     pass_to_lines[p].append(l)
                     lines_to_passengers[l].append(p)
-                    for k in range(enter_node, exit_node):
+                    for k in range(optimal_trip_option.mt_pickup_node, optimal_trip_option.mt_drop_off_node):
                         edge_to_passengers[l][k].append(p)
 
-                values[p].append(value)
+                optimal_trip_options[p].append(optimal_trip_option)
             set_of_lines.append([length, pass_covered])
 
-        print('--------------------------------------')
+        logging.info('Preprocessing finished')
 
-        return set_of_lines, pass_to_lines, values, lines_to_passengers, edge_to_passengers
+        return set_of_lines, pass_to_lines, optimal_trip_options, lines_to_passengers, edge_to_passengers
 
     def preprocessing_real_time_routing(self,candidate_set_of_lines, passengers, travel_times_on_lines, distances, detour_factor, nb_lines, nb_pass, granularity, date):
 
@@ -688,7 +714,7 @@ class line_instance:
         # print('value', value)
         return value, enter_node, exit_node
 
-    def get_optimal_trip(self, passenger, line, travel_times_on_line, distances, detour_factor):
+    def get_optimal_trip(self, passenger, line, travel_times_on_line, distances, detour_factor) -> TripOption:
         """
         Return the optimal trip option for a given passenger on a given line (\omega_{\ell,p}).
         passenger = [origin, destination]
@@ -702,23 +728,25 @@ class line_instance:
         origin = passenger[0]
         destination = passenger[1]
         shortest_travel_time = distances[origin][destination]
-        t_bus = 0
-        value = 0
-        enter_node = -1
-        exit_node = -1
+
+        optimal_trip_option: TripOption = TripOption(0, -1, -1, 0, 0, 0)
 
         # compute the optimal trip option, consider all possible pairs of enter and exit nodes for MT
         for j in range(line_length - 1):
             for i in range(j + 1, line_length):
-                t_trip_car = distances[origin][line[j]] + distances[line[i]][destination]
-                t_trip_bus = travel_times_on_line[j][i]
-                t_total = t_trip_car + t_trip_bus
-                if ((shortest_travel_time - t_trip_car > value and t_total <= detour_factor * shortest_travel_time) or (shortest_travel_time - t_trip_car == value and t_trip_bus < t_bus)):
-                    value = shortest_travel_time - t_trip_car
-                    enter_node = j
-                    exit_node = i
-                    t_bus = t_trip_bus
-        return value, enter_node, exit_node
+                first_mile_travel_time = distances[origin][line[j]]
+                last_mile_travel_time = distances[line[i]][destination]
+                mod_travel_time = first_mile_travel_time + last_mile_travel_time
+                mt_travel_time = travel_times_on_line[j][i]
+                total_travel_time = mod_travel_time + mt_travel_time
+                value = shortest_travel_time - mod_travel_time
+                if (
+                    (value > optimal_trip_option.value and total_travel_time <= detour_factor * shortest_travel_time)
+                    or (value == optimal_trip_option.value and mt_travel_time < optimal_trip_option.mt_cost)
+                ):
+                    optimal_trip_option = TripOption(value, j, i, first_mile_travel_time, last_mile_travel_time, mt_travel_time)
+
+        return optimal_trip_option
 
     def compute_travel_times_on_lines(self, candidate_set_of_lines, distances):
         travel_times_on_lines = []
