@@ -68,7 +68,7 @@ class line_planning_solver:
         x = {}
         for l in range(len(lines_to_sets)):
             for s in lines_to_sets[l]:
-                total_set_value = sum([self.line_instance.values[p][l // max_frequency] for p in sets[s]])
+                total_set_value = sum([self.line_instance.optimal_trip_options[p][l // max_frequency].value for p in sets[s]])
                 x[l,s] = master.addVar(lb=0.0, ub=GRB.INFINITY, vtype=GRB.CONTINUOUS, obj = total_set_value, name="x[%d][%d]"%(l,s))
         master.update()
 
@@ -165,7 +165,7 @@ class line_planning_solver:
 
                     y = {}
                     for p in lines_to_passengers[l]:
-                        y[p] = single_line.addVar(obj=self.line_instance.values[p][l // max_frequency] - lamb[p], ub=1, vtype=GRB.BINARY, name="y[%d]"%p)
+                        y[p] = single_line.addVar(obj=self.line_instance.optimal_trip_options[p][l // max_frequency].value - lamb[p], ub=1, vtype=GRB.BINARY, name="y[%d]" % p)
                     single_line.update()
                     var = [y[p] for p in lines_to_passengers[l]]
 
@@ -206,7 +206,7 @@ class line_planning_solver:
                         col.addTerms(1, one_set_per_line[l])
                         col.addTerms(lines_cost[l], budget_constraint)
 
-                        total_set_value = sum([self.line_instance.values[p][l // max_frequency] for p in sets[s]])
+                        total_set_value = sum([self.line_instance.optimal_trip_options[p][l // max_frequency].value for p in sets[s]])
                         x[l,s] = master.addVar(lb=0.0, ub=GRB.INFINITY, vtype=GRB.CONTINUOUS, obj = total_set_value, name="x[%d][%d]"%(l,s), column = col)
                         t_update = time.time()
 
@@ -280,7 +280,7 @@ class line_planning_solver:
         x = {}
         for l in range(line_count_total):
             for p in range(request_count):
-                val = self.line_instance.values[p][l // max_frequency]
+                val = self.line_instance.optimal_trip_options[p][l // max_frequency].value
                 if val > 0:
                     x[l,p] = master.addVar(lb=0.0, ub=GRB.INFINITY, vtype=GRB.BINARY, obj = val, name="x[%d][%d]"%(l,p))
         master.update()
@@ -290,7 +290,7 @@ class line_planning_solver:
         for p in range(request_count):
             var = []
             for l in range(line_count_total):
-                val = self.line_instance.values[p][l // max_frequency]
+                val = self.line_instance.optimal_trip_options[p][l // max_frequency].value
                 if val > 0:
                     var.append(x[l,p])
             coef = [1 for j in range(len(var))]
@@ -346,12 +346,12 @@ class line_planning_solver:
 
         line_count_total = line_count * max_frequency
 
-        lines_cost = [
+        line_costs = [
             fixed_cost * self.line_instance.lengths_travel_times[l // max_frequency]
             + l
             % max_frequency
             * self.line_instance.lengths_travel_times[l // max_frequency]
-            for l in range(line_count * max_frequency)
+            for l in range(line_count_total)
         ]
 
         master = Model("Modified ILP") # master LP problem
@@ -359,30 +359,21 @@ class line_planning_solver:
 
         master.Params.timeLimit = allowed_time
 
-        # Line variables
-        y = {} # binary variable indicating if line l is opened
-        for l in range(line_count_total):
-            y[l] = master.addVar(lb=0.0, ub=GRB.INFINITY, vtype=GRB.BINARY, obj = 0, name="y[%d]"%l)
-        master.update()
+        # binary variables indicating if line l is opened
+        line_vars = master.addVars(line_count_total, vtype=GRB.BINARY, name="y")
 
-        # Passenger variables
-        x = {}
-        for l in range(line_count_total):
-            for p in range(request_count):
-                x[l,p] = master.addVar(lb=0.0, ub=GRB.INFINITY, vtype=GRB.BINARY, obj = 1, name="x[%d][%d]"%(l,p))
-        master.update()
+        # binary variables indicating if passenger p is assigned to line l
+        passenger_vars = master.addVars(line_count_total, request_count, vtype=GRB.BINARY, obj=1, name="x")
 
         # One line per passenger constraints
         one_line_per_passenger = {}
         for p in range(request_count):
             vars = []
             for l in range(line_count_total):
-                val = self.line_instance.values[p][l // max_frequency]
-                if val > 0:
-                    vars.append(x[l,p])
+                # val = self.line_instance.optimal_trip_options[p][l // max_frequency]
+                vars.append(passenger_vars[l,p])
             coefs = [1 for j in range(len(vars))]
             one_line_per_passenger[p] = master.addConstr(LinExpr(coefs,vars) <= 1, name="one_line_per_passenger[%d]"%p)
-        master.update()
 
         # Bus capacity constraints
         capacity_constraints = {}
@@ -393,16 +384,14 @@ class line_planning_solver:
                 vars = []
                 coefs = []
                 for p in self.line_instance.edge_to_passengers[l//max_frequency][k]:
-                    vars.append(x[l,p])
+                    vars.append(passenger_vars[l,p])
                     coefs.append(1)
-                capacity_constraints[l,k] = master.addConstr(LinExpr(coefs,vars) <= bus_capacity * f_l * y[l], name="capacity_constraints[%d][%d]"%(l,k))
-        master.update()
+                capacity_constraints[l,k] = master.addConstr(LinExpr(coefs,vars) <= bus_capacity * f_l * line_vars[l], name="capacity_constraints[%d][%d]"%(l,k))
 
         # Budget constraint
-        vars = [y[l] for l in range(line_count_total)]
-        coefs = [lines_cost[l] for l in range(line_count_total)]
-        budget_constraint = master.addConstr(LinExpr(coefs, vars) <= self.line_instance.B, name="budget_constraints")
-        master.update()
+        line_costs_expression = LinExpr(line_costs, line_vars)
+        mod_cost_expression = LinExpr(, passenger_vars)
+        master.addConstr(line_costs_expression + mod_cost_expression <= self.line_instance.B, name="budget_constraint")
 
         # Model parameters
         master.Params.Presolve = 0
@@ -416,9 +405,9 @@ class line_planning_solver:
         logging.info("Execution time: %s", t1-t0)	
         logging.info("Final solution: %s", master.ObjVal)
         for l in range(line_count_total):
-            if y[l].X>0:
+            if line_vars[l].X>0:
                 op = [l//max_frequency,l%max_frequency]
-                print("line", l, y[l].X, 'cost', lines_cost[l])	
+                print("line", l, line_vars[l].X, 'cost', line_costs[l])
                 print(op)
                 '''for p in range(nb_pass):
                     if(self.line_instance.values[p][l // max_frequency]>0):
@@ -427,7 +416,7 @@ class line_planning_solver:
         return master.ObjVal, t1-t0
 
     def rounding(self, solution, active_sets, sets):
-        val = self.line_instance.values
+        optimal_trip_options: List[List[TripOption]] = self.line_instance.optimal_trip_options
         nb_pass = self.line_instance.nb_pass
         nb_lines = self.line_instance.nb_lines
         capacity = self.line_instance.capacity
@@ -453,8 +442,8 @@ class line_planning_solver:
             if final_set_index: #if final_set_index is false, the line is not opened
                 passenger_assignment.append([])
                 for p in sets[final_set_index]: #for the passengers in the set of index final_set_index
-                    if val[p][l//max_frequency] > values[p]: #if I could get more value by reassigning passenger p to line l
-                        values[p] = val[p][l//max_frequency]
+                    if optimal_trip_options[p][l//max_frequency].value > values[p]: #if I could get more value by reassigning passenger p to line l
+                        values[p] = optimal_trip_options[p][l//max_frequency].value
                         passenger_assignment[len(passenger_assignment)-1].append([p,values[p]])
 
                 used_budget += lines_cost[l] #Add costs if line is opened

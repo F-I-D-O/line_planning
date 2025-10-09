@@ -4,7 +4,7 @@ import logging
 from graph_class import *
 from copy import deepcopy
 from collections import namedtuple
-from typing import NamedTuple, Optional, List
+from typing import NamedTuple, Optional, List, Tuple
 
 # import osmnx as ox, geopandas as gpd
 
@@ -46,10 +46,12 @@ class line_instance:
         self.capacity = capacity
         self.date = None
         self.demand_file = demand_file
+        self.optimal_trip_options: List[List[TripOption]] = []
 
         # random instance of the problem
-        if instance_category == 'random': 
-            self.set_of_lines, self.pass_to_lines, self.values, self.lines_to_passengers, self.edge_to_passengers = self.random_instance()
+        if instance_category == 'random':
+            raise RuntimeError('random instance category not supported right now due o problem modification, use manhattan.')
+            # self.set_of_lines, self.pass_to_lines, self.optimal_trip_options, self.lines_to_passengers, self.edge_to_passengers = self.random_instance()
             # set of lines[i][0]: length of the line. set of lines[i][1]: list of indices of passengers covered by the line
             # pass_to_lines[p] contains the list of lines covering passenger p
             # values[p][l]: value of passenger p assigned to line l (0 if p not covered)
@@ -57,7 +59,8 @@ class line_instance:
 
         # instance from grid network
         if instance_category == 'grid':
-            self.set_of_lines, self.pass_to_lines, self.values, self.lines_to_passengers, self.edge_to_passengers, self.candidate_set_of_lines = self.random_grid_instance(nb_lines, nb_pass, n, nb_stops, min_length, max_length, detour_factor, min_start_end_distance)
+            raise RuntimeError('grid instance category not supported right now due o problem modification, use manhattan.')
+            # self.set_of_lines, self.pass_to_lines, self.optimal_trip_options, self.lines_to_passengers, self.edge_to_passengers, self.candidate_set_of_lines = self.random_grid_instance(nb_lines, nb_pass, n, nb_stops, min_length, max_length, detour_factor, min_start_end_distance)
 
         # instance from Manhattan network
         if instance_category == 'manhattan':
@@ -77,7 +80,7 @@ class line_instance:
             (
                 self.set_of_lines,
                 self.pass_to_lines,
-                self.values,
+                self.optimal_trip_options,
                 self.lines_to_passengers,
                 self.edge_to_passengers,
                 self.candidate_set_of_lines,
@@ -440,7 +443,7 @@ class line_instance:
 
         return set_of_lines, pass_to_lines, values, lines_to_passengers, edge_to_passengers, candidate_set_of_lines
 
-    def manhattan_instance(self, nb_lines, detour_factor, date):
+    def manhattan_instance(self, nb_lines, detour_factor, date) -> Tuple[list, list, List[List[TripOption]], list, list, list, list]:
         # TODO handle the case where remaining stops pop in skeleton method
 
         # load distance matrix for G
@@ -486,11 +489,17 @@ class line_instance:
         # travel_times_on_line[i][j][k] contains the time to travel from node number j to node number k on line i
         travel_times_on_lines = self.compute_travel_times_on_lines(candidate_set_of_lines, distances)
 
-        set_of_lines, pass_to_lines, values, lines_to_passengers, edge_to_passengers = self.preprocessing(candidate_set_of_lines, passengers, travel_times_on_lines, distances, detour_factor, nb_lines, nb_pass)
+        set_of_lines, pass_to_lines, optimal_trip_options, lines_to_passengers, edge_to_passengers = self.preprocessing(
+            candidate_set_of_lines,
+            passengers,
+            travel_times_on_lines,
+            distances,
+            detour_factor,
+            nb_lines,
+            nb_pass
+        )
 
         granularity = self.granularity	
-
-        # set_of_lines, pass_to_lines, values, lines_to_passengers, edge_to_passengers = self.preprocessing_real_time_routing(candidate_set_of_lines, passengers, travel_times_on_lines, distances, detour_factor, nb_lines, nb_pass, granularity, date)
 
         candidate_set_of_lines_tmp = []
         for l in range(len(candidate_set_of_lines)):
@@ -500,50 +509,7 @@ class line_instance:
 
         lengths_travel_times = [travel_times_on_lines[l//granularity][0][len(candidate_set_of_lines[l])-1] for l in range(len(candidate_set_of_lines))]
 
-        # print('values', values)
-
-        '''
-        #build the instance
-        set_of_lines = []
-        pass_to_lines = []
-        value = 0
-        values = []
-        lines_to_passengers = []
-        edge_to_passengers = []
-        
-        
-        
-
-        for i in range(nb_pass):
-            pass_to_lines.append([])
-            values.append([])
-
-        print('preprocessing')
-
-        for l in range(nb_lines):
-            if l%100==0:
-                print(l)
-            #length == nb_edges in the line == nb_stops - 1
-            length = len(candidate_set_of_lines[l]) - 1
-            pass_covered = []
-            lines_to_passengers.append([])
-            edge_to_passengers.append([[] for k in range(length)])
-            for p in range(nb_pass):
-                value, enter_node, exit_node = self.optimal_trip(passengers[p], candidate_set_of_lines[l], travel_times_on_lines[l], distances, detour_factor)
-                if value > 0:
-                    pass_covered.append([p, [enter_node,exit_node], value])
-                    pass_to_lines[p].append(l)
-                    lines_to_passengers[l].append(p)
-                    for k in range(enter_node, exit_node):
-                        edge_to_passengers[l][k].append(p)
-
-                values[p].append(value)
-            set_of_lines.append([length, pass_covered])
-
-        print('--------------------------------------')
-        '''
-
-        return set_of_lines, pass_to_lines, values, lines_to_passengers, edge_to_passengers, candidate_set_of_lines, lengths_travel_times
+        return set_of_lines, pass_to_lines, optimal_trip_options, lines_to_passengers, edge_to_passengers, candidate_set_of_lines, lengths_travel_times
 
     def preprocessing(
         self,
@@ -554,7 +520,7 @@ class line_instance:
         detour_factor,
         nb_lines,
         nb_pass
-    ) -> (list, list, List[List[TripOption]], list, list):
+    ) -> Tuple[list, list, List[List[TripOption]], list, list]:
         logging.info('Preprocessing started')
         set_of_lines = []
         pass_to_lines = [[] for _ in range(nb_pass)]
