@@ -390,7 +390,12 @@ class line_planning_solver:
 
         # Budget constraint
         line_costs_expression = LinExpr(line_costs, line_vars)
-        mod_cost_expression = LinExpr(, passenger_vars)
+        mod_costs = {
+            (l,p): self.line_instance.optimal_trip_options[p][l // max_frequency].value
+            for p in range(request_count)
+            for l in range(line_count_total)
+        }
+        mod_cost_expression = passenger_vars.prod(mod_costs)
         master.addConstr(line_costs_expression + mod_cost_expression <= self.line_instance.B, name="budget_constraint")
 
         # Model parameters
@@ -522,6 +527,7 @@ if __name__ == "__main__":
     demand_file = "OD_matrix_april_fhv_1_percent.txt" # override the month setting and uses a custom demand file
     # demand_file = None
     run_proposed_method = False
+    use_model_with_mod_costs = True # stage 1 model
 
     average_value_LP = 0
     average_value_ILP = 0
@@ -601,6 +607,9 @@ if __name__ == "__main__":
         try:
             logging.info("Solving the line planning problem with ILP")
             solver.line_instance.B = Budget
-            obj_val, run_time_ILP = solver.solve_ILP()
+            if use_model_with_mod_costs:
+                obj_val, run_time_ILP = solver.solve_modified_ILP()
+            else:
+                obj_val, run_time_ILP = solver.solve_ILP()
         except Exception as e:
             logging.error("error with ILP: %s", e)
