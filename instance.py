@@ -548,15 +548,20 @@ class line_instance:
                     distances,
                     detour_factor
                 )
-                if optimal_trip_option.value > 0:
-                    pass_covered.append([p, [optimal_trip_option.mt_pickup_node,optimal_trip_option.mt_drop_off_node], optimal_trip_option.value])
-                    pass_to_lines[p].append(l)
-                    lines_to_passengers[l].append(p)
-                    for k in range(optimal_trip_option.mt_pickup_node, optimal_trip_option.mt_drop_off_node):
-                        edge_to_passengers[l][k].append(p)
+
+                pass_covered.append([p, [optimal_trip_option.mt_pickup_node,optimal_trip_option.mt_drop_off_node], optimal_trip_option.value])
+                pass_to_lines[p].append(l)
+                lines_to_passengers[l].append(p)
+                for k in range(optimal_trip_option.mt_pickup_node, optimal_trip_option.mt_drop_off_node):
+                    edge_to_passengers[l][k].append(p)
 
                 optimal_trip_options[p].append(optimal_trip_option)
             set_of_lines.append([length, pass_covered])
+
+        # add the no MT option for each request. The MoD cost is stored in the first_mile_cost field of TripOption.
+        for p in range(nb_pass):
+            travel_time = distances[passengers[p][0]][passengers[p][1]]
+            optimal_trip_options[p].append(TripOption(0, -1, -1, travel_time, 0, 0))
 
         logging.info('Preprocessing finished')
 
@@ -682,7 +687,7 @@ class line_instance:
 
     def get_optimal_trip(self, passenger, line, travel_times_on_line, distances, detour_factor) -> TripOption:
         """
-        Return the optimal trip option for a given passenger on a given line (\omega_{\ell,p}).
+        Return the optimal trip option for a given passenger on a given line (omega_{ell,p}).
         passenger = [origin, destination]
         line = [list of nodes in the line]
         travel_times_on_line[i][j] contains the time to travel from node number i to node number j on the line
