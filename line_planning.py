@@ -430,6 +430,148 @@ class line_planning_solver:
 
         return master.ObjVal, t1-t0
 
+    def solve_ILP_with_empty_trips(self, export_model=False, export_solution=False):
+        request_count = self.line_instance.nb_pass
+        line_count = self.line_instance.nb_lines
+        bus_capacity = self.line_instance.capacity
+        node_count = len(self.line_instance.dm)
+
+        line_count_total = line_count * max_frequency
+
+        logging.info("Building ILP model with empty trips")
+
+        master = Model("ILP with empty trips") # master LP problem
+        master.ModelSense = -1 # maximize the objective function
+
+        master.Params.timeLimit = allowed_time
+
+        # VARIABLES
+        # binary variables indicating if line l is opened
+        line_vars = master.addVars(line_count_total, vtype=GRB.BINARY, name="y")
+
+        # binary variables indicating if passenger p is assigned to line l. If first mile + last mile costs are
+        # higher than the no_MT MoD cost, the line-passenger combination is not considered at all
+        potential_line_passenger_combinations = [
+            (l, p) for l in range(line_count_total) for p in range(request_count)
+            if self.line_instance.optimal_trip_options[p][l // max_frequency].value > 0
+        ]
+        passenger_vars = master.addVars(potential_line_passenger_combinations, vtype=GRB.BINARY, obj=1, name="x")
+        # add no MT variables for each passenger
+        for p in range(request_count):
+            passenger_vars[line_count_total, p] = master.addVar(vtype=GRB.BINARY, obj=1, name="x[no_MT,%d]" % p)
+
+        # integer flow variables indicating the MoD flow on each edge of the complete graph
+        # first compute used nodes
+        used_nodes = set()
+        for p in range(request_count):
+            used_nodes.add(self.line_instance.requests[p][0])
+            used_nodes.add(self.line_instance.requests[p][1])
+            for l in range(line_count_total):
+                optimal_trip_option: TripOption = self.line_instance.optimal_trip_options[p][l // max_frequency]
+                used_nodes.add(optimal_trip_option.mt_pickup_node)
+                used_nodes.add(optimal_trip_option.mt_drop_off_node)
+        used_nodes_list = list(used_nodes)
+        flow_vars = master.addVars(used_nodes_list, used_nodes_list, vtype=GRB.INTEGER, name="phi")
+
+        # One line per passenger constraints
+        master.addConstrs(
+            (passenger_vars.sum('*', p) <= 1 for p in range(request_count)),
+            name="one_line_per_passenger"
+        )
+
+        # Bus capacity constraints
+        capacity_constraints = {}
+        for l in range(line_count_total):
+            f_l = l%max_frequency + 1
+            length = self.line_instance.set_of_lines[l//max_frequency][0]
+            for k in range(length):
+                vars = []
+                coefs = []
+                for p in self.line_instance.edge_to_passengers[l//max_frequency][k]:
+                    vars.append(passenger_vars[l,p])
+                    coefs.append(1)
+                capacity_constraints[l,k] = master.addConstr(LinExpr(coefs,vars) <= bus_capacity * f_l * line_vars[l], name="capacity_constraints[%d][%d]"%(l,k))
+
+        # Budget constraint
+        line_costs = [
+            fixed_cost * self.line_instance.lengths_travel_times[l // max_frequency]
+            + l
+            % max_frequency
+            * self.line_instance.lengths_travel_times[l // max_frequency]
+            for l in range(line_count_total)
+        ]
+        line_costs_expression = line_vars.prod(line_costs)
+        flow_costs = {}
+        used_nodes_count = len(used_nodes_list)
+        for flow_from in used_nodes:
+            for flow_to in used_nodes:
+                flow_costs[flow_from,flow_to] = self.line_instance.dm[flow_from][flow_to] # currently, distance is equal to the MoD cost
+        flow_cost_expression = flow_vars.prod(flow_costs)
+        master.addConstr(line_costs_expression + flow_cost_expression <= self.line_instance.B, name="budget_constraint")
+
+        # Flow conservation constraints
+        master.addConstrs(flow_vars.sum('*', j) - flow_vars.sum(j, '*') == 0 for j in used_nodes_list)
+
+        # first/last mile flow constraints
+        for node_from in used_nodes_list:
+            for node_to in used_nodes_list:
+                if node_from != node_to:
+                    first_mile_vars = []
+                    last_mile_vars = []
+                    no_mt_vars = []
+                    for p in range(request_count):
+                        if self.line_instance.requests[p][0] == node_from:
+                            for l in range(line_count_total):
+                                if (l,p) in passenger_vars:
+                                    optimal_trip_option: TripOption = self.line_instance.optimal_trip_options[p][l // max_frequency]
+                                    if optimal_trip_option.mt_pickup_node == node_to:
+                                        first_mile_vars.append(passenger_vars[l,p])
+                            if self.line_instance.requests[p][1] == node_to:
+                                no_mt_vars.append(passenger_vars[line_count_total,p])
+                        if self.line_instance.requests[p][1] == node_to:
+                            for l in range(line_count_total):
+                                if (l,p) in passenger_vars:
+                                    optimal_trip_option: TripOption = self.line_instance.optimal_trip_options[p][l // max_frequency]
+                                    if optimal_trip_option.mt_drop_off_node == node_from:
+                                        last_mile_vars.append(passenger_vars[l,p])
+
+                    first_mile_expr = LinExpr([1 for _ in first_mile_vars], first_mile_vars)
+                    last_mile_expr = LinExpr([1 for _ in last_mile_vars], last_mile_vars)
+                    no_mt_expr = LinExpr([1 for _ in no_mt_vars], no_mt_vars)
+                    master.addConstr(
+                        flow_vars[node_from, node_to] - first_mile_expr - last_mile_expr - no_mt_expr >= 0,
+                        name="first_last_mile[%d][%d]" % (node_from, node_to)
+                    )
+
+        # Model parameters
+        master.Params.Presolve = 0
+        master.Params.PreCrush = 1
+        master.Params.Cuts = 0
+
+        if export_model:
+            master.write("ILP_with_empty_trips.lp")
+
+        t0 = time.time()
+        master.optimize()
+        t1 = time.time()
+
+        logging.info("Execution time: %s", t1-t0)
+        logging.info("Final solution: %s", master.ObjVal)
+
+        if export_solution:
+            master.write("ILP_with_empty_trips.sol")
+
+        for l in range(line_count_total):
+            if line_vars[l].X>0:
+                op = [l//max_frequency,l%max_frequency]
+                print("line", l, line_vars[l].X, 'cost', line_costs[l])
+                print(op)
+                '''for p in range(nb_pass):
+                    if(self.line_instance.values[p][l // max_frequency]>0):
+                        print("passenger", p, x[l,p].X, self.line_instance.values[p][l // max_frequency])'''
+
+        return master.ObjVal, t1-t0
+
     def rounding(self, solution, active_sets, sets):
         optimal_trip_options: List[List[TripOption]] = self.line_instance.optimal_trip_options
         nb_pass = self.line_instance.nb_pass
@@ -538,7 +680,8 @@ if __name__ == "__main__":
     # demand_file = "OD_matrix_april_fhv_10_percent.txt" # override the month setting and uses a custom demand file
     # demand_file = None
     run_proposed_method = False
-    use_model_with_mod_costs = True # stage 1 model
+    use_model_with_mod_costs = False # stage 1 model
+    use_model_with_empty_trips = True # stage 2 model
 
     average_value_LP = 0
     average_value_ILP = 0
@@ -624,6 +767,8 @@ if __name__ == "__main__":
         solver.line_instance.B = Budget
         if use_model_with_mod_costs:
             obj_val, run_time_ILP = solver.solve_modified_ILP(export_model=True, export_solution=True)
+        elif use_model_with_empty_trips:
+            obj_val, run_time_ILP = solver.solve_ILP_with_empty_trips(export_model=True, export_solution=True)
         else:
             obj_val, run_time_ILP = solver.solve_ILP()
         # except Exception as e:
