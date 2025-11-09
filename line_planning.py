@@ -3,6 +3,7 @@ import json
 import logging
 import re
 import time
+from collections import defaultdict
 from copy import deepcopy
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Union
@@ -23,24 +24,29 @@ month = "april"
 # demand_file = None
 # nb_l = 1000
 
+# 50% demand
+demand_file = "OD_matrix_april_fhv_50_percent.txt" # override the month setting and uses a custom demand file
+nb_l = 500
+nb_p = 6500
+
 # 10% demand
-demand_file = "OD_matrix_april_fhv_10_percent.txt" # override the month setting and uses a custom demand file
-nb_l = 100
-nb_p = 1300
+# demand_file = "OD_matrix_april_fhv_10_percent.txt" # override the month setting and uses a custom demand file
+# nb_l = 100
+# nb_p = 1300
 
 # 1% demand
 # demand_file = "OD_matrix_april_fhv_1_percent.txt"  # override the month setting and uses a custom demand file
 # nb_l = 10
 # nb_p = 130
 
-use_model_with_mod_costs = True # stage 1 model
-use_model_with_empty_trips = False # stage 2 model
+use_model_with_mod_costs = False # stage 1 model
+use_model_with_empty_trips = True # stage 2 model
 
 # Run the solution method proposed in Périvier et al., 2021
 run_proposed_method = False
 
 # Time limit for the Gurobi solver
-allowed_time = 3600
+allowed_time = 3600 * 24
 
 EPS = 1.e-5
 
@@ -86,11 +92,10 @@ class line_planning_solver:
         output_dir: Path,
         line_vars,
         line_costs,
-        max_frequency_value: int,
-        label: str,
+        max_frequency_value: int
     ) -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
-        csv_path = output_dir / f"used_lines_{label}.csv"
+        csv_path = output_dir / f"used_lines.csv"
         try:
             with csv_path.open("w", encoding="utf-8") as csv_file:
                 csv_file.write("line,frequency,line_cost\n")
@@ -114,39 +119,144 @@ class line_planning_solver:
         output_dir: Path,
         passenger_vars,
         max_frequency_value: int,
-        label: str,
         no_mt_index: Optional[int] = None,
-    ) -> None:
+    ) -> Dict[int, Dict[str, Union[int, str, float, bool, None]]]:
         output_dir.mkdir(parents=True, exist_ok=True)
-        csv_path = output_dir / f"passenger_assignments_{label}.csv"
-        assignments: Dict[int, Tuple[Union[int, str], float]] = {}
+        csv_path = output_dir / f"passenger_assignments.csv"
+        assignments: Dict[int, Dict[str, Union[int, str, float, bool, None]]] = {}
 
         for (line_idx, passenger_idx), var in passenger_vars.items():
             if var.X > 0:
-                if no_mt_index is not None and line_idx == no_mt_index:
+                is_no_mt = no_mt_index is not None and line_idx == no_mt_index
+                if is_no_mt:
                     line_repr: Union[int, str] = "no_MT"
                     mod_cost = self._compute_direct_mod_cost(passenger_idx)
+                    route_index: Optional[int] = None
                 else:
-                    line_repr = line_idx // max_frequency_value
-                    trip_option: TripOption = self.line_instance.optimal_trip_options[passenger_idx][
-                        line_idx // max_frequency_value
-                    ]
+                    route_index = line_idx // max_frequency_value
+                    line_repr = route_index
+                    trip_option: TripOption = self.line_instance.optimal_trip_options[passenger_idx][route_index]
                     mod_cost = trip_option.first_mile_cost + trip_option.last_mile_cost
-                assignments[passenger_idx] = (line_repr, mod_cost)
+                assignments[passenger_idx] = {
+                    "line_index": line_idx,
+                    "route_index": route_index,
+                    "line_repr": line_repr,
+                    "mod_cost": mod_cost,
+                    "is_no_mt": is_no_mt,
+                }
 
         try:
             with csv_path.open("w", encoding="utf-8") as csv_file:
                 csv_file.write("passenger,line,mod_cost\n")
                 for passenger_idx in range(self.line_instance.nb_pass):
-                    if passenger_idx in assignments:
-                        line_repr, mod_cost = assignments[passenger_idx]
-                    else:
-                        line_repr = "no_MT"
-                        mod_cost = self._compute_direct_mod_cost(passenger_idx)
-                    csv_file.write(f"{passenger_idx},{line_repr},{mod_cost}\n")
+                    if passenger_idx not in assignments:
+                        assignments[passenger_idx] = {
+                            "line_index": no_mt_index if no_mt_index is not None else -1,
+                            "route_index": None,
+                            "line_repr": "no_MT",
+                            "mod_cost": self._compute_direct_mod_cost(passenger_idx),
+                            "is_no_mt": True,
+                        }
+                    entry = assignments[passenger_idx]
+                    csv_file.write(f"{passenger_idx},{entry['line_repr']},{entry['mod_cost']}\n")
             logging.info("Exported passenger assignments to %s", csv_path)
         except OSError as exc:
             logging.warning("Unable to write passenger assignments CSV %s: %s", csv_path, exc)
+
+        return assignments
+
+    def _solve_and_export_flows(
+        self,
+        assignments: Dict[int, Dict[str, Union[int, str, float, bool, None]]],
+        output_dir: Path,
+        max_frequency_value: int,
+    ) -> None:
+        if not assignments:
+            logging.info("No assignments available for flow optimization")
+            return
+
+        required_flow = defaultdict(int)
+        used_nodes = set()
+        for passenger_idx, entry in assignments.items():
+            origin = self.line_instance.requests[passenger_idx][0]
+            destination = self.line_instance.requests[passenger_idx][1]
+            used_nodes.update([origin, destination])
+            if entry.get("is_no_mt", False):
+                required_flow[(origin, destination)] += 1
+            else:
+                route_index = entry.get("route_index")
+                if route_index is None:
+                    continue
+                trip_option: TripOption = self.line_instance.optimal_trip_options[passenger_idx][route_index]
+                pickup = trip_option.mt_pickup_node
+                drop_off = trip_option.mt_drop_off_node
+                required_flow[(origin, pickup)] += 1
+                required_flow[(drop_off, destination)] += 1
+                used_nodes.update([pickup, drop_off])
+
+        if not required_flow:
+            logging.info("No MoD flows required", )
+            self._export_flows({}, output_dir)
+            return
+
+        used_nodes_list = list(used_nodes)
+        flow_model = Model(f"FlowOptimization")
+        flow_model.ModelSense = GRB.MINIMIZE
+        flow_model.Params.OutputFlag = 0
+
+        flow_vars = {}
+        for i in used_nodes_list:
+            for j in used_nodes_list:
+                if i == j:
+                    continue
+                flow_vars[(i, j)] = flow_model.addVar(lb=0, vtype=GRB.INTEGER, name=f"phi[{i},{j}]")
+        flow_model.update()
+
+        for (i, j), demand in required_flow.items():
+            if i == j:
+                continue
+            if (i, j) in flow_vars:
+                flow_model.addConstr(flow_vars[(i, j)] >= demand, name=f"demand[{i},{j}]")
+
+        for node in used_nodes_list:
+            incoming = [flow_vars[(i, node)] for i in used_nodes_list if i != node and (i, node) in flow_vars]
+            outgoing = [flow_vars[(node, j)] for j in used_nodes_list if j != node and (node, j) in flow_vars]
+            if incoming or outgoing:
+                flow_model.addConstr(
+                    quicksum(incoming) - quicksum(outgoing) == 0,
+                    name=f"balance[{node}]",
+                )
+
+        flow_cost_expr = quicksum(
+            self.line_instance.dm[i][j] * var for (i, j), var in flow_vars.items()
+        )
+        flow_model.setObjective(flow_cost_expr)
+        flow_model.optimize()
+
+        flows = {
+            (i, j): var.X
+            for (i, j), var in flow_vars.items()
+            if var.X > EPS
+        }
+
+        self._export_flows(flows, output_dir)
+
+    def _export_flows(
+        self,
+        flows: Dict[Tuple[int, int], float],
+        output_dir: Path
+    ) -> None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = output_dir / f"flows.csv"
+        try:
+            with csv_path.open("w", encoding="utf-8") as csv_file:
+                csv_file.write("from,to,flow,cost\n")
+                for (i, j), flow_value in sorted(flows.items()):
+                    cost = self.line_instance.dm[i][j]
+                    csv_file.write(f"{i},{j},{flow_value},{cost}\n")
+            logging.info("Exported flows to %s", csv_path)
+        except OSError as exc:
+            logging.warning("Unable to write flows CSV %s: %s", csv_path, exc)
 
     # Implementation of the column generation process. Outputs the solution of the configuration LP before rounding.
     def solve_master_LP(self):
@@ -473,19 +583,16 @@ class line_planning_solver:
             master.write(str(output_dir_path / "ILP.sol"))
 
         export_dir = output_dir_path if output_dir_path is not None else Path(".")
-        self._export_used_lines(
-            output_dir=export_dir,
-            line_vars=y,
-            line_costs=lines_cost,
-            max_frequency_value=max_frequency,
-            label="default",
-        )
-
-        self._export_passenger_assignments(
+        assignments = self._export_passenger_assignments(
             output_dir=export_dir,
             passenger_vars=x,
-            max_frequency_value=max_frequency,
-            label="default",
+            max_frequency_value=max_frequency
+        )
+
+        self._solve_and_export_flows(
+            assignments=assignments,
+            output_dir=export_dir,
+            max_frequency_value=max_frequency
         )
 
         return master.ObjVal, t1-t0
@@ -567,7 +674,7 @@ class line_planning_solver:
             master.Params.LogFile = str(gurobi_log_path)
 
         if export_model:
-            master.write(str(output_dir_path / "modified_ILP.lp"))
+            master.write(str(output_dir_path / "ILP.lp"))
 
         t0 = time.time()
         master.optimize()
@@ -577,22 +684,26 @@ class line_planning_solver:
         logging.info("Final solution: %s", master.ObjVal)
 
         if export_solution:
-            master.write(str(output_dir_path / "modified_ILP.sol"))
+            master.write(str(output_dir_path / "ILP.sol"))
 
         self._export_used_lines(
             output_dir=output_dir_path,
             line_vars=line_vars,
             line_costs=line_costs,
             max_frequency_value=max_frequency,
-            label="modified",
         )
 
-        self._export_passenger_assignments(
+        assignments = self._export_passenger_assignments(
             output_dir=output_dir_path,
             passenger_vars=passenger_vars,
             max_frequency_value=max_frequency,
-            label="modified",
             no_mt_index=line_count_total,
+        )
+
+        self._solve_and_export_flows(
+            assignments=assignments,
+            output_dir=output_dir_path,
+            max_frequency_value=max_frequency,
         )
 
         return master.ObjVal, t1-t0
@@ -633,26 +744,63 @@ class line_planning_solver:
         for p in range(request_count):
             passenger_vars[line_count_total, p] = master.addVar(vtype=GRB.BINARY, obj=1, name="x[no_MT,%d]" % p)
 
-        # integer flow variables indicating the MoD flow on each edge of the complete graph
-        # first compute used nodes
+        # collections for the MoD flow constraints
+        first_mile_vars = {}
+        last_mile_vars = {}
+        no_mt_vars = {}
+
+        
+        # first iterate over all request/line combinations and
+        # 1. compute used nodes
+        # 2. compute first mile vars, last mile vars, and no MT vars for the MoD flow constraints
         used_nodes = set()
-        for p in range(request_count):
-            used_nodes.add(self.line_instance.requests[p][0])
-            used_nodes.add(self.line_instance.requests[p][1])
+        for p in tqdm(range(request_count), desc="Processing requests (used nodes, MoD flow constraints data...)"):
+            request_from = self.line_instance.requests[p][0]
+            request_to = self.line_instance.requests[p][1]
+            used_nodes.add(request_from)
+            used_nodes.add(request_to)
             for l in range(line_count_total):
                 optimal_trip_option: TripOption = self.line_instance.optimal_trip_options[p][l // max_frequency]
-                used_nodes.add(optimal_trip_option.mt_pickup_node)
-                used_nodes.add(optimal_trip_option.mt_drop_off_node)
+                mt_pickup_node = optimal_trip_option.mt_pickup_node
+                mt_drop_off_node = optimal_trip_option.mt_drop_off_node
+                used_nodes.add(mt_pickup_node)
+                used_nodes.add(mt_drop_off_node)
+
+                # ALSO DO THE HARD WORK HERE FOR THE MOD FLOW CONSTRAINTS
+                if (l, p) in passenger_vars:
+                    # first mile vars
+                    if request_from not in first_mile_vars:
+                        first_mile_vars[request_from] = {}
+                    if mt_pickup_node not in first_mile_vars[request_from]:
+                        first_mile_vars[request_from][mt_pickup_node] = []
+                    first_mile_vars[request_from][mt_pickup_node].append(passenger_vars[l,p])
+                    # last mile vars
+                    if request_to not in last_mile_vars:
+                        last_mile_vars[request_to] = {}
+                    if mt_drop_off_node not in last_mile_vars[request_to]:
+                        last_mile_vars[request_to][mt_drop_off_node] = []
+                    last_mile_vars[request_to][mt_drop_off_node].append(passenger_vars[l,p])
+            # no MT vars
+            if request_from not in no_mt_vars:
+                no_mt_vars[request_from] = {}
+            if request_to not in no_mt_vars[request_from]:
+                no_mt_vars[request_from][request_to] = []
+            no_mt_vars[request_from][request_to].append(passenger_vars[line_count_total,p])
         used_nodes_list = list(used_nodes)
+
+        # integer flow variables indicating the MoD flow on each edge of the complete graph
+        logging.info("Building flow variables")
         flow_vars = master.addVars(used_nodes_list, used_nodes_list, vtype=GRB.INTEGER, name="phi")
 
         # One line per passenger constraints
+        logging.info("Building one line per passenger constraints")
         master.addConstrs(
             (passenger_vars.sum('*', p) <= 1 for p in range(request_count)),
             name="one_line_per_passenger"
         )
 
         # Bus capacity constraints
+        logging.info("Building capacity constraints")
         capacity_constraints = {}
         for l in range(line_count_total):
             f_l = l%max_frequency + 1
@@ -666,6 +814,7 @@ class line_planning_solver:
                 capacity_constraints[l,k] = master.addConstr(LinExpr(coefs,vars) <= bus_capacity * f_l * line_vars[l], name="capacity_constraints[%d][%d]"%(l,k))
 
         # Budget constraint
+        logging.info("Building budget constraint")
         line_costs = [
             fixed_cost * self.line_instance.lengths_travel_times[l // max_frequency]
             + l
@@ -683,34 +832,20 @@ class line_planning_solver:
         master.addConstr(line_costs_expression + flow_cost_expression <= self.line_instance.B, name="budget_constraint")
 
         # Flow conservation constraints
+        logging.info("Building flow conservation constraints")
         master.addConstrs(flow_vars.sum('*', j) - flow_vars.sum(j, '*') == 0 for j in used_nodes_list)
 
         # first/last mile flow constraints
-        for node_from in used_nodes_list:
+        for node_from in tqdm(used_nodes_list, desc="generating flow constraints for MoD"):
             for node_to in used_nodes_list:
                 if node_from != node_to:
-                    first_mile_vars = []
-                    last_mile_vars = []
-                    no_mt_vars = []
-                    for p in range(request_count):
-                        if self.line_instance.requests[p][0] == node_from:
-                            for l in range(line_count_total):
-                                if (l,p) in passenger_vars:
-                                    optimal_trip_option: TripOption = self.line_instance.optimal_trip_options[p][l // max_frequency]
-                                    if optimal_trip_option.mt_pickup_node == node_to:
-                                        first_mile_vars.append(passenger_vars[l,p])
-                            if self.line_instance.requests[p][1] == node_to:
-                                no_mt_vars.append(passenger_vars[line_count_total,p])
-                        if self.line_instance.requests[p][1] == node_to:
-                            for l in range(line_count_total):
-                                if (l,p) in passenger_vars:
-                                    optimal_trip_option: TripOption = self.line_instance.optimal_trip_options[p][l // max_frequency]
-                                    if optimal_trip_option.mt_drop_off_node == node_from:
-                                        last_mile_vars.append(passenger_vars[l,p])
-
-                    first_mile_expr = LinExpr([1 for _ in first_mile_vars], first_mile_vars)
-                    last_mile_expr = LinExpr([1 for _ in last_mile_vars], last_mile_vars)
-                    no_mt_expr = LinExpr([1 for _ in no_mt_vars], no_mt_vars)
+                    first_mile_vars_for_from_to = first_mile_vars.get(node_from, {}).get(node_to, [])
+                    last_mile_vars_for_from_to = last_mile_vars.get(node_from, {}).get(node_to, [])
+                    no_mt_vars_for_from_to = no_mt_vars.get(node_from, {}).get(node_to, [])
+                    
+                    first_mile_expr = LinExpr([1 for _ in first_mile_vars_for_from_to], first_mile_vars_for_from_to)
+                    last_mile_expr = LinExpr([1 for _ in last_mile_vars_for_from_to], last_mile_vars_for_from_to)
+                    no_mt_expr = LinExpr([1 for _ in no_mt_vars_for_from_to], no_mt_vars_for_from_to)
                     master.addConstr(
                         flow_vars[node_from, node_to] - first_mile_expr - last_mile_expr - no_mt_expr >= 0,
                         name="first_last_mile[%d][%d]" % (node_from, node_to)
@@ -727,7 +862,7 @@ class line_planning_solver:
             master.Params.LogFile = str(gurobi_log_path)
 
         if export_model:
-            master.write(str(output_dir_path / "ILP_with_empty_trips.lp"))
+            master.write(str(output_dir_path / "ILP.lp"))
 
         t0 = time.time()
         master.optimize()
@@ -737,23 +872,28 @@ class line_planning_solver:
         logging.info("Final solution: %s", master.ObjVal)
 
         if export_solution:
-            master.write(str(output_dir_path / "ILP_with_empty_trips.sol"))
+            master.write(str(output_dir_path / "ILP.sol"))
 
         self._export_used_lines(
             output_dir=output_dir_path,
             line_vars=line_vars,
             line_costs=line_costs,
             max_frequency_value=max_frequency,
-            label="empty_trips",
         )
 
-        self._export_passenger_assignments(
+        assignments = self._export_passenger_assignments(
             output_dir=output_dir_path,
             passenger_vars=passenger_vars,
             max_frequency_value=max_frequency,
-            label="empty_trips",
             no_mt_index=line_count_total,
         )
+
+        flows = {
+            (i, j): var.X
+            for (i, j), var in flow_vars.items()
+            if var.X > EPS and i != j
+        }
+        self._export_flows(flows, output_dir_path)
 
         return master.ObjVal, t1-t0
 
@@ -868,11 +1008,9 @@ if __name__ == "__main__":
 
     logging.info("Solving Manhattan instance with %s lines and %s passengers", nb_l, nb_p)
 
-    Budget = 0
     line_inst = line_instance(
         nb_lines=nb_l,
         nb_pass=nb_p,
-        B=0.95 * Budget,
         cost=1,
         max_length=15,
         min_length=8,
@@ -905,7 +1043,7 @@ if __name__ == "__main__":
         # Execute the proposed method with LP solving and rounding
         if run_proposed_method:
             best_value, budg, op, v, nb_respect, mean, execution_time = solver.execute_proposed_method(
-                Budget, candidate_set_of_lines
+                budget, candidate_set_of_lines
             )
             time_LP += execution_time
             average_value_LP += best_value
@@ -920,7 +1058,7 @@ if __name__ == "__main__":
         log_handler = _configure_run_logging(run_log_path)
         try:
             logging.info("Solving the line planning problem with ILP")
-            solver.line_instance.B = Budget
+            solver.line_instance.B = budget
             if use_model_with_mod_costs:
                 obj_val, run_time_ILP = solver.solve_modified_ILP(
                     export_model=True,
