@@ -25,9 +25,9 @@ month = "april"
 # nb_l = 1000
 
 # 50% demand
-demand_file = "OD_matrix_april_fhv_50_percent.txt" # override the month setting and uses a custom demand file
-nb_l = 500
-nb_p = 6500
+# demand_file = "OD_matrix_april_fhv_50_percent.txt" # override the month setting and uses a custom demand file
+# nb_l = 500
+# nb_p = 6500
 
 # 10% demand
 # demand_file = "OD_matrix_april_fhv_10_percent.txt" # override the month setting and uses a custom demand file
@@ -35,9 +35,9 @@ nb_p = 6500
 # nb_p = 1300
 
 # 1% demand
-# demand_file = "OD_matrix_april_fhv_1_percent.txt"  # override the month setting and uses a custom demand file
-# nb_l = 10
-# nb_p = 130
+demand_file = "OD_matrix_april_fhv_1_percent.txt"  # override the month setting and uses a custom demand file
+nb_l = 10
+nb_p = 130
 
 use_model_with_mod_costs = False # stage 1 model
 use_model_with_empty_trips = True # stage 2 model
@@ -583,16 +583,23 @@ class line_planning_solver:
             master.write(str(output_dir_path / "ILP.sol"))
 
         export_dir = output_dir_path if output_dir_path is not None else Path(".")
+        self._export_used_lines(
+            output_dir=export_dir,
+            line_vars=y,
+            line_costs=lines_cost,
+            max_frequency_value=max_frequency,
+        )
+
         assignments = self._export_passenger_assignments(
             output_dir=export_dir,
             passenger_vars=x,
-            max_frequency_value=max_frequency
+            max_frequency_value=max_frequency,
         )
 
         self._solve_and_export_flows(
             assignments=assignments,
             output_dir=export_dir,
-            max_frequency_value=max_frequency
+            max_frequency_value=max_frequency,
         )
 
         return master.ObjVal, t1-t0
@@ -703,7 +710,7 @@ class line_planning_solver:
         self._solve_and_export_flows(
             assignments=assignments,
             output_dir=output_dir_path,
-            max_frequency_value=max_frequency,
+            max_frequency_value=max_frequency
         )
 
         return master.ObjVal, t1-t0
@@ -1026,8 +1033,8 @@ if __name__ == "__main__":
 
     instance_size_label = _get_instance_size_label(demand_file)
     method_label = _get_method_label(use_model_with_mod_costs, use_model_with_empty_trips)
-    results_directory = Path("Results") / instance_size_label / method_label
-    results_directory.mkdir(parents=True, exist_ok=True)
+    base_results_directory = Path("Results") / instance_size_label
+    base_results_directory.mkdir(parents=True, exist_ok=True)
 
     # budgets = [10_000, 20_000, 30_000, 40_000, 50_000, 100_000, 200_000]
     budgets = [10_000]
@@ -1048,13 +1055,12 @@ if __name__ == "__main__":
             time_LP += execution_time
             average_value_LP += best_value
 
-        # Solve the line planning problem with ILP
-        # try:
-        budget_directory = results_directory / f"budget_{budget}"
-        budget_directory.mkdir(parents=True, exist_ok=True)
+        budget_directory = base_results_directory / f"budget_{budget}"
+        method_directory = budget_directory / method_label
+        method_directory.mkdir(parents=True, exist_ok=True)
 
-        run_log_path = budget_directory / "run.log"
-        gurobi_log_path = budget_directory / "gurobi.log"
+        run_log_path = method_directory / "run.log"
+        gurobi_log_path = method_directory / "gurobi.log"
         log_handler = _configure_run_logging(run_log_path)
         try:
             logging.info("Solving the line planning problem with ILP")
@@ -1063,21 +1069,21 @@ if __name__ == "__main__":
                 obj_val, run_time_ILP = solver.solve_modified_ILP(
                     export_model=True,
                     export_solution=True,
-                    output_dir=budget_directory,
+                    output_dir=method_directory,
                     gurobi_log_file=gurobi_log_path,
                 )
             elif use_model_with_empty_trips:
                 obj_val, run_time_ILP = solver.solve_ILP_with_empty_trips(
                     export_model=True,
                     export_solution=True,
-                    output_dir=budget_directory,
+                    output_dir=method_directory,
                     gurobi_log_file=gurobi_log_path,
                 )
             else:
                 obj_val, run_time_ILP = solver.solve_ILP(
                     export_model=True,
                     export_solution=True,
-                    output_dir=budget_directory,
+                    output_dir=method_directory,
                     gurobi_log_file=gurobi_log_path,
                 )
         finally:
@@ -1094,7 +1100,5 @@ if __name__ == "__main__":
             "demand_file": demand_file,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
-        results_file = budget_directory / "metrics.json"
+        results_file = method_directory / "metrics.json"
         results_file.write_text(json.dumps(results_payload, indent=2))
-        # except Exception as e:
-        #     logging.error("error with ILP: %s", e)
