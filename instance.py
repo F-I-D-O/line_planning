@@ -43,7 +43,6 @@ class line_instance:
         self,
         nb_lines,
         nb_pass,
-        B,
         cost,
         max_length,
         min_length,
@@ -61,7 +60,7 @@ class line_instance:
     ):
         self.nb_lines = nb_lines * granularity  # number of lines in the candidate set.
         self.granularity = granularity
-        self.B = B  # Budget for opening lines
+        self.B = None
         self.cost = cost
         self.nb_pass = nb_pass  # number of passengers
         self.proba = proba  # probability that a passenger is covered by a line (when generating random instances)
@@ -90,8 +89,9 @@ class line_instance:
 
         # instance from Manhattan network
         if instance_category == 'manhattan':
-            if nb_lines != 10 and nb_lines != 100 and nb_lines != 1000 and nb_lines != 5000 and nb_lines != 2000:
-                raise NameError('Not a valid number of lines')
+            lines_file_path = Path(f"all_lines_nodes_{nb_lines}_c5.txt")
+            if not lines_file_path.exists():
+                raise FileNotFoundError("Lines file %s does not exist" % lines_file_path)
             if demand_file is not None:
                 logging.info('Checking number of requests in the demand file %s', demand_file)
                 self.nb_pass = len(np.loadtxt(demand_file))
