@@ -1,24 +1,152 @@
+import csv
+import json
 import logging
-import numpy as np
-from gurobipy import *
-from instance import *
+import re
 import time
 from copy import deepcopy
+from pathlib import Path
+from typing import Dict, Optional, Tuple, Union
 
+import numpy as np
+from gurobipy import *
+
+from instance import *
 import log
 
+# By default, 100% demand is used...
+month = "april"
+# nb_p = 13847 # april
+# # month = 'march'
+# # nb_p = 12301 # march
+# # month = 'feb'
+# # nb_p = 13851 # feb
+# demand_file = None
+# nb_l = 1000
+
+# 10% demand
+demand_file = "OD_matrix_april_fhv_10_percent.txt" # override the month setting and uses a custom demand file
+nb_l = 100
+nb_p = 1300
+
+# 1% demand
+# demand_file = "OD_matrix_april_fhv_1_percent.txt"  # override the month setting and uses a custom demand file
+# nb_l = 10
+# nb_p = 130
+
+use_model_with_mod_costs = True # stage 1 model
+use_model_with_empty_trips = False # stage 2 model
+
+# Run the solution method proposed in Périvier et al., 2021
+run_proposed_method = False
+
+# Time limit for the Gurobi solver
+allowed_time = 3600
 
 EPS = 1.e-5
-allowed_time = 1200
+
 
 
 fixed_cost = 1
 max_frequency = 1
 
+def _get_instance_size_label(demand_file_path: Optional[str]) -> str:
+    if demand_file_path:
+        demand_file_name = Path(demand_file_path).name
+        match = re.search(r"(\d+)_percent", demand_file_name)
+        if match:
+            return f"{match.group(1)}_percent"
+    return "100_percent"
+
+
+def _get_method_label(use_mod_costs: bool, use_empty_trips: bool) -> str:
+    if use_mod_costs:
+        return "stage_1"
+    if use_empty_trips:
+        return "stage_2"
+    return "original"
+
+
+def _configure_run_logging(log_path: Path) -> logging.Handler:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+    formatter = logging.Formatter("%(asctime)s %(levelname)s - %(message)s")
+    handler.setFormatter(formatter)
+    root_logger = logging.getLogger()
+    root_logger.addHandler(handler)
+    return handler
+
+
 class line_planning_solver:
 
     def __init__(self, line_instance):
         self.line_instance = line_instance
+
+    def _export_used_lines(
+        self,
+        output_dir: Path,
+        line_vars,
+        line_costs,
+        max_frequency_value: int,
+        label: str,
+    ) -> None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = output_dir / f"used_lines_{label}.csv"
+        try:
+            with csv_path.open("w", encoding="utf-8") as csv_file:
+                csv_file.write("line,frequency,line_cost\n")
+                for l, var in line_vars.items():
+                    activation = var.X
+                    if activation > 0:
+                        csv_file.write(
+                            f"{l // max_frequency_value},{l % max_frequency_value},{line_costs[l]}\n"
+                        )
+            logging.info("Exported used lines to %s", csv_path)
+        except OSError as exc:
+            logging.warning("Unable to write used lines CSV %s: %s", csv_path, exc)
+
+    def _compute_direct_mod_cost(self, passenger_idx: int) -> float:
+        origin = self.line_instance.requests[passenger_idx][0]
+        destination = self.line_instance.requests[passenger_idx][1]
+        return float(self.line_instance.dm[origin][destination])
+
+    def _export_passenger_assignments(
+        self,
+        output_dir: Path,
+        passenger_vars,
+        max_frequency_value: int,
+        label: str,
+        no_mt_index: Optional[int] = None,
+    ) -> None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = output_dir / f"passenger_assignments_{label}.csv"
+        assignments: Dict[int, Tuple[Union[int, str], float]] = {}
+
+        for (line_idx, passenger_idx), var in passenger_vars.items():
+            if var.X > 0:
+                if no_mt_index is not None and line_idx == no_mt_index:
+                    line_repr: Union[int, str] = "no_MT"
+                    mod_cost = self._compute_direct_mod_cost(passenger_idx)
+                else:
+                    line_repr = line_idx // max_frequency_value
+                    trip_option: TripOption = self.line_instance.optimal_trip_options[passenger_idx][
+                        line_idx // max_frequency_value
+                    ]
+                    mod_cost = trip_option.first_mile_cost + trip_option.last_mile_cost
+                assignments[passenger_idx] = (line_repr, mod_cost)
+
+        try:
+            with csv_path.open("w", encoding="utf-8") as csv_file:
+                csv_file.write("passenger,line,mod_cost\n")
+                for passenger_idx in range(self.line_instance.nb_pass):
+                    if passenger_idx in assignments:
+                        line_repr, mod_cost = assignments[passenger_idx]
+                    else:
+                        line_repr = "no_MT"
+                        mod_cost = self._compute_direct_mod_cost(passenger_idx)
+                    csv_file.write(f"{passenger_idx},{line_repr},{mod_cost}\n")
+            logging.info("Exported passenger assignments to %s", csv_path)
+        except OSError as exc:
+            logging.warning("Unable to write passenger assignments CSV %s: %s", csv_path, exc)
 
     # Implementation of the column generation process. Outputs the solution of the configuration LP before rounding.
     def solve_master_LP(self):
@@ -250,7 +378,13 @@ class line_planning_solver:
         print("final solution:  objective =", obj_temp)
         return solution, active_sets, sets, t_fin - t_2
 
-    def solve_ILP(self):
+    def solve_ILP(
+        self,
+        export_model: bool = False,
+        export_solution: bool = False,
+        output_dir: Union[Path, str, None] = None,
+        gurobi_log_file: Union[Path, str, None] = None,
+    ):
         request_count = self.line_instance.nb_pass
         line_count = self.line_instance.nb_lines
         bus_capacity = self.line_instance.capacity
@@ -317,10 +451,11 @@ class line_planning_solver:
         budget_constraint = master.addConstr(LinExpr(coef,var) <= self.line_instance.B, name="budget_constraints")
         master.update()
 
-        # Model parameters
-        master.Params.Presolve = 0
-        master.Params.PreCrush = 1
-        master.Params.Cuts = 0
+        output_dir_path: Optional[Path] = Path(output_dir) if output_dir is not None else None
+        if gurobi_log_file is not None:
+            gurobi_log_path = Path(gurobi_log_file)
+            gurobi_log_path.parent.mkdir(parents=True, exist_ok=True)
+            master.Params.LogFile = str(gurobi_log_path)
 
         logging.info('method: %s', master.Params.Method)
         t0 = time.time()
@@ -328,18 +463,40 @@ class line_planning_solver:
         t1 = time.time()
         logging.info("Execution time: %s", t1-t0)
         logging.info("Final solution: %s", master.ObjVal)
-        for l in range(line_count_total):
-            if y[l].X>0:
-                op = [l//max_frequency,l%max_frequency]
-                print("line", l, y[l].X, 'cost', lines_cost[l])
-                print(op)
-                '''for p in range(nb_pass):
-                    if(self.line_instance.values[p][l // max_frequency]>0):
-                        print("passenger", p, x[l,p].X, self.line_instance.values[p][l // max_frequency])'''
+
+        if export_model and output_dir_path is not None:
+            output_dir_path.mkdir(parents=True, exist_ok=True)
+            master.write(str(output_dir_path / "ILP.lp"))
+
+        if export_solution and output_dir_path is not None:
+            output_dir_path.mkdir(parents=True, exist_ok=True)
+            master.write(str(output_dir_path / "ILP.sol"))
+
+        export_dir = output_dir_path if output_dir_path is not None else Path(".")
+        self._export_used_lines(
+            output_dir=export_dir,
+            line_vars=y,
+            line_costs=lines_cost,
+            max_frequency_value=max_frequency,
+            label="default",
+        )
+
+        self._export_passenger_assignments(
+            output_dir=export_dir,
+            passenger_vars=x,
+            max_frequency_value=max_frequency,
+            label="default",
+        )
 
         return master.ObjVal, t1-t0
 
-    def solve_modified_ILP(self, export_model=False, export_solution=False):
+    def solve_modified_ILP(
+        self,
+        export_model: bool = False,
+        export_solution: bool = False,
+        output_dir: Union[Path, str] = Path("."),
+        gurobi_log_file: Union[Path, str, None] = None,
+    ):
         request_count = self.line_instance.nb_pass
         line_count = self.line_instance.nb_lines
         bus_capacity = self.line_instance.capacity
@@ -401,13 +558,16 @@ class line_planning_solver:
         mod_cost_expression = passenger_vars.prod(mod_costs)
         master.addConstr(line_costs_expression + mod_cost_expression <= self.line_instance.B, name="budget_constraint")
 
-        # Model parameters
-        master.Params.Presolve = 0
-        master.Params.PreCrush = 1
-        master.Params.Cuts = 0
+        output_dir_path = Path(output_dir)
+        output_dir_path.mkdir(parents=True, exist_ok=True)
+
+        if gurobi_log_file is not None:
+            gurobi_log_path = Path(gurobi_log_file)
+            gurobi_log_path.parent.mkdir(parents=True, exist_ok=True)
+            master.Params.LogFile = str(gurobi_log_path)
 
         if export_model:
-            master.write("modified_ILP.lp")
+            master.write(str(output_dir_path / "modified_ILP.lp"))
 
         t0 = time.time()
         master.optimize()
@@ -417,20 +577,33 @@ class line_planning_solver:
         logging.info("Final solution: %s", master.ObjVal)
 
         if export_solution:
-            master.write("modified_ILP.sol")
+            master.write(str(output_dir_path / "modified_ILP.sol"))
 
-        for l in range(line_count_total):
-            if line_vars[l].X>0:
-                op = [l//max_frequency,l%max_frequency]
-                print("line", l, line_vars[l].X, 'cost', line_costs[l])
-                print(op)
-                '''for p in range(nb_pass):
-                    if(self.line_instance.values[p][l // max_frequency]>0):
-                        print("passenger", p, x[l,p].X, self.line_instance.values[p][l // max_frequency])'''
+        self._export_used_lines(
+            output_dir=output_dir_path,
+            line_vars=line_vars,
+            line_costs=line_costs,
+            max_frequency_value=max_frequency,
+            label="modified",
+        )
+
+        self._export_passenger_assignments(
+            output_dir=output_dir_path,
+            passenger_vars=passenger_vars,
+            max_frequency_value=max_frequency,
+            label="modified",
+            no_mt_index=line_count_total,
+        )
 
         return master.ObjVal, t1-t0
 
-    def solve_ILP_with_empty_trips(self, export_model=False, export_solution=False):
+    def solve_ILP_with_empty_trips(
+        self,
+        export_model: bool = False,
+        export_solution: bool = False,
+        output_dir: Union[Path, str] = Path("."),
+        gurobi_log_file: Union[Path, str, None] = None,
+    ):
         request_count = self.line_instance.nb_pass
         line_count = self.line_instance.nb_lines
         bus_capacity = self.line_instance.capacity
@@ -543,13 +716,18 @@ class line_planning_solver:
                         name="first_last_mile[%d][%d]" % (node_from, node_to)
                     )
 
-        # Model parameters
-        master.Params.Presolve = 0
-        master.Params.PreCrush = 1
-        master.Params.Cuts = 0
+        output_dir_path = Path(output_dir)
+
+        output_dir_path = Path(output_dir)
+        output_dir_path.mkdir(parents=True, exist_ok=True)
+
+        if gurobi_log_file is not None:
+            gurobi_log_path = Path(gurobi_log_file)
+            gurobi_log_path.parent.mkdir(parents=True, exist_ok=True)
+            master.Params.LogFile = str(gurobi_log_path)
 
         if export_model:
-            master.write("ILP_with_empty_trips.lp")
+            master.write(str(output_dir_path / "ILP_with_empty_trips.lp"))
 
         t0 = time.time()
         master.optimize()
@@ -559,16 +737,23 @@ class line_planning_solver:
         logging.info("Final solution: %s", master.ObjVal)
 
         if export_solution:
-            master.write("ILP_with_empty_trips.sol")
+            master.write(str(output_dir_path / "ILP_with_empty_trips.sol"))
 
-        for l in range(line_count_total):
-            if line_vars[l].X>0:
-                op = [l//max_frequency,l%max_frequency]
-                print("line", l, line_vars[l].X, 'cost', line_costs[l])
-                print(op)
-                '''for p in range(nb_pass):
-                    if(self.line_instance.values[p][l // max_frequency]>0):
-                        print("passenger", p, x[l,p].X, self.line_instance.values[p][l // max_frequency])'''
+        self._export_used_lines(
+            output_dir=output_dir_path,
+            line_vars=line_vars,
+            line_costs=line_costs,
+            max_frequency_value=max_frequency,
+            label="empty_trips",
+        )
+
+        self._export_passenger_assignments(
+            output_dir=output_dir_path,
+            passenger_vars=passenger_vars,
+            max_frequency_value=max_frequency,
+            label="empty_trips",
+            no_mt_index=line_count_total,
+        )
 
         return master.ObjVal, t1-t0
 
@@ -671,17 +856,7 @@ class line_planning_solver:
         return best_value, budg, op, v, nb_respect, mean, execution_time
 
 if __name__ == "__main__":
-
-    month = "april"
-    # month = 'march'
-    # month = 'feb'
     np.random.seed(127)
-    demand_file = "OD_matrix_april_fhv_1_percent.txt" # override the month setting and uses a custom demand file
-    # demand_file = "OD_matrix_april_fhv_10_percent.txt" # override the month setting and uses a custom demand file
-    # demand_file = None
-    run_proposed_method = False
-    use_model_with_mod_costs = False # stage 1 model
-    use_model_with_empty_trips = True # stage 2 model
 
     average_value_LP = 0
     average_value_ILP = 0
@@ -690,12 +865,6 @@ if __name__ == "__main__":
     time_ILP = 0
 
     max_frequency = 1
-    nb_l = 10
-    # nb_p = 13847
-    # nb_p = 12301
-    # nb_p = 13851
-    nb_p = 130
-    # nb_p = 1300
 
     logging.info("Solving Manhattan instance with %s lines and %s passengers", nb_l, nb_p)
 
@@ -717,37 +886,17 @@ if __name__ == "__main__":
         demand_file=demand_file,
     )
 
-    for ind in range(0, 1):
-        if ind == 0:
-            # Budget = 100
-            Budget = 10000
-            max_frequency = 1
-            line_inst.B = Budget * 0.95
-        if ind == 1:
-            Budget = 20000
-            max_frequency = 1
-            line_inst.B = Budget * 0.95
-        if ind == 2:
-            Budget = 30000
-            max_frequency = 1
-            line_inst.B = Budget * 0.95
-        if ind == 3:
-            Budget = 40000
-            max_frequency = 1
-            line_inst.B = Budget * 0.95
-        if ind == 4:
-            Budget = 50000
-            max_frequency = 1
-            line_inst.B = Budget * 0.95
-        if ind == 5:
-            Budget = 100000
-            max_frequency = 1
-            line_inst.B = Budget * 0.95
-        if ind == 6:
-            Budget = 200000
-            max_frequency = 1
-            line_inst.B = Budget * 0.95
-        print("iter", ind, Budget, max_frequency)
+    instance_size_label = _get_instance_size_label(demand_file)
+    method_label = _get_method_label(use_model_with_mod_costs, use_model_with_empty_trips)
+    results_directory = Path("Results") / instance_size_label / method_label
+    results_directory.mkdir(parents=True, exist_ok=True)
+
+    # budgets = [10_000, 20_000, 30_000, 40_000, 50_000, 100_000, 200_000]
+    budgets = [10_000]
+
+    for budget in budgets:
+        line_inst.B = budget * 0.95
+        logging.info("Computing the line planning problem with budget %s", budget)
 
         candidate_set_of_lines = line_inst.candidate_set_of_lines
         print("candidate_set_of_lines")
@@ -763,13 +912,51 @@ if __name__ == "__main__":
 
         # Solve the line planning problem with ILP
         # try:
-        logging.info("Solving the line planning problem with ILP")
-        solver.line_instance.B = Budget
-        if use_model_with_mod_costs:
-            obj_val, run_time_ILP = solver.solve_modified_ILP(export_model=True, export_solution=True)
-        elif use_model_with_empty_trips:
-            obj_val, run_time_ILP = solver.solve_ILP_with_empty_trips(export_model=True, export_solution=True)
-        else:
-            obj_val, run_time_ILP = solver.solve_ILP()
+        budget_directory = results_directory / f"budget_{budget}"
+        budget_directory.mkdir(parents=True, exist_ok=True)
+
+        run_log_path = budget_directory / "run.log"
+        gurobi_log_path = budget_directory / "gurobi.log"
+        log_handler = _configure_run_logging(run_log_path)
+        try:
+            logging.info("Solving the line planning problem with ILP")
+            solver.line_instance.B = Budget
+            if use_model_with_mod_costs:
+                obj_val, run_time_ILP = solver.solve_modified_ILP(
+                    export_model=True,
+                    export_solution=True,
+                    output_dir=budget_directory,
+                    gurobi_log_file=gurobi_log_path,
+                )
+            elif use_model_with_empty_trips:
+                obj_val, run_time_ILP = solver.solve_ILP_with_empty_trips(
+                    export_model=True,
+                    export_solution=True,
+                    output_dir=budget_directory,
+                    gurobi_log_file=gurobi_log_path,
+                )
+            else:
+                obj_val, run_time_ILP = solver.solve_ILP(
+                    export_model=True,
+                    export_solution=True,
+                    output_dir=budget_directory,
+                    gurobi_log_file=gurobi_log_path,
+                )
+        finally:
+            root_logger = logging.getLogger()
+            root_logger.removeHandler(log_handler)
+            log_handler.close()
+
+        results_payload = {
+            "budget": budget,
+            "objective_value": obj_val,
+            "run_time_seconds": run_time_ILP,
+            "method": method_label,
+            "instance_size": instance_size_label,
+            "demand_file": demand_file,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        results_file = budget_directory / "metrics.json"
+        results_file.write_text(json.dumps(results_payload, indent=2))
         # except Exception as e:
         #     logging.error("error with ILP: %s", e)
