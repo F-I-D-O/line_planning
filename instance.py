@@ -6,6 +6,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import NamedTuple, Optional, List, Tuple
 
+import h5py
 import numpy as np
 
 from tqdm import tqdm
@@ -612,17 +613,12 @@ class line_instance:
         list, list, List[List[TripOption]], list, list, list, list, np.ndarray, List[List[int]]]:
         # TODO handle the case where remaining stops pop in skeleton method
 
-        # load distance matrix for G
-        # Distance between each pair of nodes
         logging.info('Loading distance matrix')
-        f1 = open("manhattan_dist_1.txt", "r")
-        f2 = open("manhattan_dist_2.txt", "r")
-        f3 = open("manhattan_dist_3.txt", "r")
-        distances = np.loadtxt(f1) + np.loadtxt(f2) + np.loadtxt(f3)
+        with  h5py.File('dm.h5', 'r') as f:
+            distances = np.array(f['dm'])
         logging.info('Distance matrix loaded')
 
         # load OD_matrix
-
         # passengers = np.loadtxt(f)
         # my_list = [line.split(' ') for line in open('OD_matrix_feb.txt','r')]
         # my_list = [line.split(' ') for line in open('OD_matrix_random2.txt','r')]
