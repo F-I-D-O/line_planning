@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple, Union
 
 import numpy as np
+import pandas as pd
 from gurobipy import *
 
 from instance import *
@@ -53,8 +54,6 @@ allowed_time = 3600 * 24
 
 EPS = 1.e-5
 
-
-
 fixed_cost = 1
 max_frequency = 1
 
@@ -96,10 +95,9 @@ class line_planning_solver:
         output_dir: Path,
         line_vars,
         line_costs,
-        max_frequency_value: int
     ) -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
-        csv_path = output_dir / f"used_lines.csv"
+        csv_path = output_dir / "used_lines.csv"
         try:
             with csv_path.open("w", encoding="utf-8") as csv_file:
                 csv_file.write("line,frequency,line_cost\n")
@@ -107,7 +105,7 @@ class line_planning_solver:
                     activation = var.X
                     if activation > 0:
                         csv_file.write(
-                            f"{l // max_frequency_value},{l % max_frequency_value},{line_costs[l]}\n"
+                            f"{l // max_frequency},{l % max_frequency},{line_costs[l]}\n"
                         )
             logging.info("Exported used lines to %s", csv_path)
         except OSError as exc:
@@ -122,11 +120,13 @@ class line_planning_solver:
         self,
         output_dir: Path,
         passenger_vars,
-        max_frequency_value: int
-    ) -> Dict[int, Dict[str, Union[int, str, float, bool, None]]]:
+        no_assignment_means_no_mt_option: bool = False
+    ) -> pd.DataFrame:
         output_dir.mkdir(parents=True, exist_ok=True)
-        csv_path = output_dir / f"passenger_assignments.csv"
-        assignments: Dict[int, Dict[str, Union[int, str, float, bool, None]]] = {}
+        csv_path = output_dir / "passenger_assignments.csv"
+
+        rows = []
+        assigned_passengers = set()
 
         for (line_idx, passenger_idx), var in passenger_vars.items():
             if var.X > 0:
@@ -136,69 +136,106 @@ class line_planning_solver:
                     mod_cost = self._compute_direct_mod_cost(passenger_idx)
                     route_index: Optional[int] = None
                 else:
-                    route_index = line_idx // max_frequency_value
+                    route_index = line_idx // max_frequency
                     line_repr = route_index
                     trip_option: TripOption = self.line_instance.optimal_trip_options[passenger_idx][route_index]
                     mod_cost = trip_option.first_mile_cost + trip_option.last_mile_cost
-                assignments[passenger_idx] = {
-                    "line_index": line_idx,
-                    "route_index": route_index,
-                    "line_repr": line_repr,
-                    "mod_cost": mod_cost,
-                    "is_no_mt": is_no_mt,
-                }
+                rows.append(
+                    {
+                        "passenger": passenger_idx,
+                        "line_index": int(line_idx),
+                        "route_index": route_index if route_index is not None else np.nan,
+                        "line_repr": line_repr,
+                        "mod_cost": mod_cost,
+                        "is_no_mt": is_no_mt,
+                    }
+                )
+                assigned_passengers.add(passenger_idx)
+
+        for passenger_idx in range(self.line_instance.nb_pass):
+            if passenger_idx in assigned_passengers:
+                continue
+            if no_assignment_means_no_mt_option:
+                rows.append(
+                    {
+                        "passenger": passenger_idx,
+                        "line_index": self.line_count_total,
+                        "route_index": np.nan,
+                        "line_repr": "no_MT",
+                        "mod_cost": self._compute_direct_mod_cost(passenger_idx),
+                        "is_no_mt": True,
+                    }
+                )
+            else:
+                rows.append(
+                    {
+                        "passenger": passenger_idx,
+                        "line_index": -1,
+                        "route_index": np.nan,
+                        "line_repr": "Dropped",
+                        "mod_cost": 0.0,
+                        "is_no_mt": False,
+                    }
+                )
+
+        assignments_df = pd.DataFrame(rows)
+        if not assignments_df.empty:
+            assignments_df.sort_values("passenger", inplace=True)
+            assignments_df.reset_index(drop=True, inplace=True)
+        else:
+            assignments_df = pd.DataFrame(
+                columns=["passenger", "line_index", "route_index", "line_repr", "mod_cost", "is_no_mt"]
+            )
 
         try:
-            with csv_path.open("w", encoding="utf-8") as csv_file:
-                csv_file.write("passenger,line,mod_cost\n")
-                for passenger_idx in range(self.line_instance.nb_pass):
-                    if passenger_idx not in assignments:
-                        assignments[passenger_idx] = {
-                            "line_index": -1,
-                            "route_index": None,
-                            "line_repr": "Dropped",
-                            "mod_cost": 0,
-                            "is_no_mt": False,
-                        }
-                    entry = assignments[passenger_idx]
-                    csv_file.write(f"{passenger_idx},{entry['line_repr']},{entry['mod_cost']}\n")
+            export_df = assignments_df[["passenger", "line_repr", "mod_cost"]].copy()
+            export_df.rename(columns={"line_repr": "line"}, inplace=True)
+            export_df.to_csv(csv_path, index=False)
             logging.info("Exported passenger assignments to %s", csv_path)
         except OSError as exc:
             logging.warning("Unable to write passenger assignments CSV %s: %s", csv_path, exc)
 
-        return assignments
+        return assignments_df
 
     def _solve_and_export_flows(
         self,
-        assignments: Dict[int, Dict[str, Union[int, str, float, bool, None]]],
+        assignments: pd.DataFrame,
         output_dir: Path,
-        max_frequency_value: int,
     ) -> None:
         required_flow = defaultdict(int)
         used_nodes = set()
-        for passenger_idx, entry in assignments.items():
+        for row in assignments.itertuples(index=False):
+            line_index = int(row.line_index)
+            passenger_idx = int(row.passenger)
+
             # skip dropped requests
-            if entry["line_index"] > 0:
-                origin = self.line_instance.requests[passenger_idx][0]
-                destination = self.line_instance.requests[passenger_idx][1]
-                used_nodes.update([origin, destination])
-                if entry.get("is_no_mt", False):
-                    required_flow[(origin, destination)] += 1
-                else:
-                    route_index = entry.get("route_index")
-                    trip_option: TripOption = self.line_instance.optimal_trip_options[passenger_idx][route_index]
-                    pickup = trip_option.mt_pickup_node
-                    drop_off = trip_option.mt_drop_off_node
-                    required_flow[(origin, pickup)] += 1
-                    required_flow[(drop_off, destination)] += 1
-                    used_nodes.update([pickup, drop_off])
+            if line_index < 0:
+                continue
+
+            origin = self.line_instance.requests[passenger_idx][0]
+            destination = self.line_instance.requests[passenger_idx][1]
+            used_nodes.update([origin, destination])
+
+            if bool(row.is_no_mt):
+                required_flow[(origin, destination)] += 1
+            else:
+                route_index = row.route_index
+                if pd.isna(route_index):
+                    continue
+                route_index = int(route_index)
+                trip_option: TripOption = self.line_instance.optimal_trip_options[passenger_idx][route_index]
+                pickup = trip_option.mt_pickup_node
+                drop_off = trip_option.mt_drop_off_node
+                required_flow[(origin, pickup)] += 1
+                required_flow[(drop_off, destination)] += 1
+                used_nodes.update([pickup, drop_off])
 
         # debug required flow cost
-        C_req = sum(self.line_instance.dm[i][j] * demand for (i,j), demand in required_flow.items())
+        C_req = sum(self.line_instance.dm[i][j] * demand for (i, j), demand in required_flow.items())
         print(f"Required flow cost: {C_req}")
 
         used_nodes_list = list(used_nodes)
-        flow_model = Model(f"Flow Optimization")
+        flow_model = Model("Flow Optimization")
         flow_model.ModelSense = GRB.MINIMIZE
 
         # flow variables
@@ -583,20 +620,18 @@ class line_planning_solver:
         self._export_used_lines(
             output_dir=export_dir,
             line_vars=y,
-            line_costs=lines_cost,
-            max_frequency_value=max_frequency,
+            line_costs=lines_cost
         )
 
         assignments = self._export_passenger_assignments(
             output_dir=export_dir,
             passenger_vars=x,
-            max_frequency_value=max_frequency,
+            no_assignment_means_no_mt_option=True
         )
 
         self._solve_and_export_flows(
             assignments=assignments,
-            output_dir=export_dir,
-            max_frequency_value=max_frequency,
+            output_dir=export_dir
         )
 
         return master.ObjVal, t1-t0
@@ -691,19 +726,16 @@ class line_planning_solver:
             output_dir=output_dir_path,
             line_vars=line_vars,
             line_costs=line_costs,
-            max_frequency_value=max_frequency,
         )
 
         assignments = self._export_passenger_assignments(
             output_dir=output_dir_path,
             passenger_vars=passenger_vars,
-            max_frequency_value=max_frequency
         )
 
         self._solve_and_export_flows(
             assignments=assignments,
             output_dir=output_dir_path,
-            max_frequency_value=max_frequency
         )
 
         return master.ObjVal, t1-t0
@@ -874,13 +906,11 @@ class line_planning_solver:
             output_dir=output_dir_path,
             line_vars=line_vars,
             line_costs=line_costs,
-            max_frequency_value=max_frequency,
         )
 
         assignments = self._export_passenger_assignments(
             output_dir=output_dir_path,
             passenger_vars=passenger_vars,
-            max_frequency_value=max_frequency
         )
 
         flows = {
