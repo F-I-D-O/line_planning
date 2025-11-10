@@ -14,6 +14,9 @@ from gurobipy import *
 from instance import *
 import log
 
+# budgets = [10_000, 20_000, 30_000, 40_000, 50_000, 100_000, 200_000]
+budgets = [30_000]
+
 # By default, 100% demand is used...
 month = "april"
 # nb_p = 13847 # april
@@ -86,6 +89,7 @@ class line_planning_solver:
 
     def __init__(self, line_instance):
         self.line_instance = line_instance
+        self.line_count_total = self.line_instance.nb_lines * max_frequency
 
     def _export_used_lines(
         self,
@@ -118,8 +122,7 @@ class line_planning_solver:
         self,
         output_dir: Path,
         passenger_vars,
-        max_frequency_value: int,
-        no_mt_index: Optional[int] = None,
+        max_frequency_value: int
     ) -> Dict[int, Dict[str, Union[int, str, float, bool, None]]]:
         output_dir.mkdir(parents=True, exist_ok=True)
         csv_path = output_dir / f"passenger_assignments.csv"
@@ -127,7 +130,7 @@ class line_planning_solver:
 
         for (line_idx, passenger_idx), var in passenger_vars.items():
             if var.X > 0:
-                is_no_mt = no_mt_index is not None and line_idx == no_mt_index
+                is_no_mt = line_idx == self.line_count_total
                 if is_no_mt:
                     line_repr: Union[int, str] = "no_MT"
                     mod_cost = self._compute_direct_mod_cost(passenger_idx)
@@ -151,11 +154,11 @@ class line_planning_solver:
                 for passenger_idx in range(self.line_instance.nb_pass):
                     if passenger_idx not in assignments:
                         assignments[passenger_idx] = {
-                            "line_index": no_mt_index if no_mt_index is not None else -1,
+                            "line_index": -1,
                             "route_index": None,
-                            "line_repr": "no_MT",
-                            "mod_cost": self._compute_direct_mod_cost(passenger_idx),
-                            "is_no_mt": True,
+                            "line_repr": "Dropped",
+                            "mod_cost": 0,
+                            "is_no_mt": False,
                         }
                     entry = assignments[passenger_idx]
                     csv_file.write(f"{passenger_idx},{entry['line_repr']},{entry['mod_cost']}\n")
@@ -171,67 +174,63 @@ class line_planning_solver:
         output_dir: Path,
         max_frequency_value: int,
     ) -> None:
-        if not assignments:
-            logging.info("No assignments available for flow optimization")
-            return
-
         required_flow = defaultdict(int)
         used_nodes = set()
         for passenger_idx, entry in assignments.items():
-            origin = self.line_instance.requests[passenger_idx][0]
-            destination = self.line_instance.requests[passenger_idx][1]
-            used_nodes.update([origin, destination])
-            if entry.get("is_no_mt", False):
-                required_flow[(origin, destination)] += 1
-            else:
-                route_index = entry.get("route_index")
-                if route_index is None:
-                    continue
-                trip_option: TripOption = self.line_instance.optimal_trip_options[passenger_idx][route_index]
-                pickup = trip_option.mt_pickup_node
-                drop_off = trip_option.mt_drop_off_node
-                required_flow[(origin, pickup)] += 1
-                required_flow[(drop_off, destination)] += 1
-                used_nodes.update([pickup, drop_off])
+            # skip dropped requests
+            if entry["line_index"] > 0:
+                origin = self.line_instance.requests[passenger_idx][0]
+                destination = self.line_instance.requests[passenger_idx][1]
+                used_nodes.update([origin, destination])
+                if entry.get("is_no_mt", False):
+                    required_flow[(origin, destination)] += 1
+                else:
+                    route_index = entry.get("route_index")
+                    trip_option: TripOption = self.line_instance.optimal_trip_options[passenger_idx][route_index]
+                    pickup = trip_option.mt_pickup_node
+                    drop_off = trip_option.mt_drop_off_node
+                    required_flow[(origin, pickup)] += 1
+                    required_flow[(drop_off, destination)] += 1
+                    used_nodes.update([pickup, drop_off])
 
-        if not required_flow:
-            logging.info("No MoD flows required", )
-            self._export_flows({}, output_dir)
-            return
+        # debug required flow cost
+        C_req = sum(self.line_instance.dm[i][j] * demand for (i,j), demand in required_flow.items())
+        print(f"Required flow cost: {C_req}")
 
         used_nodes_list = list(used_nodes)
-        flow_model = Model(f"FlowOptimization")
+        flow_model = Model(f"Flow Optimization")
         flow_model.ModelSense = GRB.MINIMIZE
-        flow_model.Params.OutputFlag = 0
 
-        flow_vars = {}
-        for i in used_nodes_list:
-            for j in used_nodes_list:
-                if i == j:
-                    continue
-                flow_vars[(i, j)] = flow_model.addVar(lb=0, vtype=GRB.INTEGER, name=f"phi[{i},{j}]")
-        flow_model.update()
+        # flow variables
+        logging.info("Building flow variables")
+        flow_vars = flow_model.addVars(
+            used_nodes_list,
+            used_nodes_list,
+            vtype=GRB.INTEGER,
+            name="phi",
+            obj={(x, y): self.line_instance.dm[x][y] for x in used_nodes_list for y in used_nodes_list}
+        )
 
+        # required flow constraints
         for (i, j), demand in required_flow.items():
             if i == j:
                 continue
             if (i, j) in flow_vars:
                 flow_model.addConstr(flow_vars[(i, j)] >= demand, name=f"demand[{i},{j}]")
 
-        for node in used_nodes_list:
-            incoming = [flow_vars[(i, node)] for i in used_nodes_list if i != node and (i, node) in flow_vars]
-            outgoing = [flow_vars[(node, j)] for j in used_nodes_list if j != node and (node, j) in flow_vars]
-            if incoming or outgoing:
-                flow_model.addConstr(
-                    quicksum(incoming) - quicksum(outgoing) == 0,
-                    name=f"balance[{node}]",
-                )
+        # Flow conservation constraints
+        logging.info("Building flow conservation constraints")
+        flow_model.addConstrs(flow_vars.sum('*', j) - flow_vars.sum(j, '*') == 0 for j in used_nodes_list)
 
-        flow_cost_expr = quicksum(
-            self.line_instance.dm[i][j] * var for (i, j), var in flow_vars.items()
-        )
-        flow_model.setObjective(flow_cost_expr)
+        flow_model.write(str(output_dir / "flow_ILP.lp"))
+
         flow_model.optimize()
+
+        flow_model.write(str(output_dir / "flow_ILP.sol"))
+
+        print("Model obj:", flow_model.ObjVal, " 2x baseline:", 2 * C_req)
+
+        assert flow_model.ObjVal <= 2 * C_req + 1e-8, "Shouldn't exceed 2× under symmetric metric nonneg costs"
 
         flows = {
             (i, j): var.X
@@ -499,8 +498,6 @@ class line_planning_solver:
         line_count = self.line_instance.nb_lines
         bus_capacity = self.line_instance.capacity
 
-        line_count_total = line_count * max_frequency
-
         lines_cost = [
             fixed_cost * self.line_instance.lengths_travel_times[l // max_frequency]
             + l
@@ -516,13 +513,13 @@ class line_planning_solver:
 
         # Line variables
         y = {} # binary variable indicating if line l is opened
-        for l in range(line_count_total):
+        for l in range(self.line_count_total):
             y[l] = master.addVar(lb=0.0, ub=GRB.INFINITY, vtype=GRB.BINARY, obj = 0, name="y[%d]"%l)
         master.update()
 
         # Passenger variables
         x = {}
-        for l in range(line_count_total):
+        for l in range(self.line_count_total):
             for p in range(request_count):
                 val = self.line_instance.optimal_trip_options[p][l // max_frequency].value
                 if val > 0:
@@ -533,7 +530,7 @@ class line_planning_solver:
         one_line_per_passenger = {}
         for p in range(request_count):
             var = []
-            for l in range(line_count_total):
+            for l in range(self.line_count_total):
                 val = self.line_instance.optimal_trip_options[p][l // max_frequency].value
                 if val > 0:
                     var.append(x[l,p])
@@ -543,7 +540,7 @@ class line_planning_solver:
 
         # Bus capacity constraints
         capacity_constraints = {}
-        for l in range(line_count_total):
+        for l in range(self.line_count_total):
             f_l = l%max_frequency + 1
             length = self.line_instance.set_of_lines[l//max_frequency][0]
             for k in range(length):
@@ -556,8 +553,8 @@ class line_planning_solver:
         master.update()
 
         # Budget constraint
-        var = [y[l] for l in range(line_count_total)]
-        coef = [lines_cost[l] for l in range(line_count_total)]
+        var = [y[l] for l in range(self.line_count_total)]
+        coef = [lines_cost[l] for l in range(self.line_count_total)]
         budget_constraint = master.addConstr(LinExpr(coef,var) <= self.line_instance.B, name="budget_constraints")
         master.update()
 
@@ -612,10 +609,7 @@ class line_planning_solver:
         gurobi_log_file: Union[Path, str, None] = None,
     ):
         request_count = self.line_instance.nb_pass
-        line_count = self.line_instance.nb_lines
         bus_capacity = self.line_instance.capacity
-
-        line_count_total = line_count * max_frequency
 
         master = Model("Modified ILP") # master LP problem
         master.ModelSense = -1 # maximize the objective function
@@ -623,18 +617,18 @@ class line_planning_solver:
         master.Params.timeLimit = allowed_time
 
         # binary variables indicating if line l is opened
-        line_vars = master.addVars(line_count_total, vtype=GRB.BINARY, name="y")
+        line_vars = master.addVars(self.line_count_total, vtype=GRB.BINARY, name="y")
 
         # binary variables indicating if passenger p is assigned to line l. If first mile + last mile costs are
         # higher than the no_MT MoD cost, the line-passenger combination is not considered at all
         potential_line_passenger_combinations = [
-            (l, p) for l in range(line_count_total) for p in range(request_count)
+            (l, p) for l in range(self.line_count_total) for p in range(request_count)
             if self.line_instance.optimal_trip_options[p][l // max_frequency].value > 0
         ]
         passenger_vars = master.addVars(potential_line_passenger_combinations, vtype=GRB.BINARY, obj=1, name="x")
         # add no MT variables for each passenger
         for p in range(request_count):
-            passenger_vars[line_count_total, p] = master.addVar(vtype=GRB.BINARY, obj=1, name="x[no_MT,%d]" % p)
+            passenger_vars[self.line_count_total, p] = master.addVar(vtype=GRB.BINARY, obj=1, name="x[no_MT,%d]" % p)
 
         # One line per passenger constraints
         master.addConstrs(
@@ -644,7 +638,7 @@ class line_planning_solver:
 
         # Bus capacity constraints
         capacity_constraints = {}
-        for l in range(line_count_total):
+        for l in range(self.line_count_total):
             f_l = l%max_frequency + 1
             length = self.line_instance.set_of_lines[l//max_frequency][0]
             for k in range(length):
@@ -661,12 +655,12 @@ class line_planning_solver:
             + l
             % max_frequency
             * self.line_instance.lengths_travel_times[l // max_frequency]
-            for l in range(line_count_total)
+            for l in range(self.line_count_total)
         ]
         line_costs_expression = line_vars.prod(line_costs)
         mod_costs = {}
         for p in range(request_count):
-            for l in range(line_count_total + 1):
+            for l in range(self.line_count_total + 1):
                 optimal_trip_option: TripOption = self.line_instance.optimal_trip_options[p][l // max_frequency]
                 mod_costs[l,p] = optimal_trip_option.first_mile_cost + optimal_trip_option.last_mile_cost
         mod_cost_expression = passenger_vars.prod(mod_costs)
@@ -703,8 +697,7 @@ class line_planning_solver:
         assignments = self._export_passenger_assignments(
             output_dir=output_dir_path,
             passenger_vars=passenger_vars,
-            max_frequency_value=max_frequency,
-            no_mt_index=line_count_total,
+            max_frequency_value=max_frequency
         )
 
         self._solve_and_export_flows(
@@ -723,11 +716,7 @@ class line_planning_solver:
         gurobi_log_file: Union[Path, str, None] = None,
     ):
         request_count = self.line_instance.nb_pass
-        line_count = self.line_instance.nb_lines
         bus_capacity = self.line_instance.capacity
-        node_count = len(self.line_instance.dm)
-
-        line_count_total = line_count * max_frequency
 
         logging.info("Building ILP model with empty trips")
 
@@ -738,18 +727,18 @@ class line_planning_solver:
 
         # VARIABLES
         # binary variables indicating if line l is opened
-        line_vars = master.addVars(line_count_total, vtype=GRB.BINARY, name="y")
+        line_vars = master.addVars(self.line_count_total, vtype=GRB.BINARY, name="y")
 
         # binary variables indicating if passenger p is assigned to line l. If first mile + last mile costs are
         # higher than the no_MT MoD cost, the line-passenger combination is not considered at all
         potential_line_passenger_combinations = [
-            (l, p) for l in range(line_count_total) for p in range(request_count)
+            (l, p) for l in range(self.line_count_total) for p in range(request_count)
             if self.line_instance.optimal_trip_options[p][l // max_frequency].value > 0
         ]
         passenger_vars = master.addVars(potential_line_passenger_combinations, vtype=GRB.BINARY, obj=1, name="x")
         # add no MT variables for each passenger
         for p in range(request_count):
-            passenger_vars[line_count_total, p] = master.addVar(vtype=GRB.BINARY, obj=1, name="x[no_MT,%d]" % p)
+            passenger_vars[self.line_count_total, p] = master.addVar(vtype=GRB.BINARY, obj=1, name="x[no_MT,%d]" % p)
 
         # collections for the MoD flow constraints
         first_mile_vars = {}
@@ -766,7 +755,7 @@ class line_planning_solver:
             request_to = self.line_instance.requests[p][1]
             used_nodes.add(request_from)
             used_nodes.add(request_to)
-            for l in range(line_count_total):
+            for l in range(self.line_count_total):
                 optimal_trip_option: TripOption = self.line_instance.optimal_trip_options[p][l // max_frequency]
                 mt_pickup_node = optimal_trip_option.mt_pickup_node
                 mt_drop_off_node = optimal_trip_option.mt_drop_off_node
@@ -792,7 +781,7 @@ class line_planning_solver:
                 no_mt_vars[request_from] = {}
             if request_to not in no_mt_vars[request_from]:
                 no_mt_vars[request_from][request_to] = []
-            no_mt_vars[request_from][request_to].append(passenger_vars[line_count_total,p])
+            no_mt_vars[request_from][request_to].append(passenger_vars[self.line_count_total,p])
         used_nodes_list = list(used_nodes)
 
         # integer flow variables indicating the MoD flow on each edge of the complete graph
@@ -809,7 +798,7 @@ class line_planning_solver:
         # Bus capacity constraints
         logging.info("Building capacity constraints")
         capacity_constraints = {}
-        for l in range(line_count_total):
+        for l in range(self.line_count_total):
             f_l = l%max_frequency + 1
             length = self.line_instance.set_of_lines[l//max_frequency][0]
             for k in range(length):
@@ -827,7 +816,7 @@ class line_planning_solver:
             + l
             % max_frequency
             * self.line_instance.lengths_travel_times[l // max_frequency]
-            for l in range(line_count_total)
+            for l in range(self.line_count_total)
         ]
         line_costs_expression = line_vars.prod(line_costs)
         flow_costs = {}
@@ -891,8 +880,7 @@ class line_planning_solver:
         assignments = self._export_passenger_assignments(
             output_dir=output_dir_path,
             passenger_vars=passenger_vars,
-            max_frequency_value=max_frequency,
-            no_mt_index=line_count_total,
+            max_frequency_value=max_frequency
         )
 
         flows = {
@@ -1035,9 +1023,6 @@ if __name__ == "__main__":
     method_label = _get_method_label(use_model_with_mod_costs, use_model_with_empty_trips)
     base_results_directory = Path("Results") / instance_size_label
     base_results_directory.mkdir(parents=True, exist_ok=True)
-
-    # budgets = [10_000, 20_000, 30_000, 40_000, 50_000, 100_000, 200_000]
-    budgets = [10_000]
 
     for budget in budgets:
         line_inst.B = budget * 0.95

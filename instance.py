@@ -27,6 +27,8 @@ class TripOption(NamedTuple):
     value: float
     mt_pickup_node: int
     mt_drop_off_node: int
+    mt_pickup_line_edge_index: int
+    mt_drop_off_line_edge_index: int
     first_mile_cost: float
     last_mile_cost: float
     mt_cost: float
@@ -75,6 +77,7 @@ class line_instance:
         self.demand_file = demand_file
         self.optimal_trip_options: List[List[TripOption]] = []
         self.dm: Optional[np.ndarray] = None  # dm.
+        self.edge_to_passengers: Optional[List[List[List[int]]]] = None
 
         # random instance of the problem
         if instance_category == 'random':
@@ -132,6 +135,8 @@ class line_instance:
             "value": option.value,
             "mt_pickup_node": option.mt_pickup_node,
             "mt_drop_off_node": option.mt_drop_off_node,
+            "mt_pickup_line_edge_index": option.mt_pickup_line_edge_index,
+            "mt_drop_off_line_edge_index": option.mt_drop_off_line_edge_index,
             "first_mile_cost": option.first_mile_cost,
             "last_mile_cost": option.last_mile_cost,
             "mt_cost": option.mt_cost,
@@ -143,6 +148,8 @@ class line_instance:
             value=data["value"],
             mt_pickup_node=data["mt_pickup_node"],
             mt_drop_off_node=data["mt_drop_off_node"],
+            mt_pickup_line_edge_index=data["mt_pickup_line_edge_index"],
+            mt_drop_off_line_edge_index=data["mt_drop_off_line_edge_index"],
             first_mile_cost=data["first_mile_cost"],
             last_mile_cost=data["last_mile_cost"],
             mt_cost=data["mt_cost"],
@@ -610,7 +617,7 @@ class line_instance:
         return set_of_lines, pass_to_lines, values, lines_to_passengers, edge_to_passengers, candidate_set_of_lines
 
     def manhattan_instance(self, nb_lines, detour_factor, date) -> Tuple[
-        list, list, List[List[TripOption]], list, list, list, list, np.ndarray, List[List[int]]]:
+        list, list, List[List[TripOption]], list, List[List[List[int]]], list, list, np.ndarray, List[List[int]]]:
         # TODO handle the case where remaining stops pop in skeleton method
 
         logging.info('Loading distance matrix')
@@ -714,7 +721,7 @@ class line_instance:
 
     def preprocessing(
         self, candidate_set_of_lines, passengers: List[List[int]], travel_times_on_lines, distances, detour_factor, nb_lines, nb_pass
-    ) -> Tuple[list, list, List[List[TripOption]], list, list]:
+    ) -> Tuple[list, list, List[List[TripOption]], list, List[List[List[int]]]]:
         logging.info('Preprocessing optimal trip options')
         set_of_lines = []
         pass_to_lines = [[] for _ in range(nb_pass)]
@@ -724,17 +731,18 @@ class line_instance:
         optimal_trip_options: List[List[TripOption]] = [[] for _ in range(nb_pass)]
 
         lines_to_passengers = []
-        edge_to_passengers = []
 
-        for l in tqdm(range(nb_lines), desc='Processing lines'):
-            # length == nb_edges in the line == nb_stops - 1
-            length = len(candidate_set_of_lines[l]) - 1
+        # for each edge on each line, this collection contains a list of passengers traveling on the line
+        edge_to_passengers: List[List[List[int]]] = []
+
+        for line in tqdm(range(nb_lines), desc='Processing lines'):
+            line_length = len(candidate_set_of_lines[line]) - 1
             pass_covered = []
             lines_to_passengers.append([])
-            edge_to_passengers.append([[] for k in range(length)])
+            edge_to_passengers.append([[] for _ in range(line_length)])
             for p in range(nb_pass):
                 optimal_trip_option = self.get_optimal_trip(
-                    passengers[p], candidate_set_of_lines[l], travel_times_on_lines[l], distances, detour_factor
+                    passengers[p], candidate_set_of_lines[line], travel_times_on_lines[line], distances, detour_factor
                 )
 
                 pass_covered.append(
@@ -744,18 +752,18 @@ class line_instance:
                         optimal_trip_option.value
                     ]
                 )
-                pass_to_lines[p].append(l)
-                lines_to_passengers[l].append(p)
-                for k in range(optimal_trip_option.mt_pickup_node, optimal_trip_option.mt_drop_off_node):
-                    edge_to_passengers[l][k].append(p)
+                pass_to_lines[p].append(line)
+                lines_to_passengers[line].append(p)
+                for line_edge in range(optimal_trip_option.mt_pickup_line_edge_index, optimal_trip_option.mt_drop_off_line_edge_index):
+                    edge_to_passengers[line][line_edge].append(p)
 
                 optimal_trip_options[p].append(optimal_trip_option)
-            set_of_lines.append([length, pass_covered])
+            set_of_lines.append([line_length, pass_covered])
 
         # add the no MT option for each request. The MoD cost is stored in the first_mile_cost field of TripOption.
         for p in range(nb_pass):
             travel_time = distances[passengers[p][0]][passengers[p][1]]
-            optimal_trip_options[p].append(TripOption(0, -1, -1, travel_time, 0, 0))
+            optimal_trip_options[p].append(TripOption(0, -1, -1, -1, -1, travel_time, 0, 0))
 
         logging.info('Preprocessing finished')
 
@@ -927,22 +935,29 @@ class line_instance:
         destination = passenger[1]
         shortest_travel_time = distances[origin][destination]
 
-        optimal_trip_option: TripOption = TripOption(0, -1, -1, 0, 0, 0)
+        optimal_trip_option: TripOption = TripOption(0, -1, -1, -1, -1, 0, 0, 0)
 
         # compute the optimal trip option, consider all possible pairs of enter and exit nodes for MT
-        for j in range(line_length - 1):
-            for i in range(j + 1, line_length):
-                first_mile_travel_time = distances[origin][line[j]]
-                last_mile_travel_time = distances[line[i]][destination]
+        for pickup_index in range(line_length - 1):
+            for drop_off_index in range(pickup_index + 1, line_length):
+                first_mile_travel_time = distances[origin][line[pickup_index]]
+                last_mile_travel_time = distances[line[drop_off_index]][destination]
                 mod_travel_time = first_mile_travel_time + last_mile_travel_time
-                mt_travel_time = travel_times_on_line[j][i]
+                mt_travel_time = travel_times_on_line[pickup_index][drop_off_index]
                 total_travel_time = mod_travel_time + mt_travel_time
                 value = shortest_travel_time - mod_travel_time
                 if ((
                     value > optimal_trip_option.value and total_travel_time <= detour_factor * shortest_travel_time) or (
                     value == optimal_trip_option.value and mt_travel_time < optimal_trip_option.mt_cost)):
                     optimal_trip_option = TripOption(
-                        value, j, i, first_mile_travel_time, last_mile_travel_time, mt_travel_time
+                        value,
+                        line[pickup_index],
+                        line[drop_off_index],
+                        pickup_index,
+                        drop_off_index,
+                        first_mile_travel_time,
+                        last_mile_travel_time,
+                        mt_travel_time
                     )
 
         return optimal_trip_option
