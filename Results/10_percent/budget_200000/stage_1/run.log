@@ -1,0 +1,165 @@
+2025-11-09 23:32:41,772 INFO - Solving the line planning problem with ILP
+2025-11-09 23:32:41,773 INFO - Set parameter Username
+2025-11-09 23:32:41,773 INFO - Set parameter LicenseID to value 2711114
+2025-11-09 23:32:41,774 INFO - Academic license - for non-commercial use only - expires 2026-09-20
+2025-11-09 23:32:41,775 INFO - Set parameter TimeLimit to value 86400
+2025-11-09 23:32:41,916 INFO - Set parameter LogFile to value "Results\10_percent\budget_200000\stage_1\gurobi.log"
+2025-11-09 23:32:42,027 INFO - Gurobi Optimizer version 12.0.3 build v12.0.3rc0 (win64 - Windows 11+.0 (26200.2))
+2025-11-09 23:32:42,027 INFO - 
+2025-11-09 23:32:42,027 INFO - CPU model: Intel(R) Core(TM) Ultra 7 265K, instruction set [SSE2|AVX|AVX2]
+2025-11-09 23:32:42,029 INFO - Thread count: 20 physical cores, 20 logical processors, using up to 20 threads
+2025-11-09 23:32:42,029 INFO - 
+2025-11-09 23:32:42,029 INFO - Non-default parameters:
+2025-11-09 23:32:42,029 INFO - TimeLimit  86400
+2025-11-09 23:32:42,029 INFO - 
+2025-11-09 23:32:42,029 INFO - Optimize a model with 2726 rows, 24443 columns and 168883 nonzeros
+2025-11-09 23:32:42,030 INFO - Model fingerprint: 0xfce96326
+2025-11-09 23:32:42,030 INFO - Variable types: 0 continuous, 24443 integer (24443 binary)
+2025-11-09 23:32:42,031 INFO - Coefficient statistics:
+2025-11-09 23:32:42,031 INFO -   Matrix range     [1e+00, 2e+03]
+2025-11-09 23:32:42,031 INFO -   Objective range  [1e+00, 1e+00]
+2025-11-09 23:32:42,031 INFO -   Bounds range     [1e+00, 1e+00]
+2025-11-09 23:32:42,031 INFO -   RHS range        [1e+00, 2e+05]
+2025-11-09 23:32:42,033 INFO - Found heuristic solution: objective 703.0000000
+2025-11-09 23:32:42,222 INFO - Presolve removed 281 rows and 17 columns
+2025-11-09 23:32:42,222 INFO - Presolve time: 0.19s
+2025-11-09 23:32:42,223 INFO - Presolved: 2445 rows, 24426 columns, 155074 nonzeros
+2025-11-09 23:32:42,234 INFO - Variable types: 0 continuous, 24426 integer (24413 binary)
+2025-11-09 23:32:42,261 INFO - Deterministic concurrent LP optimizer: primal and dual simplex
+2025-11-09 23:32:42,261 INFO - Showing primal log only...
+2025-11-09 23:32:42,261 INFO - 
+2025-11-09 23:32:42,365 INFO - Concurrent spin time: 0.02s
+2025-11-09 23:32:42,366 INFO - 
+2025-11-09 23:32:42,366 INFO - Solved with dual simplex
+2025-11-09 23:32:42,366 INFO - 
+2025-11-09 23:32:42,366 INFO - Root relaxation: objective 1.300000e+03, 3258 iterations, 0.13 seconds (0.25 work units)
+2025-11-09 23:32:42,597 INFO - 
+2025-11-09 23:32:42,597 INFO -     Nodes    |    Current Node    |     Objective Bounds      |     Work
+2025-11-09 23:32:42,597 INFO -  Expl Unexpl |  Obj  Depth IntInf | Incumbent    BestBd   Gap | It/Node Time
+2025-11-09 23:32:42,597 INFO - 
+2025-11-09 23:32:42,597 INFO -      0     0 1300.00000    0   92  703.00000 1300.00000  84.9%     -    0s
+2025-11-09 23:32:42,599 INFO - H    0     0                    1061.0000000 1300.00000  22.5%     -    0s
+2025-11-09 23:32:42,637 INFO - H    0     0                    1066.0000000 1300.00000  22.0%     -    0s
+2025-11-09 23:32:42,651 INFO - H    0     0                    1098.0000000 1300.00000  18.4%     -    0s
+2025-11-09 23:32:42,847 INFO - H    0     0                    1119.0000000 1300.00000  16.2%     -    0s
+2025-11-09 23:32:42,848 INFO - H    0     0                    1172.0000000 1300.00000  10.9%     -    0s
+2025-11-09 23:32:42,848 INFO - H    0     0                    1182.0000000 1300.00000  10.0%     -    0s
+2025-11-09 23:32:42,849 INFO - H    0     0                    1185.0000000 1300.00000  9.70%     -    0s
+2025-11-09 23:32:42,849 INFO - H    0     0                    1186.0000000 1300.00000  9.61%     -    0s
+2025-11-09 23:32:42,850 INFO - H    0     0                    1188.0000000 1300.00000  9.43%     -    0s
+2025-11-09 23:32:42,945 INFO - H    0     0                    1216.0000000 1300.00000  6.91%     -    0s
+2025-11-09 23:32:42,946 INFO - H    0     0                    1223.0000000 1300.00000  6.30%     -    0s
+2025-11-09 23:32:42,947 INFO - H    0     0                    1226.0000000 1300.00000  6.04%     -    0s
+2025-11-09 23:32:42,947 INFO - H    0     0                    1227.0000000 1300.00000  5.95%     -    0s
+2025-11-09 23:32:42,948 INFO - H    0     0                    1232.0000000 1300.00000  5.52%     -    0s
+2025-11-09 23:32:42,948 INFO - H    0     0                    1235.0000000 1300.00000  5.26%     -    0s
+2025-11-09 23:32:42,999 INFO - H    0     0                    1254.0000000 1300.00000  3.67%     -    0s
+2025-11-09 23:32:43,000 INFO - H    0     0                    1255.0000000 1300.00000  3.59%     -    0s
+2025-11-09 23:32:43,000 INFO - H    0     0                    1256.0000000 1300.00000  3.50%     -    0s
+2025-11-09 23:32:43,001 INFO - H    0     0                    1266.0000000 1300.00000  2.69%     -    0s
+2025-11-09 23:32:43,001 INFO - H    0     0                    1270.0000000 1300.00000  2.36%     -    0s
+2025-11-09 23:32:43,010 INFO -      0     0 1300.00000    0  615 1270.00000 1300.00000  2.36%     -    0s
+2025-11-09 23:32:43,086 INFO - H    0     0                    1271.0000000 1300.00000  2.28%     -    1s
+2025-11-09 23:32:43,087 INFO - H    0     0                    1289.0000000 1300.00000  0.85%     -    1s
+2025-11-09 23:32:43,088 INFO - H    0     0                    1290.0000000 1300.00000  0.78%     -    1s
+2025-11-09 23:32:43,090 INFO - H    0     0                    1291.0000000 1300.00000  0.70%     -    1s
+2025-11-09 23:32:43,121 INFO - H    0     0                    1292.0000000 1300.00000  0.62%     -    1s
+2025-11-09 23:32:43,126 INFO - H    0     0                    1293.0000000 1300.00000  0.54%     -    1s
+2025-11-09 23:32:43,150 INFO -      0     0 1300.00000    0  546 1293.00000 1300.00000  0.54%     -    1s
+2025-11-09 23:32:43,627 INFO - H    0     0                    1294.0000000 1300.00000  0.46%     -    1s
+2025-11-09 23:32:43,628 INFO - H    0     0                    1295.0000000 1300.00000  0.39%     -    1s
+2025-11-09 23:32:43,629 INFO - H    0     0                    1296.0000000 1300.00000  0.31%     -    1s
+2025-11-09 23:32:43,630 INFO - H    0     0                    1297.0000000 1300.00000  0.23%     -    1s
+2025-11-09 23:32:43,631 INFO - H    0     0                    1299.0000000 1300.00000  0.08%     -    1s
+2025-11-09 23:32:43,715 INFO -      0     0 1300.00000    0   39 1299.00000 1300.00000  0.08%     -    1s
+2025-11-09 23:32:43,766 INFO - H    0     0                    1300.0000000 1300.00000  0.00%     -    1s
+2025-11-09 23:32:43,767 INFO -      0     0 1300.00000    0   39 1300.00000 1300.00000  0.00%     -    1s
+2025-11-09 23:32:43,774 INFO - 
+2025-11-09 23:32:43,774 INFO - Cutting planes:
+2025-11-09 23:32:43,774 INFO -   Gomory: 2
+2025-11-09 23:32:43,774 INFO -   Cover: 304
+2025-11-09 23:32:43,774 INFO -   Clique: 447
+2025-11-09 23:32:43,774 INFO -   MIR: 51
+2025-11-09 23:32:43,774 INFO -   StrongCG: 7
+2025-11-09 23:32:43,774 INFO -   Relax-and-lift: 1
+2025-11-09 23:32:43,774 INFO -   BQP: 1
+2025-11-09 23:32:43,776 INFO - 
+2025-11-09 23:32:43,776 INFO - Explored 1 nodes (12272 simplex iterations) in 1.75 seconds (3.03 work units)
+2025-11-09 23:32:43,776 INFO - Thread count was 20 (of 20 available processors)
+2025-11-09 23:32:43,776 INFO - 
+2025-11-09 23:32:43,776 INFO - Solution count 10: 1300 1299 1297 ... 1290
+2025-11-09 23:32:43,776 INFO - 
+2025-11-09 23:32:43,776 INFO - Optimal solution found (tolerance 1.00e-04)
+2025-11-09 23:32:43,777 INFO - Best objective 1.300000000000e+03, best bound 1.300000000000e+03, gap 0.0000%
+2025-11-09 23:32:44,007 INFO - Execution time: 1.979935884475708
+2025-11-09 23:32:44,007 INFO - Final solution: 1300.0
+2025-11-09 23:32:44,013 INFO - Exported used lines to Results\10_percent\budget_200000\stage_1\used_lines.csv
+2025-11-09 23:32:44,041 INFO - Exported passenger assignments to Results\10_percent\budget_200000\stage_1\passenger_assignments.csv
+2025-11-09 23:32:44,044 INFO - Building flow variables
+2025-11-09 23:32:52,926 INFO - Building flow conservation constraints
+2025-11-09 23:33:09,621 INFO - Gurobi Optimizer version 12.0.3 build v12.0.3rc0 (win64 - Windows 11+.0 (26200.2))
+2025-11-09 23:33:09,621 INFO - 
+2025-11-09 23:33:09,621 INFO - CPU model: Intel(R) Core(TM) Ultra 7 265K, instruction set [SSE2|AVX|AVX2]
+2025-11-09 23:33:09,621 INFO - Thread count: 20 physical cores, 20 logical processors, using up to 20 threads
+2025-11-09 23:33:09,621 INFO - 
+2025-11-09 23:33:09,621 INFO - Optimize a model with 4257 rows, 3759721 columns and 7517882 nonzeros
+2025-11-09 23:33:09,664 INFO - Model fingerprint: 0x87587f8f
+2025-11-09 23:33:09,665 INFO - Variable types: 0 continuous, 3759721 integer (0 binary)
+2025-11-09 23:33:09,682 INFO - Coefficient statistics:
+2025-11-09 23:33:09,682 INFO -   Matrix range     [1e+00, 1e+00]
+2025-11-09 23:33:09,682 INFO -   Objective range  [1e+00, 1e+03]
+2025-11-09 23:33:09,682 INFO -   Bounds range     [0e+00, 0e+00]
+2025-11-09 23:33:09,683 INFO -   RHS range        [1e+00, 4e+00]
+2025-11-09 23:33:09,994 INFO - Found heuristic solution: objective 3206780.0000
+2025-11-09 23:33:15,066 INFO - Presolve removed 2324 rows and 1951 columns (presolve time = 5s)...
+2025-11-09 23:33:20,079 INFO - Presolve removed 2324 rows and 25165 columns (presolve time = 10s)...
+2025-11-09 23:33:25,018 INFO - Presolve removed 2324 rows and 25165 columns (presolve time = 15s)...
+2025-11-09 23:33:25,302 INFO - Presolve removed 2324 rows and 25165 columns
+2025-11-09 23:33:25,302 INFO - Presolve time: 15.30s
+2025-11-09 23:33:25,344 INFO - Presolved: 1933 rows, 3734556 columns, 7469112 nonzeros
+2025-11-09 23:33:26,354 INFO - Variable types: 0 continuous, 3734556 integer (0 binary)
+2025-11-09 23:33:27,908 INFO - Deterministic concurrent LP optimizer: primal simplex, dual simplex, and barrier
+2025-11-09 23:33:27,908 INFO - Showing barrier log only...
+2025-11-09 23:33:27,908 INFO - 
+2025-11-09 23:33:28,487 INFO - Root barrier log...
+2025-11-09 23:33:28,487 INFO - 
+2025-11-09 23:33:28,749 INFO - Ordering time: 0.10s
+2025-11-09 23:33:29,267 INFO - 
+2025-11-09 23:33:29,267 INFO - Barrier statistics:
+2025-11-09 23:33:29,267 INFO -  AA' NZ     : 1.867e+06
+2025-11-09 23:33:29,267 INFO -  Factor NZ  : 1.869e+06 (roughly 1.5 GB of memory)
+2025-11-09 23:33:29,267 INFO -  Factor Ops : 2.409e+09 (less than 1 second per iteration)
+2025-11-09 23:33:29,267 INFO -  Threads    : 18
+2025-11-09 23:33:29,667 INFO - 
+2025-11-09 23:33:29,667 INFO -                   Objective                Residual
+2025-11-09 23:33:29,667 INFO - Iter       Primal          Dual         Primal    Dual     Compl     Time
+2025-11-09 23:33:29,784 INFO -    0   2.39277899e+13 -5.97698180e+13  2.22e+04 2.27e-13  2.62e+07    20s
+2025-11-09 23:33:30,486 INFO -    1   4.74441441e+12 -2.54289926e+13  1.04e-06 1.82e-11  4.04e+06    21s
+2025-11-09 23:33:30,514 INFO - 
+2025-11-09 23:33:30,514 INFO - Barrier performed 1 iterations in 20.88 seconds (16.79 work units)
+2025-11-09 23:33:30,514 INFO - Barrier solve interrupted - model solved by another algorithm
+2025-11-09 23:33:30,514 INFO - 
+2025-11-09 23:33:30,566 INFO - Concurrent spin time: 1.88s (can be avoided by choosing Method=3)
+2025-11-09 23:33:30,567 INFO - 
+2025-11-09 23:33:30,567 INFO - Solved with primal simplex
+2025-11-09 23:33:30,624 INFO - 
+2025-11-09 23:33:30,624 INFO - Root simplex log...
+2025-11-09 23:33:30,624 INFO - 
+2025-11-09 23:33:30,624 INFO - Iteration    Objective       Primal Inf.    Dual Inf.      Time
+2025-11-09 23:33:30,624 INFO -    13420    2.0040500e+05   0.000000e+00   0.000000e+00     21s
+2025-11-09 23:33:30,624 INFO - 
+2025-11-09 23:33:30,624 INFO - Root relaxation: objective 2.004050e+05, 13420 iterations, 4.15 seconds (2.07 work units)
+2025-11-09 23:33:30,980 INFO - 
+2025-11-09 23:33:30,980 INFO -     Nodes    |    Current Node    |     Objective Bounds      |     Work
+2025-11-09 23:33:30,980 INFO -  Expl Unexpl |  Obj  Depth IntInf | Incumbent    BestBd   Gap | It/Node Time
+2025-11-09 23:33:30,980 INFO - 
+2025-11-09 23:33:30,980 INFO - *    0     0               0    200405.00000 200405.000  0.00%     -   21s
+2025-11-09 23:33:31,177 INFO - 
+2025-11-09 23:33:31,178 INFO - Explored 1 nodes (13420 simplex iterations) in 21.56 seconds (16.61 work units)
+2025-11-09 23:33:31,178 INFO - Thread count was 20 (of 20 available processors)
+2025-11-09 23:33:31,178 INFO - 
+2025-11-09 23:33:31,178 INFO - Solution count 2: 200405 3.20678e+06 
+2025-11-09 23:33:31,178 INFO - 
+2025-11-09 23:33:31,178 INFO - Optimal solution found (tolerance 1.00e-04)
+2025-11-09 23:33:31,201 INFO - Best objective 2.004050000000e+05, best bound 2.004050000000e+05, gap 0.0000%
+2025-11-09 23:33:35,184 INFO - Exported flows to Results\10_percent\budget_200000\stage_1\flows.csv

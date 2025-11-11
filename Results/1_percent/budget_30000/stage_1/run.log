@@ -1,0 +1,112 @@
+2025-11-09 21:53:25,985 INFO - Solving the line planning problem with ILP
+2025-11-09 21:53:25,987 INFO - Set parameter Username
+2025-11-09 21:53:25,987 INFO - Set parameter LicenseID to value 2711114
+2025-11-09 21:53:25,988 INFO - Academic license - for non-commercial use only - expires 2026-09-20
+2025-11-09 21:53:25,990 INFO - Set parameter TimeLimit to value 86400
+2025-11-09 21:53:25,997 INFO - Set parameter LogFile to value "Results\1_percent\budget_30000\stage_1\gurobi.log"
+2025-11-09 21:53:26,000 INFO - Gurobi Optimizer version 12.0.3 build v12.0.3rc0 (win64 - Windows 11+.0 (26200.2))
+2025-11-09 21:53:26,000 INFO - 
+2025-11-09 21:53:26,000 INFO - CPU model: Intel(R) Core(TM) Ultra 7 265K, instruction set [SSE2|AVX|AVX2]
+2025-11-09 21:53:26,002 INFO - Thread count: 20 physical cores, 20 logical processors, using up to 20 threads
+2025-11-09 21:53:26,002 INFO - 
+2025-11-09 21:53:26,002 INFO - Non-default parameters:
+2025-11-09 21:53:26,002 INFO - TimeLimit  86400
+2025-11-09 21:53:26,002 INFO - 
+2025-11-09 21:53:26,002 INFO - Optimize a model with 282 rows, 383 columns and 2055 nonzeros
+2025-11-09 21:53:26,002 INFO - Model fingerprint: 0x1107b1b0
+2025-11-09 21:53:26,002 INFO - Variable types: 0 continuous, 383 integer (383 binary)
+2025-11-09 21:53:26,002 INFO - Coefficient statistics:
+2025-11-09 21:53:26,002 INFO -   Matrix range     [1e+00, 2e+03]
+2025-11-09 21:53:26,002 INFO -   Objective range  [1e+00, 1e+00]
+2025-11-09 21:53:26,002 INFO -   Bounds range     [1e+00, 1e+00]
+2025-11-09 21:53:26,003 INFO -   RHS range        [1e+00, 3e+04]
+2025-11-09 21:53:26,003 INFO - Found heuristic solution: objective 107.0000000
+2025-11-09 21:53:26,005 INFO - Presolve removed 84 rows and 2 columns
+2025-11-09 21:53:26,006 INFO - Presolve time: 0.00s
+2025-11-09 21:53:26,006 INFO - Presolved: 198 rows, 381 columns, 1655 nonzeros
+2025-11-09 21:53:26,006 INFO - Variable types: 0 continuous, 381 integer (379 binary)
+2025-11-09 21:53:26,007 INFO - 
+2025-11-09 21:53:26,007 INFO - Root relaxation: objective 1.300000e+02, 115 iterations, 0.00 seconds (0.00 work units)
+2025-11-09 21:53:26,011 INFO - 
+2025-11-09 21:53:26,011 INFO -     Nodes    |    Current Node    |     Objective Bounds      |     Work
+2025-11-09 21:53:26,011 INFO -  Expl Unexpl |  Obj  Depth IntInf | Incumbent    BestBd   Gap | It/Node Time
+2025-11-09 21:53:26,011 INFO - 
+2025-11-09 21:53:26,011 INFO -      0     0  130.00000    0    5  107.00000  130.00000  21.5%     -    0s
+2025-11-09 21:53:26,011 INFO - H    0     0                     121.0000000  130.00000  7.44%     -    0s
+2025-11-09 21:53:26,011 INFO - H    0     0                     122.0000000  130.00000  6.56%     -    0s
+2025-11-09 21:53:26,014 INFO - H    0     0                     124.0000000  130.00000  4.84%     -    0s
+2025-11-09 21:53:26,020 INFO - H    0     0                     126.0000000  130.00000  3.17%     -    0s
+2025-11-09 21:53:26,020 INFO -      0     0  130.00000    0   42  126.00000  130.00000  3.17%     -    0s
+2025-11-09 21:53:26,027 INFO - H    0     0                     127.0000000  130.00000  2.36%     -    0s
+2025-11-09 21:53:26,028 INFO - H    0     0                     129.0000000  130.00000  0.78%     -    0s
+2025-11-09 21:53:26,028 INFO - H    0     0                     130.0000000  130.00000  0.00%     -    0s
+2025-11-09 21:53:26,029 INFO -      0     0  130.00000    0   43  130.00000  130.00000  0.00%     -    0s
+2025-11-09 21:53:26,030 INFO - 
+2025-11-09 21:53:26,030 INFO - Cutting planes:
+2025-11-09 21:53:26,030 INFO -   Cover: 16
+2025-11-09 21:53:26,030 INFO -   Clique: 22
+2025-11-09 21:53:26,030 INFO -   MIR: 3
+2025-11-09 21:53:26,030 INFO -   RLT: 5
+2025-11-09 21:53:26,030 INFO -   Relax-and-lift: 1
+2025-11-09 21:53:26,030 INFO - 
+2025-11-09 21:53:26,030 INFO - Explored 1 nodes (300 simplex iterations) in 0.03 seconds (0.02 work units)
+2025-11-09 21:53:26,030 INFO - Thread count was 20 (of 20 available processors)
+2025-11-09 21:53:26,030 INFO - 
+2025-11-09 21:53:26,030 INFO - Solution count 8: 130 129 127 ... 107
+2025-11-09 21:53:26,030 INFO - 
+2025-11-09 21:53:26,030 INFO - Optimal solution found (tolerance 1.00e-04)
+2025-11-09 21:53:26,030 INFO - Best objective 1.300000000000e+02, best bound 1.300000000000e+02, gap 0.0000%
+2025-11-09 21:53:26,030 INFO - Execution time: 0.030870437622070312
+2025-11-09 21:53:26,031 INFO - Final solution: 130.0
+2025-11-09 21:53:26,032 INFO - Exported used lines to Results\1_percent\budget_30000\stage_1\used_lines.csv
+2025-11-09 21:53:26,038 INFO - Exported passenger assignments to Results\1_percent\budget_30000\stage_1\passenger_assignments.csv
+2025-11-09 21:53:26,038 INFO - Building flow variables
+2025-11-09 21:53:26,251 INFO - Building flow conservation constraints
+2025-11-09 21:53:26,582 INFO - Gurobi Optimizer version 12.0.3 build v12.0.3rc0 (win64 - Windows 11+.0 (26200.2))
+2025-11-09 21:53:26,583 INFO - 
+2025-11-09 21:53:26,583 INFO - CPU model: Intel(R) Core(TM) Ultra 7 265K, instruction set [SSE2|AVX|AVX2]
+2025-11-09 21:53:26,583 INFO - Thread count: 20 physical cores, 20 logical processors, using up to 20 threads
+2025-11-09 21:53:26,583 INFO - 
+2025-11-09 21:53:26,583 INFO - Optimize a model with 496 rows, 84681 columns and 168985 nonzeros
+2025-11-09 21:53:26,584 INFO - Model fingerprint: 0x9a2c616b
+2025-11-09 21:53:26,584 INFO - Variable types: 0 continuous, 84681 integer (0 binary)
+2025-11-09 21:53:26,584 INFO - Coefficient statistics:
+2025-11-09 21:53:26,584 INFO -   Matrix range     [1e+00, 1e+00]
+2025-11-09 21:53:26,584 INFO -   Objective range  [1e+00, 1e+03]
+2025-11-09 21:53:26,584 INFO -   Bounds range     [0e+00, 0e+00]
+2025-11-09 21:53:26,584 INFO -   RHS range        [1e+00, 1e+00]
+2025-11-09 21:53:26,590 INFO - Found heuristic solution: objective 201997.00000
+2025-11-09 21:53:26,682 INFO - Presolve removed 205 rows and 291 columns
+2025-11-09 21:53:26,683 INFO - Presolve time: 0.09s
+2025-11-09 21:53:26,684 INFO - Presolved: 291 rows, 84390 columns, 168780 nonzeros
+2025-11-09 21:53:26,698 INFO - Variable types: 0 continuous, 84390 integer (0 binary)
+2025-11-09 21:53:26,713 INFO - 
+2025-11-09 21:53:26,713 INFO - Starting sifting (using dual simplex for sub-problems)...
+2025-11-09 21:53:26,713 INFO - 
+2025-11-09 21:53:26,713 INFO -     Iter     Pivots    Primal Obj      Dual Obj        Time
+2025-11-09 21:53:26,713 INFO -        0          0     infinity      2.4913000e+04      0s
+2025-11-09 21:53:26,722 INFO -        1        545   4.5343110e+06   2.6319988e+04      0s
+2025-11-09 21:53:26,730 INFO -        2        996   1.0376030e+06   2.6607655e+04      0s
+2025-11-09 21:53:26,739 INFO -        3       1451   2.8844800e+05   2.6581155e+04      0s
+2025-11-09 21:53:26,747 INFO -        4       1925   3.8838000e+04   2.8144375e+04      0s
+2025-11-09 21:53:26,756 INFO -        5       2364   3.6976000e+04   3.2447357e+04      0s
+2025-11-09 21:53:26,764 INFO -        6       2772   3.6593000e+04   3.6483169e+04      0s
+2025-11-09 21:53:26,766 INFO - 
+2025-11-09 21:53:26,766 INFO - Sifting complete
+2025-11-09 21:53:26,766 INFO - 
+2025-11-09 21:53:26,771 INFO - 
+2025-11-09 21:53:26,771 INFO - Root relaxation: objective 3.659100e+04, 3070 iterations, 0.07 seconds (0.10 work units)
+2025-11-09 21:53:26,784 INFO - 
+2025-11-09 21:53:26,784 INFO -     Nodes    |    Current Node    |     Objective Bounds      |     Work
+2025-11-09 21:53:26,784 INFO -  Expl Unexpl |  Obj  Depth IntInf | Incumbent    BestBd   Gap | It/Node Time
+2025-11-09 21:53:26,784 INFO - 
+2025-11-09 21:53:26,784 INFO - *    0     0               0    36591.000000 36591.0000  0.00%     -    0s
+2025-11-09 21:53:26,820 INFO - 
+2025-11-09 21:53:26,820 INFO - Explored 1 nodes (3070 simplex iterations) in 0.24 seconds (0.25 work units)
+2025-11-09 21:53:26,820 INFO - Thread count was 20 (of 20 available processors)
+2025-11-09 21:53:26,820 INFO - 
+2025-11-09 21:53:26,821 INFO - Solution count 2: 36591 201997 
+2025-11-09 21:53:26,821 INFO - 
+2025-11-09 21:53:26,821 INFO - Optimal solution found (tolerance 1.00e-04)
+2025-11-09 21:53:26,821 INFO - Best objective 3.659100000000e+04, best bound 3.659100000000e+04, gap 0.0000%
+2025-11-09 21:53:26,882 INFO - Exported flows to Results\1_percent\budget_30000\stage_1\flows.csv
