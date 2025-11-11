@@ -16,17 +16,19 @@ from instance import *
 import log
 
 # budgets = [10_000, 20_000, 30_000, 40_000, 50_000, 100_000, 200_000]
-budgets = [30_000]
+# budgets = [30_000]
+# budgets = [200_000]
+budgets = [500_000]
 
 # By default, 100% demand is used...
 month = "april"
-# nb_p = 13847 # april
-# # month = 'march'
-# # nb_p = 12301 # march
-# # month = 'feb'
-# # nb_p = 13851 # feb
-# demand_file = None
-# nb_l = 1000
+nb_p = 13847 # april
+# month = 'march'
+# nb_p = 12301 # march
+# month = 'feb'
+# nb_p = 13851 # feb
+demand_file = None
+nb_l = 1000
 
 # 50% demand
 # demand_file = "OD_matrix_april_fhv_50_percent.txt" # override the month setting and uses a custom demand file
@@ -39,12 +41,12 @@ month = "april"
 # nb_p = 1300
 
 # 1% demand
-demand_file = "OD_matrix_april_fhv_1_percent.txt"  # override the month setting and uses a custom demand file
-nb_l = 10
-nb_p = 130
+# demand_file = "OD_matrix_april_fhv_1_percent.txt"  # override the month setting and uses a custom demand file
+# nb_l = 10
+# nb_p = 130
 
-use_model_with_mod_costs = False # stage 1 model
-use_model_with_empty_trips = True # stage 2 model
+use_model_with_mod_costs = True # stage 1 model
+use_model_with_empty_trips = False # stage 2 model
 
 # Run the solution method proposed in Périvier et al., 2021
 run_proposed_method = False
@@ -788,14 +790,14 @@ class line_planning_solver:
             used_nodes.add(request_from)
             used_nodes.add(request_to)
             for l in range(self.line_count_total):
-                optimal_trip_option: TripOption = self.line_instance.optimal_trip_options[p][l // max_frequency]
-                mt_pickup_node = optimal_trip_option.mt_pickup_node
-                mt_drop_off_node = optimal_trip_option.mt_drop_off_node
-                used_nodes.add(mt_pickup_node)
-                used_nodes.add(mt_drop_off_node)
-
-                # ALSO DO THE HARD WORK HERE FOR THE MOD FLOW CONSTRAINTS
                 if (l, p) in passenger_vars:
+                    optimal_trip_option: TripOption = self.line_instance.optimal_trip_options[p][l // max_frequency]
+                    mt_pickup_node = optimal_trip_option.mt_pickup_node
+                    mt_drop_off_node = optimal_trip_option.mt_drop_off_node
+                    used_nodes.add(mt_pickup_node)
+                    used_nodes.add(mt_drop_off_node)
+
+                    # ALSO DO THE HARD WORK HERE FOR THE MOD FLOW CONSTRAINTS
                     # first mile vars
                     if request_from not in first_mile_vars:
                         first_mile_vars[request_from] = {}
@@ -803,11 +805,11 @@ class line_planning_solver:
                         first_mile_vars[request_from][mt_pickup_node] = []
                     first_mile_vars[request_from][mt_pickup_node].append(passenger_vars[l,p])
                     # last mile vars
-                    if request_to not in last_mile_vars:
-                        last_mile_vars[request_to] = {}
-                    if mt_drop_off_node not in last_mile_vars[request_to]:
-                        last_mile_vars[request_to][mt_drop_off_node] = []
-                    last_mile_vars[request_to][mt_drop_off_node].append(passenger_vars[l,p])
+                    if mt_drop_off_node not in last_mile_vars:
+                        last_mile_vars[mt_drop_off_node] = {}
+                    if request_to not in last_mile_vars[mt_drop_off_node]:
+                        last_mile_vars[mt_drop_off_node][request_to] = []
+                    last_mile_vars[mt_drop_off_node][request_to].append(passenger_vars[l,p])
             # no MT vars
             if request_from not in no_mt_vars:
                 no_mt_vars[request_from] = {}
