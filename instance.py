@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 from graph_class import *
 
-# import osmnx as ox, geopandas as gpd
+, geopandas as gpd
 
 import networkx as nx
 
@@ -980,70 +980,5 @@ class line_instance:
         return travel_times_on_lines
 
 
-if __name__ == "__main__":
-    f1 = open("manhattan_dist_1.txt", "r")
-    f2 = open("manhattan_dist_2.txt", "r")
-    f3 = open("manhattan_dist_3.txt", "r")
-    distances = np.loadtxt(f1) + np.loadtxt(f2) + np.loadtxt(f3)
 
-    n = 400
-    potential_stops = [i for i in range(4580)]
-    stops = []
-    for i in range(n):
-        stop_index = random.randint(0, 4580 - i - 1)
-        new_stop = potential_stops.pop(stop_index)
-        stops.append(new_stop)
 
-    line_inst = line_instance(nb_lines=10, nb_pass=10, B=1, cost=1, max_length=50, min_length=6, proba=0.1, capacity=30)
-
-    G = ox.graph_from_place('Manhattan, New York, New York, USA', network_type='drive')
-    node_id = list(G.nodes())
-    # impute speed on all edges missing data
-    G = ox.add_edge_speeds(G)
-    # calculate travel time (seconds) for all edges
-    G = ox.add_edge_travel_times(G)
-
-    f1 = open("bus_stop_number2.txt", "r")
-    stops_arr = np.loadtxt(f1)
-    stops_floats = stops_arr.tolist()
-    stops = [int(stops_floats[i]) for i in range(len(stops_floats))]
-
-    node_id = list(G.nodes())
-
-    dic_id_to_index = {}  # get node number (from 0 t0 4579) from node osmid
-    for i in range(len(node_id)):
-        dic_id_to_index[node_id[i]] = i
-
-    nb_lines = 1000
-    min_length = 10
-    max_length = 30
-    min_start_end_distance = 200
-    detour_skeleton = 2
-
-    all_lines, all_routes = line_inst.generate_lines_skeleton_manhattan(
-        nb_lines, stops, min_length, max_length, distances, min_start_end_distance, detour_skeleton, G
-    )
-    print('nb_lines_final', len(all_lines))
-
-    all_lines_nodes = [[dic_id_to_index[all_lines[i][j]] for j in range(len(all_lines[i]))] for i in
-        range(len(all_lines))]
-
-    print('-----------')
-
-    with open('all_lines_1000_c5.txt', 'wb') as f:
-        for i in range(len(all_lines)):
-            mat = np.matrix(all_lines[i])
-            for line in mat:
-                np.savetxt(f, line, fmt='%.2f')
-
-    with open('all_lines_nodes_1000_c5.txt', 'wb') as f:
-        for i in range(len(all_lines_nodes)):
-            mat = np.matrix(all_lines_nodes[i])
-            for line in mat:
-                np.savetxt(f, line, fmt='%.2f')
-
-    with open('all_routes_1000_c5.txt', 'wb') as f:
-        for i in range(len(all_routes)):
-            mat = np.matrix(all_routes[i])
-            for line in mat:
-                np.savetxt(f, line, fmt='%.2f')
