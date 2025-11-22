@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 from graph_class import *
 
-, geopandas as gpd
+# , geopandas as gpd
 
 import networkx as nx
 
@@ -439,108 +439,9 @@ class line_instance:
             line.pop(index)
         return line, remaining_stops
 
-    def generate_new_line_skeleton_manhattan(
-        self, stops, distances, length, min_start_end_distance, detour_skeleton, G
-    ):
-        # TODO: pick only nodes which are in shortest_paths inter remaining_stops
-        remaining_stops = deepcopy(stops)
-        n = len(remaining_stops)
-        # min_distance = len(distances)//min_start_end_distance
-        min_distance = min_start_end_distance
 
-        # distances contains for i,j the length of a shortest path between i,j
-        # Chose randomly the initial node and the last node of the line
-        start_index = random.randint(0, n - 1)
-        start = remaining_stops.pop(start_index)
 
-        distance_start_end = 0
-        i = 0
-        while i <= 1000:
-            i += 1
-            end_index = random.randint(0, n - 2)
-            end = remaining_stops[end_index]
-            if distances[start][end] >= min_distance:
-                break
 
-        end = remaining_stops.pop(end_index)
-        # print('ori', start, end, distances[start][end])
-        # print('iter', i)
-
-        i = 0
-        while i <= 1000:
-            i += 1
-            inter_index = random.randint(0, n - 3)
-            inter = remaining_stops[inter_index]
-            if distances[start][inter] + distances[end][inter] <= distances[start][end] * detour_skeleton:
-                break
-        inter = remaining_stops.pop(inter_index)
-
-        i = 0
-        while i <= 1000:
-            i += 1
-            inter_index_2 = random.randint(0, n - 4)
-            inter_2 = remaining_stops[inter_index_2]
-            if distances[inter_2][inter] + distances[end][inter_2] <= distances[inter][end] * detour_skeleton:
-                break
-        inter_2 = remaining_stops.pop(inter_index_2)
-
-        orig = list(G)[start]
-        dest = list(G)[end]
-
-        route_within_stops_1, route1 = self.shortest_path_nodes(G, start, inter, stops)
-        route_within_stops_2, route2 = self.shortest_path_nodes(G, inter, inter_2, stops)
-        route_within_stops_3, route3 = self.shortest_path_nodes(G, inter_2, end, stops)
-
-        line = route_within_stops_1 + route_within_stops_2[1:] + route_within_stops_3[1:]
-        route = route1 + route2[1:] + route3[1:]
-
-        while len(line) > length:
-            index = random.randint(1, len(line) - 2)
-            line.pop(index)
-        # print('time_length', distances[start][end])
-        # print(line)
-        return line, route
-
-    def generate_lines_skeleton_manhattan(
-        self, nb_lines, stops, min_length, max_length, distances, min_start_end_distance, detour_skeleton, G
-    ):
-        all_lines = []
-        all_routes = []
-        iter = 0
-        while len(all_lines) < nb_lines and iter < 2 * nb_lines:
-            iter += 1
-            if iter % 100 == 0:
-                print('iteration', iter)
-            try:
-                length = random.randint(min_length, max_length)
-                new_line, route = self.generate_new_line_skeleton_manhattan(
-                    stops, distances, length, min_start_end_distance, detour_skeleton, G
-                )
-                # print('length', len(new_line))
-                all_lines.append(new_line)
-                all_routes.append(route)
-            except:
-                print('line_construction_failed')
-        return all_lines, all_routes
-
-    def shortest_path_nodes(self, G, orig_index, dest_index, stops):
-        orig = list(G)[orig_index]
-        dest = list(G)[dest_index]
-        route = nx.shortest_path(G, orig, dest, weight='travel_time')
-        # print(route)
-        nb = 0
-        route_within_stops = []
-        for i in range(len(route)):
-            for j in range(len(stops)):
-                if route[i] == list(G)[stops[j]]:
-                    nb += 1
-                    route_within_stops.append(route[i])
-                    break
-        # print(nb)
-        # print(route_within_stops)
-        # fig, ax = ox.plot_graph_route(G, route, route_linewidth=6, node_size=0, bgcolor='k')
-
-        return route_within_stops, route
 
     def random_grid_instance(
         self, nb_lines, nb_pass, n, nb_stops, min_length, max_length, detour_factor, min_start_end_distance

@@ -3,8 +3,8 @@ import pandas as pd
 import networkx as nx
 import osmnx as ox
 
-
 from pathlib import Path
+from copy import deepcopy
 
 from darpinstances.instance import MatrixTravelTimeProvider
 
@@ -26,6 +26,7 @@ def load_graph(edges_path: Path):
 
     return nx.from_pandas_edgelist(edge_df, source='u', target='v', edge_attr='travel_time', create_using=nx.DiGraph())
 
+
 def get_graph_from_openstreetmap(area_name: str):
     G = ox.graph_from_place(area_name, network_type='drive')
     # impute speed on all edges missing data
@@ -37,6 +38,112 @@ def get_graph_from_openstreetmap(area_name: str):
     G = nx.convert_node_labels_to_integers(G)
 
     return G
+
+
+class CandidateLineGenerator:
+    def __init__(
+        self,
+        stops,
+        travel_time_provider: MatrixTravelTimeProvider,
+        G,
+        min_start_end_distance,
+        detour_skeleton,
+        min_length,
+        max_length
+    ):
+        self.stops = stops
+        self.travel_time_provider: MatrixTravelTimeProvider = travel_time_provider
+        self.G = G
+        self.min_start_end_distance = min_start_end_distance
+        self.detour_skeleton = detour_skeleton
+        self.min_length = min_length
+        self.max_length = max_length
+
+    def shortest_path_nodes(self, orig_index, dest_index):
+        orig = list(self.G)[orig_index]
+        dest = list(self.G)[dest_index]
+        route = nx.shortest_path(self.G, orig, dest, weight='travel_time')
+        # print(route)
+        nb = 0
+        route_within_stops = []
+        for i in range(len(route)):
+            for j in range(len(self.stops)):
+                if route[i] == list(self.G)[self.stops[j]]:
+                    nb += 1
+                    route_within_stops.append(route[i])
+                    break
+
+        return route_within_stops, route
+
+    def generate_new_line_skeleton_manhattan(self, length):
+        # TODO: pick only nodes which are in shortest_paths inter remaining_stops
+        remaining_stops = deepcopy(self.stops)
+        n = len(remaining_stops)
+        min_distance = self.min_start_end_distance
+
+        # distances contains for i,j the length of a shortest path between i,j
+        # Chose randomly the initial node and the last node of the line
+        start_index = random.randint(0, n - 1)
+        start = remaining_stops.pop(start_index)
+
+        i = 0
+        while i <= 1000:
+            i += 1
+            end_index = random.randint(0, n - 2)
+            end = remaining_stops[end_index]
+            if self.travel_time_provider.get_travel_time(start, end) >= min_distance:
+                break
+
+        end = remaining_stops.pop(end_index)
+
+        i = 0
+        while i <= 1000:
+            i += 1
+            inter_index = random.randint(0, n - 3)
+            inter = remaining_stops[inter_index]
+            if self.travel_time_provider.get_travel_time(start, inter) + self.travel_time_provider.get_travel_time(end, inter) <= \
+                self.travel_time_provider.get_travel_time(start, end) * self.detour_skeleton:
+                break
+        inter = remaining_stops.pop(inter_index)
+
+        i = 0
+        while i <= 1000:
+            i += 1
+            inter_index_2 = random.randint(0, n - 4)
+            inter_2 = remaining_stops[inter_index_2]
+            if self.travel_time_provider.get_travel_time(inter_2, inter) + self.travel_time_provider.get_travel_time(end, inter_2) <= \
+                self.travel_time_provider.get_travel_time(inter, end) * self.detour_skeleton:
+                break
+        inter_2 = remaining_stops.pop(inter_index_2)
+
+        route_within_stops_1, route1 = self.shortest_path_nodes(start, inter)
+        route_within_stops_2, route2 = self.shortest_path_nodes(inter, inter_2)
+        route_within_stops_3, route3 = self.shortest_path_nodes(inter_2, end)
+
+        line = route_within_stops_1 + route_within_stops_2[1:] + route_within_stops_3[1:]
+        route = route1 + route2[1:] + route3[1:]
+
+        while len(line) > length:
+            index = random.randint(1, len(line) - 2)
+            line.pop(index)
+        return line, route
+
+    def generate_lines_skeleton_manhattan(self, nb_lines):
+        all_lines = []
+        all_routes = []
+        iter = 0
+        while len(all_lines) < nb_lines and iter < 2 * nb_lines:
+            iter += 1
+            if iter % 100 == 0:
+                print('iteration', iter)
+            try:
+                length = random.randint(self.min_length, self.max_length)
+                new_line, route = self.generate_new_line_skeleton_manhattan(length)
+                all_lines.append(new_line)
+                all_routes.append(route)
+            except:
+                print('line_construction_failed')
+        return all_lines, all_routes
 
 
 travel_time_provider = MatrixTravelTimeProvider.from_hdf(area_path / 'dm.h5')
@@ -58,18 +165,13 @@ elif area_name is not None:
 else:
     raise ValueError('Either the edge path or the area name must be specified.')
 
-
-line_inst = line_instance(nb_lines=10, nb_pass=10, B=1, cost=1, max_length=50, min_length=6, proba=0.1, capacity=30)
-
-all_lines, all_routes = line_inst.generate_lines_skeleton_manhattan(
-    nb_lines, stops, min_length, max_length, distances, min_start_end_distance, detour_skeleton, G
+line_generator = CandidateLineGenerator(
+    stops, travel_time_provider, G, min_start_end_distance, detour_skeleton, min_length, max_length
 )
-print('nb_lines_final', len(all_lines))
+all_lines, all_routes = line_generator.generate_lines_skeleton_manhattan(nb_lines)
 
-all_lines_nodes = [[dic_id_to_index[all_lines[i][j]] for j in range(len(all_lines[i]))] for i in
-    range(len(all_lines))]
 
-print('-----------')
+all_lines_nodes = [[dic_id_to_index[all_lines[i][j]] for j in range(len(all_lines[i]))] for i in range(len(all_lines))]
 
 with open('all_lines_1000_c5.txt', 'wb') as f:
     for i in range(len(all_lines)):
