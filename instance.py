@@ -2,12 +2,15 @@ import json
 import logging
 import random
 import re
+import hashlib
 from copy import deepcopy
 from pathlib import Path
 from typing import NamedTuple, Optional, List, Tuple
 
 import h5py
 import numpy as np
+import pandas as pd
+from pandas.io.sas.sas_constants import dataset_length
 
 from tqdm import tqdm
 
@@ -23,6 +26,48 @@ import log
 # ox.config(log_console=True, use_cache=True)
 
 
+def _load_demand_from_csv(demand_file: Path) -> List[List[str]]:
+    """
+    Load demand data from a CSV file.
+    
+    Args:
+        demand_file: Path to the CSV file
+        
+    Returns:
+        List of lists where each inner list contains [origin, dest] as strings
+    """
+    logging.info('Loading demand from CSV file %s', demand_file)
+    try:
+        df = pd.read_csv(demand_file, delimiter='\t')
+    except Exception as exc:
+        raise ValueError(f"Failed to read CSV file {demand_file}: {exc}")
+    
+    # Try to find origin and dest columns (case-insensitive, with common variations)
+    origin_col = None
+    dest_col = None
+    
+    # Check for common column name variations
+    for col in df.columns:
+        col_lower = col.lower().strip()
+        if col_lower in ['origin', 'orig', 'o', 'from', 'pickup', 'pick_up', 'pickup_node']:
+            origin_col = col
+        elif col_lower in ['dest', 'destination', 'd', 'to', 'dropoff', 'drop_off', 'dropoff_node', 'dest_node']:
+            dest_col = col
+    
+    if origin_col is None:
+        raise ValueError(f"Could not find 'origin' column in CSV file {demand_file}. Available columns: {list(df.columns)}")
+    if dest_col is None:
+        raise ValueError(f"Could not find 'dest' column in CSV file {demand_file}. Available columns: {list(df.columns)}")
+    
+    logging.info('Found origin column: %s, dest column: %s', origin_col, dest_col)
+    
+    # Extract origin and dest columns, convert to string, and return as list of lists
+    my_list = [[str(row[origin_col]), str(row[dest_col])] for _, row in df.iterrows()]
+    
+    logging.info('Loaded %d demand records from CSV', len(my_list))
+    return my_list
+
+
 class TripOption(NamedTuple):
     value: float
     mt_pickup_node: int
@@ -33,6 +78,15 @@ class TripOption(NamedTuple):
     last_mile_cost: float
     mt_cost: float
 
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return json.JSONEncoder.default(self, obj)
 
 class line_instance:
 
@@ -44,8 +98,7 @@ class line_instance:
 
     def __init__(
         self,
-        nb_lines,
-        nb_pass,
+        candidate_lines_file,
         cost,
         max_length,
         min_length,
@@ -54,14 +107,13 @@ class line_instance:
         detour_factor=None,
         method=0,
         granularity=1,
-        date=None,
-        demand_file=None
+        demand_file=None,
+        results_dir=None,
+        dm_file=None
     ):
-        self.nb_lines = nb_lines * granularity  # number of lines in the candidate set.
         self.granularity = granularity
         self.B = None
         self.cost = cost
-        self.nb_pass = nb_pass  # number of passengers
         self.proba = proba  # probability that a passenger is covered by a line (when generating random instances)
         self.max_length = max_length  # max length of a line (when generating random instances)
         self.min_length = min_length  # min length of a line (when generating random instances)
@@ -69,28 +121,26 @@ class line_instance:
         self.method = method  # method used by the ILP solver.
         self.lengths_travel_times = None  # used only for the manhattan instance
         self.capacity = capacity
-        self.date = None
         self.demand_file = demand_file
         self.optimal_trip_options: List[List[TripOption]] = []
         self.dm: Optional[np.ndarray] = None  # dm.
         self.edge_to_passengers: Optional[List[List[List[int]]]] = None
+        self.results_dir = Path(results_dir) if results_dir is not None else Path("Results")
+        self.dm_file = Path(dm_file) if dm_file is not None else Path("dm.h5")
+        self.nb_pass: Optional[int] = None
 
-        lines_file_path = Path(f"all_lines_nodes_{nb_lines}_c5.txt")
-        if not lines_file_path.exists():
-            raise FileNotFoundError("Lines file %s does not exist" % lines_file_path)
-        if demand_file is not None:
-            logging.info('Checking number of requests in the demand file %s', demand_file)
-            self.nb_pass = len(np.loadtxt(demand_file))
-            logging.info('%s requests in the demand file', self.nb_pass)
-        else:
-            if date == 'april':
-                self.nb_pass = 13851
-            elif date == 'march':
-                self.nb_pass = 12301
-            elif date == 'feb':
-                self.nb_pass = 13847
-            else:
-                raise NameError('Not a valid date')
+        # Store candidate line file path
+        self.candidate_line_file = Path(candidate_lines_file)
+        if not self.candidate_line_file.exists():
+            raise FileNotFoundError("Lines file %s does not exist" % self.candidate_line_file)
+        
+        # Load candidate lines file early to count number of lines
+        # We'll actually load the file in manhattan_instance, but count here to set nb_lines early
+        logging.info('Counting candidate lines in %s', self.candidate_line_file)
+        with open(self.candidate_line_file, 'r') as f:
+            nb_lines = sum(1 for line in f if line.strip())  # Count non-empty lines only
+        logging.info('Found %s candidate lines in file', nb_lines)
+        self.nb_lines = nb_lines * granularity  # number of lines in the candidate set (after granularity)
         (
             self.set_of_lines,
             self.pass_to_lines,
@@ -101,7 +151,7 @@ class line_instance:
             self.lengths_travel_times,
             self.dm,
             self.requests
-        ) = self.manhattan_instance(nb_lines, detour_factor, date)
+        ) = self.manhattan_instance(detour_factor)
 
     def _get_instance_size_label(self, date: Optional[str]) -> str:
         if self.demand_file:
@@ -139,15 +189,32 @@ class line_instance:
 
     def _get_preprocessing_cache_path(
         self,
-        nb_lines: int,
         detour_factor: Optional[int],
-        date: Optional[str],
     ) -> Path:
-        instance_label = self._get_instance_size_label(date)
-        date_suffix = date if date else "april"
+        """
+        Generate cache path based on demand file, candidate line file, and detour factor.
+        Uses hash of file paths to ensure uniqueness.
+        """
+        # Normalize file paths to absolute paths for consistent hashing
+        demand_file_path = Path(self.demand_file).resolve() if self.demand_file else None
+        candidate_line_file_path = self.candidate_line_file.resolve()
+        
+        # Create a string identifier from the three components
+        demand_file_str = str(demand_file_path) if demand_file_path else "none"
+        candidate_line_file_str = str(candidate_line_file_path)
+        detour_factor_str = str(detour_factor) if detour_factor is not None else "none"
+        
+        # Create a hash from the three components to ensure uniqueness
+        cache_key = f"{demand_file_str}|{candidate_line_file_str}|{detour_factor_str}"
+        cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:12]
+        
+        # Use friendly names for readability in directory structure
+        demand_name = demand_file_path.stem if demand_file_path else "none"
+        candidate_line_name = candidate_line_file_path.stem
         detour_suffix = detour_factor if detour_factor is not None else "none"
-        cache_dir = Path("Results") / instance_label / "preprocessing"
-        filename = f"manhattan_{date_suffix}_lines_{nb_lines}_detour_{detour_suffix}.json"
+        
+        cache_dir = self.results_dir / "preprocessing"
+        filename = f"{demand_name}_{candidate_line_name}_detour_{detour_suffix}_{cache_hash}.json"
         return cache_dir / filename
 
     def _load_preprocessing_cache(self, cache_path: Path):
@@ -206,57 +273,55 @@ class line_instance:
         }
         try:
             with cache_path.open("w", encoding="utf-8") as cache_file:
-                json.dump(cache_payload, cache_file)
+                json.dump(cache_payload, cache_file, cls=NumpyEncoder)
         except OSError as exc:
             logging.warning("Failed to write preprocessing cache %s: %s", cache_path, exc)
             return
         logging.info("Stored preprocessing data to cache %s", cache_path)
 
-    def manhattan_instance(self, nb_lines, detour_factor, date) -> Tuple[
+    def manhattan_instance(self, detour_factor) -> Tuple[
         list, list, List[List[TripOption]], list, List[List[List[int]]], list, list, np.ndarray, List[List[int]]]:
         # TODO handle the case where remaining stops pop in skeleton method
 
-        logging.info('Loading distance matrix')
-        with  h5py.File('dm.h5', 'r') as f:
-            distances = np.array(f['dm'])
+        logging.info('Loading distance matrix from %s', self.dm_file)
+        if not self.dm_file.exists():
+            raise FileNotFoundError("Distance matrix file %s does not exist" % self.dm_file)
+        with h5py.File(self.dm_file, 'r') as f:
+            if 'dm' in f:
+                dataset_name = 'dm'
+            else:
+                dataset_name = list(f.keys())[0]
+            distances = np.array(f[dataset_name])
         logging.info('Distance matrix loaded')
 
-        # load OD_matrix
-        # passengers = np.loadtxt(f)
-        # my_list = [line.split(' ') for line in open('OD_matrix_feb.txt','r')]
-        # my_list = [line.split(' ') for line in open('OD_matrix_random2.txt','r')]
-        # my_list = [line.split(' ') for line in open('OD_matrix_feb_fhv.txt','r')]
-        # my_list = [line.split(' ') for line in open('OD_matrix_march_fhv.txt','r')]
         logging.info('Loading demand')
-        if self.demand_file is not None:
+        if self.demand_file.suffix == '.txt':
             my_list = [line.split(' ') for line in open(self.demand_file, 'r')]  # use the demand file provided
         else:
-            if date == 'april':
-                my_list = [line.split(' ') for line in open('OD_matrix_april_fhv.txt', 'r')]
-            if date == 'march':
-                my_list = [line.split(' ') for line in open('OD_matrix_march_fhv.txt', 'r')]
-            if date == 'feb':
-                my_list = [line.split(' ') for line in open('OD_matrix_feb_fhv.txt', 'r')]
+            my_list = _load_demand_from_csv(self.demand_file)
 
         passengers: List[List[int]] = [[int(float(i.strip())) for i in my_list[j]] for j in range(len(my_list))]
+        self.nb_pass = len(passengers)
         logging.info('Demand loaded')
 
         nb_pass = len(passengers)
 
-        # load candidate set of lines
-        # my_list = [line.split(' ') for line in open('all_lines_nodes_{}.txt'.format(nb_lines))]
-        # my_list = [line.split(' ') for line in open('all_lines_nodes_{}_c3.txt'.format(nb_lines))]
-        # my_list = [line.split(' ') for line in open('all_lines_nodes_{}_c4.txt'.format(nb_lines))]
-        my_list = [line.split(' ') for line in open('all_lines_nodes_{}_c5.txt'.format(nb_lines))]
+        logging.info('Loading candidate lines from %s', self.candidate_line_file)
+        with open(self.candidate_line_file, 'r') as f:
+            fist_line = f.readline().strip()
+            delimiter = ',' if ',' in fist_line else ' '
+            f.seek(0)
+            my_list = [line.split(delimiter) for line in open(self.candidate_line_file)]
 
         candidate_set_of_lines = [[int(float(i.strip())) for i in my_list[j]] for j in range(len(my_list))]
+        nb_lines = len(candidate_set_of_lines)
 
         # travel_times_on_line[i][j][k] contains the time to travel from node number j to node number k on line i
         logging.info('Computing travel times for each line')
         travel_times_on_lines = self.compute_travel_times_on_lines(candidate_set_of_lines, distances)
         logging.info('Travel times computed')
 
-        cache_path = self._get_preprocessing_cache_path(nb_lines, detour_factor, date)
+        cache_path = self._get_preprocessing_cache_path(detour_factor)
         cached_preprocessing = self._load_preprocessing_cache(cache_path)
 
         if cached_preprocessing is not None:
@@ -280,7 +345,6 @@ class line_instance:
                 travel_times_on_lines,
                 distances,
                 detour_factor,
-                nb_lines,
                 nb_pass,
             )
             self._save_preprocessing_cache(
@@ -316,12 +380,14 @@ class line_instance:
         )
 
     def preprocessing(
-        self, candidate_set_of_lines, passengers: List[List[int]], travel_times_on_lines, distances, detour_factor, nb_lines, nb_pass
+        self, candidate_set_of_lines, passengers: List[List[int]], travel_times_on_lines, distances, detour_factor, nb_pass
     ) -> Tuple[list, list, List[List[TripOption]], list, List[List[List[int]]]]:
         logging.info('Preprocessing optimal trip options')
         set_of_lines = []
         pass_to_lines = [[] for _ in range(nb_pass)]
         value = 0
+        
+        nb_lines = len(candidate_set_of_lines)
 
         # optimal trip option for each passenger-line combination
         optimal_trip_options: List[List[TripOption]] = [[] for _ in range(nb_pass)]
@@ -378,7 +444,7 @@ class line_instance:
         line_length = len(line)
         origin = passenger[0]
         destination = passenger[1]
-        shortest_travel_time = distances[origin][destination]
+        shortest_travel_time = int(distances[origin][destination])
 
         optimal_trip_option: TripOption = TripOption(0, -1, -1, -1, -1, 0, 0, 0)
 

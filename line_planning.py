@@ -15,37 +15,46 @@ from gurobipy import *
 from instance import *
 import log
 
+test_data_path = Path(__file__).parent / "test_data"
+line_planning_results_path = Path(r"C:\Google Drive AIC\My Drive\AIC Experiment Data\Line Planning\Results")
+
+# Distance matrix file
+# dm_file = Path(r"C:\Google Drive AIC\My Drive\AIC Experiment Data\Line Planning\Instances/original/dm.h5")
+
+# Results directory - user is responsible for organizing subdirectories as needed
+# results_dir = line_planning_results_path / "original_instances/test_one_percent"
+results_dir = line_planning_results_path / "original_instances/test_one_percent-RGT"
+
 # budgets = [10_000, 20_000, 30_000, 40_000, 50_000, 100_000, 200_000]
-# budgets = [30_000]
+budgets = [30_000]
 # budgets = [200_000]
-budgets = [500_000]
+# budgets = [500_000]
 
 # By default, 100% demand is used...
-month = "april"
-nb_p = 13847 # april
-# month = 'march'
-# nb_p = 12301 # march
-# month = 'feb'
-# nb_p = 13851 # feb
-demand_file = None
-nb_l = 1000
+# demand_file = test_data_path / "OD_matrix_april_fhv.txt"
+# demand_file = test_data_path / "OD_matrix_march_fhv.txt"
+# demand_file = test_data_path / "OD_matrix_feb_fhv.txt"
+# candidate_lines_file = test_data_path / "all_lines_nodes_1000_c5.txt"
 
 # 50% demand
-# demand_file = "OD_matrix_april_fhv_50_percent.txt" # override the month setting and uses a custom demand file
+# demand_file = "OD_matrix_april_fhv_50_percent.txt"
 # nb_l = 500
-# nb_p = 6500
 
 # 10% demand
-# demand_file = "OD_matrix_april_fhv_10_percent.txt" # override the month setting and uses a custom demand file
+# demand_file = "OD_matrix_april_fhv_10_percent.txt"
 # nb_l = 100
-# nb_p = 1300
 
-# 1% demand
-# demand_file = "OD_matrix_april_fhv_1_percent.txt"  # override the month setting and uses a custom demand file
-# nb_l = 10
-# nb_p = 130
+# # 1% demand
+# demand_file = test_data_path / "OD_matrix_april_fhv_1_percent.txt"
+# candidate_lines_file = test_data_path / "all_lines_nodes_10_c5.txt"
 
-use_model_with_mod_costs = True # stage 1 model
+# RGT demand
+area_path = Path(r"C:\Google Drive AIC\My Drive\AIC Experiment Data\DARP\Instances\Manhattan")
+demand_file = area_path / r'C:\Google Drive AIC\My Drive\AIC Experiment Data\DARP\Instances\Manhattan\instances\start_18-00\duration_01_min\max_delay_05_min/requests.csv'
+candidate_lines_file = area_path / "lines.txt"
+dm_file = area_path / "dm.h5"
+
+use_model_with_mod_costs = False # stage 1 model
 use_model_with_empty_trips = False # stage 2 model
 
 # Run the solution method proposed in Périvier et al., 2021
@@ -1033,11 +1042,8 @@ if __name__ == "__main__":
 
     max_frequency = 1
 
-    logging.info("Solving Manhattan instance with %s lines and %s passengers", nb_l, nb_p)
-
     line_inst = line_instance(
-        nb_lines=nb_l,
-        nb_pass=nb_p,
+        candidate_lines_file=candidate_lines_file,
         cost=1,
         max_length=15,
         min_length=8,
@@ -1046,13 +1052,14 @@ if __name__ == "__main__":
         detour_factor=3,
         method=3,
         granularity=1,
-        date=month,
         demand_file=demand_file,
+        results_dir=results_dir,
+        dm_file=dm_file,
     )
 
     instance_size_label = _get_instance_size_label(demand_file)
     method_label = _get_method_label(use_model_with_mod_costs, use_model_with_empty_trips)
-    base_results_directory = Path("Results") / instance_size_label
+    base_results_directory = results_dir
     base_results_directory.mkdir(parents=True, exist_ok=True)
 
     for budget in budgets:
@@ -1113,7 +1120,7 @@ if __name__ == "__main__":
             "run_time_seconds": run_time_ILP,
             "method": method_label,
             "instance_size": instance_size_label,
-            "demand_file": demand_file,
+            "demand_file": str(demand_file),
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
         results_file = method_directory / "metrics.json"

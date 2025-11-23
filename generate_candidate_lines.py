@@ -12,6 +12,7 @@ from tqdm import tqdm
 
 # configuration
 area_path = Path(r"C:\Google Drive AIC\My Drive\AIC Experiment Data\DARP\Instances\Manhattan")
+lines_path = area_path / 'lines.txt'
 number_of_stops = 400
 nb_lines = 1000
 min_length = 10
@@ -176,7 +177,7 @@ line_generator = CandidateLineGenerator(
 logging.info("Generating candidate lines")
 all_lines, all_routes = line_generator.generate_lines_skeleton_manhattan(nb_lines)
 
-lines_path = area_path / 'lines.csv'
+
 with open(lines_path, 'w') as f:
     logging.info("Exporting candidate lines to %s", lines_path)
     for line in all_lines:
