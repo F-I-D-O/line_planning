@@ -1043,7 +1043,6 @@ if __name__ == "__main__":
         min_length=8,
         proba=0.1,
         capacity=30,
-        instance_category="manhattan",
         detour_factor=3,
         method=3,
         granularity=1,

@@ -1,4 +1,5 @@
 import random
+import logging
 import pandas as pd
 import networkx as nx
 import osmnx as ox
@@ -7,6 +8,7 @@ from pathlib import Path
 from copy import deepcopy
 
 from darpinstances.instance import MatrixTravelTimeProvider
+from tqdm import tqdm
 
 # configuration
 area_path = Path(r"C:\Google Drive AIC\My Drive\AIC Experiment Data\DARP\Instances\Manhattan")
@@ -21,6 +23,7 @@ area_name = None
 
 
 def load_graph(edges_path: Path):
+    logging.info("Loading graph from %s", edges_path)
     edge_df = pd.read_csv(edges_path, delimiter='\t')
     edge_df['travel_time'] = edge_df['length'] / edge_df['speed']
 
@@ -132,23 +135,24 @@ class CandidateLineGenerator:
         all_lines = []
         all_routes = []
         iter = 0
-        while len(all_lines) < nb_lines and iter < 2 * nb_lines:
-            iter += 1
-            if iter % 100 == 0:
-                print('iteration', iter)
-            try:
-                length = random.randint(self.min_length, self.max_length)
-                new_line, route = self.generate_new_line_skeleton_manhattan(length)
-                all_lines.append(new_line)
-                all_routes.append(route)
-            except:
-                print('line_construction_failed')
+        with tqdm(total=nb_lines, desc='Generating candidate lines') as progress_bar:
+            while len(all_lines) < nb_lines and iter < 2 * nb_lines:
+                iter += 1
+                try:
+                    length = random.randint(self.min_length, self.max_length)
+                    new_line, route = self.generate_new_line_skeleton_manhattan(length)
+                    all_lines.append(new_line)
+                    all_routes.append(route)
+                    progress_bar.update(1)
+                except:
+                    logging.warning('line_construction_failed')
         return all_lines, all_routes
 
 
 travel_time_provider = MatrixTravelTimeProvider.from_hdf(area_path / 'dm.h5')
 
 # randomly selecting nodes for stops
+logging.info("Randomly selecting stops")
 potential_stops = [i for i in range(travel_time_provider.get_node_count())]
 stops = []
 for i in range(number_of_stops):
@@ -157,7 +161,7 @@ for i in range(number_of_stops):
     stops.append(new_stop)
 
 # get the road network graph
-edge_path = area_path / 'edges.csv'
+edge_path = area_path / 'map/edges.csv'
 if edge_path.exists():
     G = load_graph(edge_path)
 elif area_name is not None:
@@ -168,25 +172,12 @@ else:
 line_generator = CandidateLineGenerator(
     stops, travel_time_provider, G, min_start_end_distance, detour_skeleton, min_length, max_length
 )
+
+logging.info("Generating candidate lines")
 all_lines, all_routes = line_generator.generate_lines_skeleton_manhattan(nb_lines)
 
-
-all_lines_nodes = [[dic_id_to_index[all_lines[i][j]] for j in range(len(all_lines[i]))] for i in range(len(all_lines))]
-
-with open('all_lines_1000_c5.txt', 'wb') as f:
-    for i in range(len(all_lines)):
-        mat = np.matrix(all_lines[i])
-        for line in mat:
-            np.savetxt(f, line, fmt='%.2f')
-
-with open('all_lines_nodes_1000_c5.txt', 'wb') as f:
-    for i in range(len(all_lines_nodes)):
-        mat = np.matrix(all_lines_nodes[i])
-        for line in mat:
-            np.savetxt(f, line, fmt='%.2f')
-
-with open('all_routes_1000_c5.txt', 'wb') as f:
-    for i in range(len(all_routes)):
-        mat = np.matrix(all_routes[i])
-        for line in mat:
-            np.savetxt(f, line, fmt='%.2f')
+lines_path = area_path / 'lines.csv'
+with open(lines_path, 'w') as f:
+    logging.info("Exporting candidate lines to %s", lines_path)
+    for line in all_lines:
+        f.write(','.join([str(i) for i in line]) + '\n')
