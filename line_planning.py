@@ -242,7 +242,7 @@ class line_planning_solver:
                 used_nodes.update([pickup, drop_off])
 
         # debug required flow cost
-        C_req = sum(self.line_instance.dm[i][j] * demand for (i, j), demand in required_flow.items())
+        C_req = sum(int(self.line_instance.dm[i][j]) * demand for (i, j), demand in required_flow.items())
         print(f"Required flow cost: {C_req}")
 
         used_nodes_list = list(used_nodes)
