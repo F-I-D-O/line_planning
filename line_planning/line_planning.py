@@ -95,7 +95,7 @@ def _configure_run_logging(log_path: Path) -> logging.Handler:
     return handler
 
 
-class line_planning_solver:
+class LinePlanningSolver:
 
     def __init__(self, line_instance):
         self.line_instance = line_instance
@@ -126,6 +126,41 @@ class line_planning_solver:
         origin = self.line_instance.requests[passenger_idx][0]
         destination = self.line_instance.requests[passenger_idx][1]
         return float(self.line_instance.dm[origin][destination])
+
+    def update_mod_costs(
+        self,
+        new_costs: Dict[int, Tuple[float, float]],
+        request_assignments: list,
+    ) -> None:
+        """
+        Update the MoD cost estimates in optimal_trip_options based on DARP solution (section 4.3.2).
+
+        For each original request, updates the first_mile_cost and last_mile_cost of the
+        assigned travel option (either a line or the no_MT option).
+
+        Args:
+            new_costs: Dict mapping original_request_id -> (first_mile_cost, last_mile_cost).
+                       For MoD-only requests, last_mile_cost should be 0.
+            request_assignments: List of (kind, line_idx) tuples from solve_MoD_aware_ILP.
+                                 kind is "no_MT" or "line", line_idx is the line index or None.
+        """
+        nb_lines = self.line_instance.nb_lines
+        for original_request_id, (first_mile_cost, last_mile_cost) in new_costs.items():
+            kind, line_idx = request_assignments[original_request_id]
+
+            if kind == "no_MT" or line_idx is None:
+                route_index = nb_lines
+            else:
+                route_index = line_idx // max_frequency
+
+            old_option = self.line_instance.optimal_trip_options[original_request_id][route_index]
+            new_option = old_option._replace(
+                first_mile_cost=first_mile_cost,
+                last_mile_cost=last_mile_cost,
+            )
+            self.line_instance.optimal_trip_options[original_request_id][route_index] = new_option
+
+        logging.info("Updated MoD costs for %d requests", len(new_costs))
 
     def _export_passenger_assignments(
         self,
@@ -1218,7 +1253,7 @@ if __name__ == "__main__":
 
         candidate_set_of_lines = line_inst.candidate_set_of_lines
         print("candidate_set_of_lines")
-        solver = line_planning_solver(line_inst)
+        solver = LinePlanningSolver(line_inst)
 
         # Execute the proposed method with LP solving and rounding
         if run_proposed_method:

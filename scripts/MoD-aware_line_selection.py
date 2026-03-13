@@ -12,6 +12,8 @@ from typing import List, Optional, Tuple, Union
 
 import yaml
 
+import darpinstances.inout
+
 import darpbenchmark.experiments
 
 import line_planning.instance
@@ -220,6 +222,92 @@ def write_darp_config_yaml(
         yaml.dump(experiment_config, f, default_flow_style=False, sort_keys=False)
 
 
+def compute_per_darp_request_costs(solution: dict) -> dict:
+    """
+    Compute the cost share for each DARP request from the DARP solution (section 4.3.2).
+
+    For each plan, the cost per request is: plan_cost / num_requests_in_plan.
+    Each request contributes equally to the total plan cost.
+
+    Args:
+        solution: DARP solution dict with 'plans' key.
+
+    Returns:
+        Dict mapping DARP request_id -> cost share.
+    """
+    darp_request_costs = {}
+
+    for plan in solution["plans"]:
+        if len(plan["actions"]) == 0:
+            continue
+
+        plan_cost = plan["cost"]
+        num_requests = len(plan["actions"]) // 2
+        if num_requests == 0:
+            continue
+
+        cost_per_request = plan_cost / num_requests
+
+        for action in plan["actions"]:
+            request_id = action["action"]["request_index"]
+            if request_id not in darp_request_costs:
+                darp_request_costs[request_id] = cost_per_request
+
+    return darp_request_costs
+
+
+def aggregate_mod_costs_for_original_requests(
+    darp_request_costs: dict,
+    darp_requests: List[dict],
+    request_assignments: List[Tuple[str, Optional[int]]],
+) -> dict:
+    """
+    Aggregate DARP request costs back to original line-planning requests (section 4.3.2).
+
+    For MoD-only original requests: cost = cost of the single direct trip DARP request.
+    For line-assigned original requests: first_mile_cost + last_mile_cost from two DARP requests.
+
+    Args:
+        darp_request_costs: Dict mapping DARP request_id -> cost share.
+        darp_requests: List of DARP request dicts with 'id' and 'original_request_id'.
+        request_assignments: List of (kind, line_idx) tuples for original requests.
+
+    Returns:
+        Dict mapping original_request_id -> (first_mile_cost, last_mile_cost).
+    """
+    original_request_costs: dict = {}
+
+    for original_id in range(len(request_assignments)):
+        kind, line_idx = request_assignments[original_id]
+
+        darp_ids_for_original = [
+            req["id"] for req in darp_requests if req["original_request_id"] == original_id
+        ]
+
+        if kind == "no_MT" or line_idx is None:
+            if len(darp_ids_for_original) != 1:
+                raise ValueError(
+                    f"MoD-only original request {original_id} expected 1 DARP request, "
+                    f"found {len(darp_ids_for_original)}"
+                )
+            darp_id = darp_ids_for_original[0]
+            cost = darp_request_costs.get(darp_id, 0.0)
+            original_request_costs[original_id] = (cost, 0.0)
+        else:
+            if len(darp_ids_for_original) != 2:
+                raise ValueError(
+                    f"Line-assigned original request {original_id} expected 2 DARP requests, "
+                    f"found {len(darp_ids_for_original)}"
+                )
+            first_mile_darp_id = darp_ids_for_original[0]
+            last_mile_darp_id = darp_ids_for_original[1]
+            first_mile_cost = darp_request_costs.get(first_mile_darp_id, 0.0)
+            last_mile_cost = darp_request_costs.get(last_mile_darp_id, 0.0)
+            original_request_costs[original_id] = (first_mile_cost, last_mile_cost)
+
+    return original_request_costs
+
+
 line_planning_path = Path(r"C:\Google Drive AIC\My Drive\AIC Experiment Data\Line Planning")
 
 iteration_count = 2
@@ -248,7 +336,7 @@ line_inst = line_planning.instance.line_instance(
     dm_file=dm_file,
 )
 
-solver = line_planning.line_planning.line_planning_solver(line_inst)
+solver = line_planning.line_planning.LinePlanningSolver(line_inst)
 
 instance_size_label = line_planning.line_planning.get_instance_size_label(demand_file)
 
@@ -265,18 +353,6 @@ for i in range(iteration_count):
         output_dir=results_dir_path_per_iteration,
         gurobi_log_file=results_dir_path_per_iteration / "gurobi.log",
     )
-
-    # 1.1. Write metrics.json
-    results_payload = {
-            "objective_value": obj_val,
-            "run_time_seconds": run_time_ILP,
-            "instance_size": instance_size_label,
-            "demand_file": str(demand_file),
-            "n_darp_requests": len(darp_requests),
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        }
-    results_file = results_dir_path_per_iteration / "metrics.json"
-    results_file.write_text(json.dumps(results_payload, indent=2))
 
     # 2. DARP
     # Build MoD requests for DARP per section 4.2.1 (Conventional model) and write requests.csv
@@ -296,10 +372,34 @@ for i in range(iteration_count):
         vehicle_capacity=5,
     )
 
+    # 2.1 Write metrics.json
+    results_payload = {
+        "iteration": i + 1,
+        "objective_value": obj_val,
+        "run_time_seconds": run_time_ILP,
+        "instance_size": instance_size_label,
+        "demand_file": str(demand_file),
+        "n_darp_requests": len(darp_requests),
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    results_file = results_dir_path_per_iteration / "metrics.json"
+    results_file.write_text(json.dumps(results_payload, indent=2))
+
     # 2.2 call DARP solver
-    darpbenchmark.experiments.run_experiment_using_config(results_dir_path_per_iteration / "experiment_ih.yaml")
+    experiment_config_path = results_dir_path_per_iteration / "experiment_ih.yaml"
+    darpbenchmark.experiments.run_experiment_using_config(experiment_config_path)
 
+    # 3. Recompute the MoD cost estimates (section 4.3.2)
+    solution_path = results_dir_path_per_iteration / "experiment_ih.yaml-solution.json"
+    darp_solution = darpinstances.inout.load_json(solution_path)
 
-    # 3. recompute the MoD cost estimates
+    darp_request_costs = compute_per_darp_request_costs(darp_solution)
+    new_mod_costs = aggregate_mod_costs_for_original_requests(
+        darp_request_costs,
+        darp_requests,
+        request_assignments,
+    )
 
-    
+    solver.update_mod_costs(new_mod_costs, request_assignments)
+    logging.info(f"Iteration {i+1}: updated MoD costs for {len(new_mod_costs)} requests")
+
