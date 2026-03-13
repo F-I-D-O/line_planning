@@ -10,6 +10,10 @@ import time
 import json
 from typing import List, Optional, Tuple, Union
 
+import yaml
+
+import darpbenchmark.experiments
+
 import line_planning.instance
 import line_planning.line_planning
 
@@ -136,6 +140,86 @@ def write_darp_requests_csv(
             w.writerow(row)
 
 
+def write_darp_vehicles_csv(
+    darp_requests: List[dict],
+    path: Union[Path, str],
+    capacity: int = 5,
+    time_format: str = "seconds",
+) -> None:
+    """
+    Write DARP vehicles to a CSV file in Ridesharing_DARP_instances format.
+
+    One vehicle is created per request, with:
+    - starting position = request's pickup (origin) position
+    - operation_start = request's pickup time
+    - capacity = given capacity (default 5)
+
+    Columns: id, origin, capacity, operation_start
+    time_format: "seconds" (numeric) or "datetime" (yyyy-mm-dd HH:MM:SS).
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["id", "origin", "capacity", "operation_start"])
+        w.writeheader()
+        for req in darp_requests:
+            row = {
+                "id": req["id"],
+                "origin": req["origin"],
+                "capacity": capacity,
+                "operation_start": req["time"] if time_format == "seconds" else req.get("time_datetime", req["time"]),
+            }
+            w.writerow(row)
+
+
+def write_darp_config_yaml(
+    output_dir: Union[Path, str],
+    dm_filepath: Union[Path, str],
+    max_travel_time_delay_seconds: int = 300,
+    vehicle_capacity: int = 5,
+) -> None:
+    """
+    Write DARP instance and experiment config YAML files for DARP-benchmark.
+
+    Creates two files in output_dir:
+    - config.yaml: Instance configuration (requests, vehicles, dm, constraints)
+    - experiment_ih.yaml: Experiment configuration for running insertion heuristic
+
+    See: https://github.com/aicenter/DARP-benchmark
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    instance_config = {
+        "demand": {
+            "filepath": "./requests.csv",
+        },
+        "vehicles": {
+            "filepath": "./vehicles.csv",
+            "vehicle_capacity": vehicle_capacity,
+        },
+        "dm_filepath": str(dm_filepath),
+        "max_travel_time_delay": {
+            "mode": "absolute",
+            "seconds": max_travel_time_delay_seconds,
+        },
+    }
+
+    instance_config_path = output_dir / "config.yaml"
+    with instance_config_path.open("w", encoding="utf-8") as f:
+        yaml.dump(instance_config, f, default_flow_style=False, sort_keys=False)
+
+    experiment_config = {
+        "instance": "./config.yaml",
+        "method": "ih",
+        "outdir": ".",
+    }
+
+    experiment_config_path = output_dir / "experiment_ih.yaml"
+    with experiment_config_path.open("w", encoding="utf-8") as f:
+        yaml.dump(experiment_config, f, default_flow_style=False, sort_keys=False)
+
+
 line_planning_path = Path(r"C:\Google Drive AIC\My Drive\AIC Experiment Data\Line Planning")
 
 iteration_count = 2
@@ -182,16 +266,7 @@ for i in range(iteration_count):
         gurobi_log_file=results_dir_path_per_iteration / "gurobi.log",
     )
 
-    # 2. Build MoD requests for DARP per section 4.2.1 (Conventional model) and write requests.csv
-    darp_requests = solution_to_darp_requests(
-        line_inst,
-        request_assignments,
-        request_times=None,
-        delta_transfer_seconds=0,
-        max_frequency=line_planning.line_planning.max_frequency,
-    )
-    write_darp_requests_csv(darp_requests, results_dir_path_per_iteration / "requests.csv", time_format="seconds")
-
+    # 1.1. Write metrics.json
     results_payload = {
             "objective_value": obj_val,
             "run_time_seconds": run_time_ILP,
@@ -202,3 +277,29 @@ for i in range(iteration_count):
         }
     results_file = results_dir_path_per_iteration / "metrics.json"
     results_file.write_text(json.dumps(results_payload, indent=2))
+
+    # 2. DARP
+    # Build MoD requests for DARP per section 4.2.1 (Conventional model) and write requests.csv
+    darp_requests = solution_to_darp_requests(
+        line_inst,
+        request_assignments,
+        request_times=None,
+        delta_transfer_seconds=0,
+        max_frequency=line_planning.line_planning.max_frequency,
+    )
+    write_darp_requests_csv(darp_requests, results_dir_path_per_iteration / "requests.csv", time_format="seconds")
+    write_darp_vehicles_csv(darp_requests, results_dir_path_per_iteration / "vehicles.csv", capacity=5, time_format="seconds")
+    write_darp_config_yaml(
+        output_dir=results_dir_path_per_iteration,
+        dm_filepath=dm_file,
+        max_travel_time_delay_seconds=300,
+        vehicle_capacity=5,
+    )
+
+    # 2.2 call DARP solver
+    darpbenchmark.experiments.run_experiment_using_config(results_dir_path_per_iteration / "experiment_ih.yaml")
+
+
+    # 3. recompute the MoD cost estimates
+
+    
