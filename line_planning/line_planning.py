@@ -68,7 +68,7 @@ EPS = 1.e-5
 fixed_cost = 1
 max_frequency = 1
 
-def _get_instance_size_label(demand_file_path: Optional[str]) -> str:
+def get_instance_size_label(demand_file_path: Optional[str]) -> str:
     if demand_file_path:
         demand_file_name = Path(demand_file_path).name
         match = re.search(r"(\d+)_percent", demand_file_name)
@@ -728,7 +728,7 @@ class line_planning_solver:
         t1 = time.time()
 
         logging.info("Execution time: %s", t1-t0)
-        logging.info("Final solution: %s", master.ObjVal)
+        logging.info("Final solution cost: %s", master.ObjVal)
 
         if export_solution:
             master.write(str(output_dir_path / "ILP.sol"))
@@ -750,6 +750,156 @@ class line_planning_solver:
         )
 
         return master.ObjVal, t1-t0
+
+    def solve_MoD_aware_ILP(
+        self,
+        export_model: bool = False,
+        export_solution: bool = False,
+        output_dir: Union[Path, str] = Path("."),
+        gurobi_log_file: Union[Path, str, None] = None,
+    ):
+        """
+        Solve the MoD-aware line selection ILP from section 4.1 of the MoD-aware
+        Line Selection formulation: minimize total cost (MoD cost + MT line cost)
+        subject to each request served by exactly one option and line capacity.
+
+        Objective (7): min sum_r f̃tc(τ^MoD_r) x^MoD_r + sum_ℓ,r f̃tc(τ*_ℓr) x_ℓr + sum_ℓ c_ℓ y_ℓ
+        Constraint (8): x^MoD_r + sum_ℓ x_ℓr = 1 for each request r
+        Constraint (9): sum_{r: e in ρ_ℓr} x_ℓr <= C_MT f_ℓ y_ℓ for each line ℓ and edge e
+        """
+        request_count = self.line_instance.nb_pass
+        bus_capacity = self.line_instance.capacity
+
+        master = Model("MoD-aware ILP")
+        master.ModelSense = GRB.MINIMIZE
+
+        master.Params.timeLimit = allowed_time
+
+        # Line cost c_ℓ (MT cost of line ℓ)
+        line_costs = [
+            fixed_cost * self.line_instance.lengths_travel_times[l // max_frequency]
+            + (l % max_frequency) * self.line_instance.lengths_travel_times[l // max_frequency]
+            for l in range(self.line_count_total)
+        ]
+
+        # Binary variables y_ℓ: line ℓ selected
+        line_vars = master.addVars(self.line_count_total, vtype=GRB.BINARY, name="y")
+
+        # Binary x_ℓr only for (l, p) with a valid MT travel option (same as existing methods)
+        potential_line_passenger_combinations = [
+            (l, p)
+            for l in range(self.line_count_total)
+            for p in range(request_count)
+            if self.line_instance.optimal_trip_options[p][l // max_frequency].value > 0
+        ]
+        # MoD cost f̃tc(τ*_ℓr) = first_mile + last_mile for request r on line ℓ
+        mod_costs_line = {
+            (l, p): (
+                self.line_instance.optimal_trip_options[p][l // max_frequency].first_mile_cost
+                + self.line_instance.optimal_trip_options[p][l // max_frequency].last_mile_cost
+            )
+            for (l, p) in potential_line_passenger_combinations
+        }
+        passenger_vars = master.addVars(
+            potential_line_passenger_combinations,
+            vtype=GRB.BINARY,
+            obj=0,
+            name="x",
+        )
+        # Binary x^MoD_r: request r served by MoD-only (f̃tc(τ^MoD_r) = direct travel cost)
+        for p in range(request_count):
+            passenger_vars[self.line_count_total, p] = master.addVar(
+                vtype=GRB.BINARY,
+                obj=0,
+                name="x[no_MT,%d]" % p,
+            )
+        master.update()
+
+        # Objective (7): minimize MoD cost + line cost
+        line_costs_expression = line_vars.prod(line_costs)
+        mod_costs_for_obj = dict(mod_costs_line)
+        for p in range(request_count):
+            mod_costs_for_obj[self.line_count_total, p] = self._compute_direct_mod_cost(p)
+        mod_cost_expression = passenger_vars.prod(mod_costs_for_obj)
+        master.setObjective(line_costs_expression + mod_cost_expression, GRB.MINIMIZE)
+
+        # Constraint (8): each request served by exactly one option
+        master.addConstrs(
+            (passenger_vars.sum("*", p) == 1 for p in range(request_count)),
+            name="one_option_per_passenger",
+        )
+
+        # Constraint (9): capacity on each edge of each line
+        for l in range(self.line_count_total):
+            f_l = l % max_frequency + 1
+            length = self.line_instance.set_of_lines[l // max_frequency][0]
+            for k in range(length):
+                vars_list = []
+                coefs_list = []
+                for p in self.line_instance.edge_to_passengers[l // max_frequency][k]:
+                    if (l, p) in passenger_vars:
+                        vars_list.append(passenger_vars[l, p])
+                        coefs_list.append(1)
+                if vars_list:
+                    master.addConstr(
+                        LinExpr(coefs_list, vars_list) <= bus_capacity * f_l * line_vars[l],
+                        name="capacity[%d][%d]" % (l, k),
+                    )
+        master.update()
+
+        output_dir_path = Path(output_dir)
+        output_dir_path.mkdir(parents=True, exist_ok=True)
+
+        if gurobi_log_file is not None:
+            gurobi_log_path = Path(gurobi_log_file)
+            gurobi_log_path.parent.mkdir(parents=True, exist_ok=True)
+            master.Params.LogFile = str(gurobi_log_path)
+
+        if export_model:
+            master.write(str(output_dir_path / "MoD_aware_ILP.lp"))
+
+        logging.info("Solving MoD-aware ILP (section 4.1)")
+        t0 = time.time()
+        master.optimize()
+        t1 = time.time()
+
+        logging.info("Execution time: %s", t1 - t0)
+        logging.info("Final solution (total cost): %s", master.ObjVal)
+
+        if export_solution:
+            master.write(str(output_dir_path / "MoD_aware_ILP.sol"))
+
+        self._export_used_lines(
+            output_dir=output_dir_path,
+            line_vars=line_vars,
+            line_costs=line_costs,
+        )
+
+        assignments = self._export_passenger_assignments(
+            output_dir=output_dir_path,
+            passenger_vars=passenger_vars,
+        )
+
+        self._solve_and_export_flows(
+            assignments=assignments,
+            output_dir=output_dir_path,
+        )
+
+        # Build selected lines and request-line assignments for downstream DARP (e.g. section 4.2.1)
+        selected_lines = [l for l in range(self.line_count_total) if line_vars[l].X > EPS]
+        request_assignments = []
+        for p in range(request_count):
+            if passenger_vars[self.line_count_total, p].X > EPS:
+                request_assignments.append(("no_MT", None))
+            else:
+                assigned_line = None
+                for l in range(self.line_count_total):
+                    if (l, p) in passenger_vars and passenger_vars[l, p].X > EPS:
+                        assigned_line = l
+                        break
+                request_assignments.append(("line", assigned_line))
+
+        return master.ObjVal, t1 - t0, selected_lines, request_assignments
 
     def solve_ILP_with_empty_trips(
         self,
@@ -1057,7 +1207,7 @@ if __name__ == "__main__":
         dm_file=dm_file,
     )
 
-    instance_size_label = _get_instance_size_label(demand_file)
+    instance_size_label = get_instance_size_label(demand_file)
     method_label = _get_method_label(use_model_with_mod_costs, use_model_with_empty_trips)
     base_results_directory = results_dir
     base_results_directory.mkdir(parents=True, exist_ok=True)
