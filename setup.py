@@ -1,7 +1,7 @@
 import setuptools
 
 setuptools.setup(
-    name="line_planning",
+    name="lineplanning",
     version="0.1.0",
     author="David Fiedler",
     author_email="david.fido.fiedler@gmail.com",
@@ -9,6 +9,8 @@ setuptools.setup(
     packages=setuptools.find_packages(),
     install_requires=[
         "gurobipy",
-        "darpbenchmark"
+        "darpbenchmark",
+        "darpinstances",
+        "pyYAML"
     ],
 )

@@ -14,13 +14,13 @@ from pandas.io.sas.sas_constants import dataset_length
 
 from tqdm import tqdm
 
-from graph_class import *
+from lineplanning.graph_class import *
 
 # , geopandas as gpd
 
 import networkx as nx
 
-import log
+import lineplanning.log
 
 
 # ox.config(log_console=True, use_cache=True)

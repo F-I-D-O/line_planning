@@ -12,8 +12,8 @@ import numpy as np
 import pandas as pd
 from gurobipy import *
 
-from instance import *
-import log
+from lineplanning.instance import *
+import lineplanning.log
 
 test_data_path = Path(__file__).parent / "test_data"
 line_planning_results_path = Path(r"C:\Google Drive AIC\My Drive\AIC Experiment Data\Line Planning\Results")

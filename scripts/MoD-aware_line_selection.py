@@ -16,12 +16,36 @@ import darpinstances.inout
 
 import darpbenchmark.experiments
 
-import line_planning.instance
-import line_planning.line_planning
+import lineplanning.instance
+import lineplanning.line_planning
+
+
+experiment_data_path = Path(r"C:\Google Drive AIC\My Drive\AIC Experiment Data")
+
+
+iteration_count = 2
+
+instance_dir = experiment_data_path / "DARP/Instances/Manhattan"
+candidate_lines_file = instance_dir / "lines.txt"
+dm_file = instance_dir / "dm.h5"
+demand_file = instance_dir / "instances/start_18-00/duration_02_h/max_delay_05_min/requests.csv"
+line_planning_path = experiment_data_path / "Line Planning"
+results_dir_path = line_planning_path / "Results/manhattan_test/mod-aware"
+
+# Perivier instance - broken triangle inequality
+# test_data_path = Path(__file__).parent.parent / "test_data"
+# candidate_lines_file = test_data_path / "all_lines_nodes_100_c5.txt"
+# # Distance matrix file
+# dm_file = line_planning_path / "Instances/original/dm.h5"
+# demand_file = test_data_path / "OD_matrix_april_fhv_10_percent.txt"
+# results_dir_path = line_planning_path / "Results/original_instances/10_percent/budget_200000/mod-aware"
+
+
+DARP_BENCHMARK_PATH = Path(r"C:/Workspaces/AIC/DARP_Benchmark/cmake-build-debug/DARP-benchmark")
 
 
 def solution_to_darp_requests(
-    line_instance: "line_planning.instance.line_instance",
+    line_instance: "lineplanning.instance.line_instance",
     request_assignments: List[Tuple[str, Optional[int]]],
     request_times: Optional[List[Union[int, float]]] = None,
     delta_transfer_seconds: Union[int, float] = 0,
@@ -115,6 +139,60 @@ def solution_to_darp_requests(
     return darp_requests
 
 
+def load_darp_requests_csv(path: Union[Path, str]) -> List[dict]:
+    """
+    Load DARP requests from a CSV file.
+
+    Returns a list of dicts with keys: origin, destination, time, id, original_request_id.
+    """
+    path = Path(path)
+    darp_requests = []
+    with path.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            darp_requests.append({
+                "id": int(row["id"]),
+                "original_request_id": int(row["original_request_id"]),
+                "origin": int(row["origin"]),
+                "destination": int(row["destination"]),
+                "time": float(row["time"]),
+            })
+    return darp_requests
+
+
+def load_request_assignments_csv(
+    path: Union[Path, str],
+    max_frequency: int = 1,
+) -> List[Tuple[str, Optional[int]]]:
+    """
+    Load request assignments from passenger_assignments.csv (exported by the ILP solver).
+
+    The CSV has columns: passenger, line, mod_cost
+    where `line` is either:
+    - an integer (route_index) if assigned to a line
+    - "no_MT" if assigned to MoD-only
+    - "Dropped" if dropped (treated as no_MT here)
+
+    Returns a list of (kind, line_idx) tuples where kind is "no_MT" or "line".
+    line_idx is the line index (route_index * max_frequency), not the route_index.
+    """
+    import pandas as pd
+    path = Path(path)
+    df = pd.read_csv(path)
+    df = df.sort_values("passenger").reset_index(drop=True)
+
+    request_assignments = []
+    for _, row in df.iterrows():
+        line_value = row["line"]
+        if line_value == "no_MT":
+            request_assignments.append(("no_MT", None))
+        else:
+            route_index = int(line_value)
+            line_idx = route_index * max_frequency
+            request_assignments.append(("line", line_idx))
+    return request_assignments
+
+
 def write_darp_requests_csv(
     darp_requests: List[dict],
     path: Union[Path, str],
@@ -167,7 +245,7 @@ def write_darp_vehicles_csv(
         for req in darp_requests:
             row = {
                 "id": req["id"],
-                "origin": req["origin"],
+                "position": req["origin"],
                 "capacity": capacity,
                 "operation_start": req["time"] if time_format == "seconds" else req.get("time_datetime", req["time"]),
             }
@@ -308,20 +386,10 @@ def aggregate_mod_costs_for_original_requests(
     return original_request_costs
 
 
-line_planning_path = Path(r"C:\Google Drive AIC\My Drive\AIC Experiment Data\Line Planning")
 
-iteration_count = 2
-
-test_data_path = Path(__file__).parent.parent / "test_data"
-candidate_lines_file = test_data_path / "all_lines_nodes_100_c5.txt"
-# Distance matrix file
-dm_file = line_planning_path / "Instances/original/dm.h5"
-demand_file = test_data_path / "OD_matrix_april_fhv_10_percent.txt"
-
-results_dir_path = line_planning_path / "Results/original_instances/10_percent/budget_200000/mod-aware"
 
 # Loads candidate lines file and similar: once per the whole script
-line_inst = line_planning.instance.line_instance(
+line_inst = lineplanning.instance.line_instance(
     candidate_lines_file=candidate_lines_file,
     cost=1,
     max_length=15,
@@ -336,58 +404,68 @@ line_inst = line_planning.instance.line_instance(
     dm_file=dm_file,
 )
 
-solver = line_planning.line_planning.LinePlanningSolver(line_inst)
+solver = lineplanning.line_planning.LinePlanningSolver(line_inst)
 
-instance_size_label = line_planning.line_planning.get_instance_size_label(demand_file)
+instance_size_label = lineplanning.line_planning.get_instance_size_label(demand_file)
 
 for i in range(iteration_count):
     logging.info(f"Iteration {i+1} of {iteration_count}")
 
     results_dir_path_per_iteration = results_dir_path / f"iteration_{i+1}"
-    results_dir_path_per_iteration.mkdir(parents=True)
+    results_dir_path_per_iteration.mkdir(parents=True, exist_ok=True)
 
-    # 1. Solve the line selection ILP (section 4.1); get selected lines and request-line assignments
-    obj_val, run_time_ILP, selected_lines, request_assignments = solver.solve_MoD_aware_ILP(
-        export_model=True,
-        export_solution=True,
-        output_dir=results_dir_path_per_iteration,
-        gurobi_log_file=results_dir_path_per_iteration / "gurobi.log",
-    )
+    # Check if DARP input files already exist; if so, skip to step 2.2
+    requests_csv_path = results_dir_path_per_iteration / "requests.csv"
+    passenger_assignments_csv_path = results_dir_path_per_iteration / "passenger_assignments.csv"
+    experiment_config_path = results_dir_path_per_iteration / "experiment_ih.yaml"
 
-    # 2. DARP
-    # Build MoD requests for DARP per section 4.2.1 (Conventional model) and write requests.csv
-    darp_requests = solution_to_darp_requests(
-        line_inst,
-        request_assignments,
-        request_times=None,
-        delta_transfer_seconds=0,
-        max_frequency=line_planning.line_planning.max_frequency,
-    )
-    write_darp_requests_csv(darp_requests, results_dir_path_per_iteration / "requests.csv", time_format="seconds")
-    write_darp_vehicles_csv(darp_requests, results_dir_path_per_iteration / "vehicles.csv", capacity=5, time_format="seconds")
-    write_darp_config_yaml(
-        output_dir=results_dir_path_per_iteration,
-        dm_filepath=dm_file,
-        max_travel_time_delay_seconds=300,
-        vehicle_capacity=5,
-    )
+    if requests_csv_path.exists() and passenger_assignments_csv_path.exists() and experiment_config_path.exists():
+        logging.info(f"Iteration {i+1}: DARP input files exist, skipping ILP and loading from files")
+        darp_requests = load_darp_requests_csv(requests_csv_path)
+        request_assignments = load_request_assignments_csv(
+            passenger_assignments_csv_path,
+            max_frequency=lineplanning.line_planning.max_frequency,
+        )
+    else:
+        # 1. Solve the line selection ILP (section 4.1); get selected lines and request-line assignments
+        obj_val, run_time_ILP, selected_lines, request_assignments = solver.solve_MoD_aware_ILP(
+            export_model=True,
+            export_solution=True,
+            output_dir=results_dir_path_per_iteration,
+            gurobi_log_file=results_dir_path_per_iteration / "gurobi.log",
+        )
+        # 1.2 Write metrics.json
+        results_payload = {
+            "iteration": i + 1,
+            "objective_value": obj_val,
+            "run_time_seconds": run_time_ILP,
+            "instance_size": instance_size_label,
+            "demand_file": str(demand_file),
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        results_file = results_dir_path_per_iteration / "metrics.json"
+        results_file.write_text(json.dumps(results_payload, indent=2))
 
-    # 2.1 Write metrics.json
-    results_payload = {
-        "iteration": i + 1,
-        "objective_value": obj_val,
-        "run_time_seconds": run_time_ILP,
-        "instance_size": instance_size_label,
-        "demand_file": str(demand_file),
-        "n_darp_requests": len(darp_requests),
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-    }
-    results_file = results_dir_path_per_iteration / "metrics.json"
-    results_file.write_text(json.dumps(results_payload, indent=2))
+        # 2. DARP
+        # Build MoD requests for DARP per section 4.2.1 (Conventional model) and write requests.csv
+        darp_requests = solution_to_darp_requests(
+            line_inst,
+            request_assignments,
+            request_times=None,
+            delta_transfer_seconds=0,
+            max_frequency=lineplanning.line_planning.max_frequency,
+        )
+        write_darp_requests_csv(darp_requests, requests_csv_path, time_format="seconds")
+        write_darp_vehicles_csv(darp_requests, results_dir_path_per_iteration / "vehicles.csv", capacity=5, time_format="seconds")
+        write_darp_config_yaml(
+            output_dir=results_dir_path_per_iteration,
+            dm_filepath=dm_file,
+            max_travel_time_delay_seconds=300,
+            vehicle_capacity=5,
+        )
 
     # 2.2 call DARP solver
-    experiment_config_path = results_dir_path_per_iteration / "experiment_ih.yaml"
-    darpbenchmark.experiments.run_experiment_using_config(experiment_config_path)
+    darpbenchmark.experiments.run_experiment_using_config(experiment_config_path, executable_path=DARP_BENCHMARK_PATH)
 
     # 3. Recompute the MoD cost estimates (section 4.3.2)
     solution_path = results_dir_path_per_iteration / "experiment_ih.yaml-solution.json"
