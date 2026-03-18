@@ -7,7 +7,6 @@ from copy import deepcopy
 from pathlib import Path
 from typing import NamedTuple, Optional, List, Tuple
 
-import h5py
 import numpy as np
 import pandas as pd
 from pandas.io.sas.sas_constants import dataset_length
@@ -15,6 +14,7 @@ from pandas.io.sas.sas_constants import dataset_length
 from tqdm import tqdm
 
 from lineplanning.graph_class import *
+from darpinstances.travel_time_provider import MatrixTravelTimeProvider
 
 # , geopandas as gpd
 
@@ -286,12 +286,9 @@ class line_instance:
         logging.info('Loading distance matrix from %s', self.dm_file)
         if not self.dm_file.exists():
             raise FileNotFoundError("Distance matrix file %s does not exist" % self.dm_file)
-        with h5py.File(self.dm_file, 'r') as f:
-            if 'dm' in f:
-                dataset_name = 'dm'
-            else:
-                dataset_name = list(f.keys())[0]
-            distances = np.array(f[dataset_name])
+
+        travel_time_provider = MatrixTravelTimeProvider.read_from_file(self.dm_file)
+        distances = np.asarray(travel_time_provider.dm)
         logging.info('Distance matrix loaded')
 
         logging.info('Loading demand')

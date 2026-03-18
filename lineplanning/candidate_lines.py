@@ -10,23 +10,27 @@ from copy import deepcopy
 from darpinstances.instance import MatrixTravelTimeProvider
 from tqdm import tqdm
 
-# configuration
-area_path = Path(r"C:\Google Drive AIC\My Drive\AIC Experiment Data\DARP\Instances\Manhattan")
-lines_path = area_path / 'lines.txt'
-number_of_stops = 400
-nb_lines = 1000
-min_length = 10
-max_length = 30
-min_start_end_distance = 200
-detour_skeleton = 2
-# area_name = 'Manhattan, New York, New York, USA'
-area_name = None
+# default configuration (used only when running this module as a script)
+# area_path = Path(r"C:\Google Drive AIC\My Drive\AIC Experiment Data\DARP\Instances\Manhattan")
+DEFAULT_AREA_PATH = Path(r"C:\Google Drive AIC\My Drive\AIC Experiment Data\Line Planning\Instances\Chyse")
+DEFAULT_NUMBER_OF_STOPS = 10
+DEFAULT_NB_LINES = 30
+DEFAULT_MIN_LENGTH = 2
+DEFAULT_MAX_LENGTH = 10
+DEFAULT_MIN_START_END_DISTANCE = 20
+DEFAULT_DETOUR_SKELETON = 2
+# DEFAULT_AREA_NAME = 'Manhattan, New York, New York, USA'
+DEFAULT_AREA_NAME = None
 
 
 def load_graph(edges_path: Path):
     logging.info("Loading graph from %s", edges_path)
     edge_df = pd.read_csv(edges_path, delimiter='\t')
-    edge_df['travel_time'] = edge_df['length'] / edge_df['speed']
+    DEFAULT_SPEED = 14 # 50 km/h in meters per second
+    if 'speed' in edge_df.columns:
+        edge_df['travel_time'] = edge_df['length'] / edge_df['speed']
+    else:
+        edge_df['travel_time'] = edge_df['length'] / DEFAULT_SPEED
 
     return nx.from_pandas_edgelist(edge_df, source='u', target='v', edge_attr='travel_time', create_using=nx.DiGraph())
 
@@ -148,37 +152,85 @@ class CandidateLineGenerator:
                 except:
                     logging.warning('line_construction_failed')
         return all_lines, all_routes
+        
+
+def generate_candidate_lines(
+    area_path: Path,
+    output_path: Path,
+    number_of_stops: int = DEFAULT_NUMBER_OF_STOPS,
+    nb_lines: int = DEFAULT_NB_LINES,
+    min_length: int = DEFAULT_MIN_LENGTH,
+    max_length: int = DEFAULT_MAX_LENGTH,
+    min_start_end_distance: int = DEFAULT_MIN_START_END_DISTANCE,
+    detour_skeleton: int = DEFAULT_DETOUR_SKELETON,
+    area_name: str | None = DEFAULT_AREA_NAME,
+) -> None:
+    """
+    Generate candidate lines for a given instance directory.
+
+    The instance directory must contain:
+    - a distance matrix file named one of: dm.h5, dm.hdf5, dm.csv, dm.dm
+    - a road network at map/edges.csv, or alternatively provide area_name to download from OSM.
+    """
+    lines_path = output_path / "lines.txt"
+
+    dm_candidates = [
+        area_path / "dm.h5",
+        area_path / "dm.hdf5",
+        area_path / "dm.csv"
+    ]
+    dm_path = next((p for p in dm_candidates if p.exists()), None)
+    if dm_path is None:
+        raise FileNotFoundError(
+            "Distance matrix file does not exist. Expected one of: %s in %s"
+            % ([p.name for p in dm_candidates], area_path)
+        )
+
+    travel_time_provider = MatrixTravelTimeProvider.read_from_file(dm_path)
+
+    logging.info("Randomly selecting stops")
+    potential_stops = [i for i in range(travel_time_provider.get_node_count())]
+    stops = []
+    for _ in range(number_of_stops):
+        stop_index = random.randint(0, len(potential_stops) - 1)
+        new_stop = potential_stops.pop(stop_index)
+        stops.append(new_stop)
+
+    edge_path = area_path / "map/edges.csv"
+    if edge_path.exists():
+        G = load_graph(edge_path)
+    elif area_name is not None:
+        G = get_graph_from_openstreetmap(area_name)
+    else:
+        raise ValueError("Either the edge path or the area name must be specified.")
+
+    line_generator = CandidateLineGenerator(
+        stops,
+        travel_time_provider,
+        G,
+        min_start_end_distance,
+        detour_skeleton,
+        min_length,
+        max_length,
+    )
+
+    logging.info("Generating candidate lines")
+    all_lines, _ = line_generator.generate_lines_skeleton_manhattan(nb_lines)
+
+    with open(lines_path, "w") as f:
+        logging.info("Exporting candidate lines to %s", lines_path)
+        for line in all_lines:
+            f.write(",".join([str(i) for i in line]) + "\n")
 
 
-travel_time_provider = MatrixTravelTimeProvider.from_hdf(area_path / 'dm.h5')
-
-# randomly selecting nodes for stops
-logging.info("Randomly selecting stops")
-potential_stops = [i for i in range(travel_time_provider.get_node_count())]
-stops = []
-for i in range(number_of_stops):
-    stop_index = random.randint(0, len(potential_stops) - 1)
-    new_stop = potential_stops.pop(stop_index)
-    stops.append(new_stop)
-
-# get the road network graph
-edge_path = area_path / 'map/edges.csv'
-if edge_path.exists():
-    G = load_graph(edge_path)
-elif area_name is not None:
-    G = get_graph_from_openstreetmap(area_name)
-else:
-    raise ValueError('Either the edge path or the area name must be specified.')
-
-line_generator = CandidateLineGenerator(
-    stops, travel_time_provider, G, min_start_end_distance, detour_skeleton, min_length, max_length
-)
-
-logging.info("Generating candidate lines")
-all_lines, all_routes = line_generator.generate_lines_skeleton_manhattan(nb_lines)
-
-
-with open(lines_path, 'w') as f:
-    logging.info("Exporting candidate lines to %s", lines_path)
-    for line in all_lines:
-        f.write(','.join([str(i) for i in line]) + '\n')
+if __name__ == "__main__":
+    generate_candidate_lines(
+        area_path=DEFAULT_AREA_PATH,
+        number_of_stops=DEFAULT_NUMBER_OF_STOPS,
+        nb_lines=DEFAULT_NB_LINES,
+        min_length=DEFAULT_MIN_LENGTH,
+        max_length=DEFAULT_MAX_LENGTH,
+        min_start_end_distance=DEFAULT_MIN_START_END_DISTANCE,
+        detour_skeleton=DEFAULT_DETOUR_SKELETON,
+        area_name=DEFAULT_AREA_NAME,
+    )

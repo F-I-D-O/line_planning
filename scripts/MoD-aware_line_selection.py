@@ -25,12 +25,20 @@ experiment_data_path = Path(r"C:\Google Drive AIC\My Drive\AIC Experiment Data")
 
 iteration_count = 2
 
-instance_dir = experiment_data_path / "DARP/Instances/Manhattan"
-candidate_lines_file = instance_dir / "lines.txt"
-dm_file = instance_dir / "dm.h5"
-demand_file = instance_dir / "instances/start_18-00/duration_02_h/max_delay_05_min/requests.csv"
 line_planning_path = experiment_data_path / "Line Planning"
-results_dir_path = line_planning_path / "Results/manhattan_test/mod-aware"
+
+# instance_dir = experiment_data_path / "DARP/Instances/Manhattan"
+# candidate_lines_file = instance_dir / "lines.txt"
+# dm_file = instance_dir / "dm.h5"
+# demand_file = instance_dir / "instances/start_18-00/duration_02_h/max_delay_05_min/requests.csv"
+# results_dir_path = line_planning_path / "Results/manhattan_test/mod-aware"
+
+# Chyse
+instance_dir = experiment_data_path / "Line Planning/Instances/Chyse"
+candidate_lines_file = instance_dir / "lines.txt"
+dm_file = instance_dir / "dm.csv"
+demand_file = instance_dir / "requests.csv"
+results_dir_path = line_planning_path / "Results/chyse_test/mod-aware"
 
 # Perivier instance - broken triangle inequality
 # test_data_path = Path(__file__).parent.parent / "test_data"
@@ -41,7 +49,7 @@ results_dir_path = line_planning_path / "Results/manhattan_test/mod-aware"
 # results_dir_path = line_planning_path / "Results/original_instances/10_percent/budget_200000/mod-aware"
 
 
-DARP_BENCHMARK_PATH = Path(r"C:/Workspaces/AIC/DARP_Benchmark/cmake-build-debug/DARP-benchmark")
+DARP_BENCHMARK_PATH = Path(r"C:/Workspaces/AIC/DARP-Benchmark/cmake-build-debug/DARP-benchmark")
 
 
 def solution_to_darp_requests(
@@ -240,7 +248,7 @@ def write_darp_vehicles_csv(
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["id", "origin", "capacity", "operation_start"])
+        w = csv.DictWriter(f, fieldnames=["id", "position", "capacity", "operation_start"])
         w.writeheader()
         for req in darp_requests:
             row = {
@@ -468,7 +476,7 @@ for i in range(iteration_count):
     darpbenchmark.experiments.run_experiment_using_config(experiment_config_path, executable_path=DARP_BENCHMARK_PATH)
 
     # 3. Recompute the MoD cost estimates (section 4.3.2)
-    solution_path = results_dir_path_per_iteration / "experiment_ih.yaml-solution.json"
+    solution_path = results_dir_path_per_iteration / "config.yaml-solution.json"
     darp_solution = darpinstances.inout.load_json(solution_path)
 
     darp_request_costs = compute_per_darp_request_costs(darp_solution)
