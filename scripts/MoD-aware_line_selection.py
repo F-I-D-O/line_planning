@@ -26,6 +26,8 @@ experiment_data_path = Path(r"C:\Google Drive AIC\My Drive\AIC Experiment Data")
 iteration_count = 2
 
 line_planning_path = experiment_data_path / "Line Planning"
+demand_file = None
+dm_file = None
 
 # instance_dir = experiment_data_path / "DARP/Instances/Manhattan"
 # candidate_lines_file = instance_dir / "lines.txt"
@@ -34,11 +36,89 @@ line_planning_path = experiment_data_path / "Line Planning"
 # results_dir_path = line_planning_path / "Results/manhattan_test/mod-aware"
 
 # Chyse
-instance_dir = experiment_data_path / "Line Planning/Instances/Chyse"
+# instance_dir = experiment_data_path / "Line Planning/Instances/Chyse"
+# candidate_lines_file = instance_dir / "lines.txt"
+# dm_file = instance_dir / "dm.csv"
+# demand_file = instance_dir / "requests.csv"
+# results_dir_path = line_planning_path / "Results/chyse_test/mod-aware"
+
+# Manhattan 10% demand
+instance_dir = experiment_data_path / "Line Planning/Instances/manhattan-2_h-10_percent/instance_01"
 candidate_lines_file = instance_dir / "lines.txt"
-dm_file = instance_dir / "dm.csv"
-demand_file = instance_dir / "requests.csv"
-results_dir_path = line_planning_path / "Results/chyse_test/mod-aware"
+results_dir_path = line_planning_path / "Results/manhattan-2_h-10_percent/instance_01/mod-aware"
+
+def _resolve_config_path(instance_dir_path: Path) -> Path:
+    config_candidates = [
+        instance_dir_path / "config.yaml",
+        instance_dir_path / "config.yml",
+        instance_dir_path / "instance_config.yaml",
+        instance_dir_path / "instance_config.yml",
+    ]
+    for p in config_candidates:
+        if p.exists():
+            return p
+    raise FileNotFoundError(
+        "Could not find an instance config file to infer demand/dm paths. "
+        f"Tried: {[str(p) for p in config_candidates]}"
+    )
+
+
+def _coerce_path(v: object) -> Path:
+    if isinstance(v, Path):
+        return v
+    if isinstance(v, str):
+        return Path(v)
+    raise TypeError(f"Expected str/Path, got {type(v).__name__}")
+
+
+def _load_demand_and_dm_from_instance_config(instance_dir_path: Path) -> Tuple[Path, Path]:
+    config_path = _resolve_config_path(instance_dir_path)
+    config_dir = config_path.parent
+
+    with config_path.open("r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    if not isinstance(cfg, dict):
+        raise ValueError(f"Expected a mapping at top-level in {config_path}, got {type(cfg).__name__}.")
+
+    demand_cfg = cfg.get("demand")
+    dm_filepath = cfg.get("dm_filepath")
+
+    if not isinstance(demand_cfg, dict):
+        raise ValueError(f"Expected config['demand'] to be a mapping in {config_path}.")
+
+    demand_filepath = demand_cfg.get("filepath")
+
+    if not demand_filepath:
+        raise KeyError(
+            f"Missing demand filepath in {config_path}. Expected keys like demand.filepath."
+        )
+    if not dm_filepath:
+        raise KeyError(
+            f"Missing dm filepath in {config_path}. Expected key like dm_filepath."
+        )
+
+    demand_path = _coerce_path(demand_filepath)
+    dm_path = _coerce_path(dm_filepath)
+
+    if not demand_path.is_absolute():
+        demand_path = (config_dir / demand_path).resolve()
+    if not dm_path.is_absolute():
+        dm_path = (config_dir / dm_path).resolve()
+
+    return demand_path, dm_path
+
+
+if demand_file is None or dm_file is None:
+    inferred_demand_file, inferred_dm_file = _load_demand_and_dm_from_instance_config(instance_dir)
+    if demand_file is None:
+        demand_file = inferred_demand_file
+    if dm_file is None:
+        dm_file = inferred_dm_file
+
+if demand_file is None or dm_file is None:
+    raise ValueError(
+        "demand_file and dm_file must be set either directly in the script or via instance_dir/config.yaml."
+    )
 
 # Perivier instance - broken triangle inequality
 # test_data_path = Path(__file__).parent.parent / "test_data"

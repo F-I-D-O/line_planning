@@ -23,9 +23,18 @@ DEFAULT_DETOUR_SKELETON = 2
 DEFAULT_AREA_NAME = None
 
 
-def load_graph(edges_path: Path):
+def load_graph(edges_path: Path) -> nx.DiGraph:
+    """
+    Build a directed graph whose node labels are exactly the ``u`` / ``v`` values
+    from the edge file. These must match distance-matrix row/column indices
+    (0 .. n-1 or the same id space as ``MatrixTravelTimeProvider``); otherwise
+    line generation and travel-time lookups are inconsistent.
+    """
     logging.info("Loading graph from %s", edges_path)
     edge_df = pd.read_csv(edges_path, delimiter='\t')
+    # Normalize endpoints to int labels so they match DM indices (CSV may parse as float).
+    edge_df["u"] = pd.to_numeric(edge_df["u"], errors="raise").astype(int)
+    edge_df["v"] = pd.to_numeric(edge_df["v"], errors="raise").astype(int)
     DEFAULT_SPEED = 14 # 50 km/h in meters per second
     if 'speed' in edge_df.columns:
         edge_df['travel_time'] = edge_df['length'] / edge_df['speed']
@@ -42,7 +51,7 @@ def get_graph_from_openstreetmap(area_name: str):
     # calculate travel time (seconds) for all edges
     G = ox.add_edge_travel_times(G)
 
-    # relabel nodes to index from 0 to n-1
+    # Relabel nodes to 0..n-1; the distance matrix must use the same indices.
     G = nx.convert_node_labels_to_integers(G)
 
     return G
@@ -53,7 +62,7 @@ class CandidateLineGenerator:
         self,
         stops: list[int],
         travel_time_provider: MatrixTravelTimeProvider,
-        G,
+        G: nx.DiGraph,
         min_start_end_distance,
         detour_skeleton,
         min_length,
@@ -62,16 +71,20 @@ class CandidateLineGenerator:
         self.stops: list[int] = stops
         self.stops_set: set[int] = set(stops)
         self.travel_time_provider: MatrixTravelTimeProvider = travel_time_provider
-        self.G = G
+        self.G: nx.DiGraph = G
         self.min_start_end_distance = min_start_end_distance
         self.detour_skeleton = detour_skeleton
         self.min_length = min_length
         self.max_length = max_length
 
-    def shortest_path_nodes(self, orig_index, dest_index):
-        orig = list(self.G)[orig_index]
-        dest = list(self.G)[dest_index]
-        route = nx.shortest_path(self.G, orig, dest, weight='travel_time')
+    def compute_route_between_stops(self, orig_node_label: int, dest_node_label: int):
+        """
+        Shortest path on the road graph between two stops, using **graph node labels**
+        (same ids as DM / ``u``–``v`` in ``edges.csv``), not positions in ``list(G)``.
+        """
+        route = nx.shortest_path(
+            self.G, orig_node_label, dest_node_label, weight="travel_time"
+        )
         # print(route)
         route_within_stops = []
         for node in route:
@@ -121,9 +134,9 @@ class CandidateLineGenerator:
                 break
         inter_2 = remaining_stops.pop(inter_index_2)
 
-        route_within_stops_1, route1 = self.shortest_path_nodes(start, inter)
-        route_within_stops_2, route2 = self.shortest_path_nodes(inter, inter_2)
-        route_within_stops_3, route3 = self.shortest_path_nodes(inter_2, end)
+        route_within_stops_1, route1 = self.compute_route_between_stops(start, inter)
+        route_within_stops_2, route2 = self.compute_route_between_stops(inter, inter_2)
+        route_within_stops_3, route3 = self.compute_route_between_stops(inter_2, end)
 
         line = route_within_stops_1 + route_within_stops_2[1:] + route_within_stops_3[1:]
         route = route1 + route2[1:] + route3[1:]
@@ -169,8 +182,11 @@ def generate_candidate_lines(
     The instance directory must contain:
     - a distance matrix file named one of: dm.h5, dm.hdf5, dm.csv, dm.dm
     - a road network at map/edges.csv, or alternatively provide area_name to download from OSM.
+
+    **Graph / DM contract:** ``edges.csv`` endpoints ``u`` and ``v`` are node labels and must
+    match distance-matrix indices (same integer id space). Shortest paths use these labels
+    directly—never list positions in ``G``.
     """
-    lines_path = output_path / "lines.txt"
 
     dm_candidates = [
         area_path / "dm.h5",
@@ -196,9 +212,9 @@ def generate_candidate_lines(
 
     edge_path = area_path / "map/edges.csv"
     if edge_path.exists():
-        G = load_graph(edge_path)
+        G: nx.DiGraph = load_graph(edge_path)
     elif area_name is not None:
-        G = get_graph_from_openstreetmap(area_name)
+        G: nx.DiGraph = get_graph_from_openstreetmap(area_name)
     else:
         raise ValueError("Either the edge path or the area name must be specified.")
 
@@ -215,8 +231,8 @@ def generate_candidate_lines(
     logging.info("Generating candidate lines")
     all_lines, _ = line_generator.generate_lines_skeleton_manhattan(nb_lines)
 
-    with open(lines_path, "w") as f:
-        logging.info("Exporting candidate lines to %s", lines_path)
+    with open(output_path, "w") as f:
+        logging.info("Exporting candidate lines to %s", output_path)
         for line in all_lines:
             f.write(",".join([str(i) for i in line]) + "\n")
 
@@ -224,6 +240,7 @@ def generate_candidate_lines(
 if __name__ == "__main__":
     generate_candidate_lines(
         area_path=DEFAULT_AREA_PATH,
+        output_path=DEFAULT_AREA_PATH / "lines.txt",
         number_of_stops=DEFAULT_NUMBER_OF_STOPS,
         nb_lines=DEFAULT_NB_LINES,
         min_length=DEFAULT_MIN_LENGTH,
