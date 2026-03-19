@@ -68,7 +68,6 @@ class CandidateLineGenerator:
         self.min_length = min_length
         self.max_length = max_length
 
-    @profile
     def shortest_path_nodes(self, orig_index, dest_index):
         orig = list(self.G)[orig_index]
         dest = list(self.G)[dest_index]
@@ -141,9 +140,6 @@ class CandidateLineGenerator:
         with tqdm(total=nb_lines, desc='Generating candidate lines') as progress_bar:
             while len(all_lines) < nb_lines and iter < 2 * nb_lines:
                 iter += 1
-
-                if iter == 10:
-                    break
 
                 try:
                     length = random.randint(self.min_length, self.max_length)
