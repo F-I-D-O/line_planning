@@ -51,7 +51,7 @@ def get_graph_from_openstreetmap(area_name: str):
 class CandidateLineGenerator:
     def __init__(
         self,
-        stops,
+        stops: list[int],
         travel_time_provider: MatrixTravelTimeProvider,
         G,
         min_start_end_distance,
@@ -59,7 +59,8 @@ class CandidateLineGenerator:
         min_length,
         max_length
     ):
-        self.stops = stops
+        self.stops: list[int] = stops
+        self.stops_set: set[int] = set(stops)
         self.travel_time_provider: MatrixTravelTimeProvider = travel_time_provider
         self.G = G
         self.min_start_end_distance = min_start_end_distance
@@ -67,19 +68,16 @@ class CandidateLineGenerator:
         self.min_length = min_length
         self.max_length = max_length
 
+    @profile
     def shortest_path_nodes(self, orig_index, dest_index):
         orig = list(self.G)[orig_index]
         dest = list(self.G)[dest_index]
         route = nx.shortest_path(self.G, orig, dest, weight='travel_time')
         # print(route)
-        nb = 0
         route_within_stops = []
-        for i in range(len(route)):
-            for j in range(len(self.stops)):
-                if route[i] == list(self.G)[self.stops[j]]:
-                    nb += 1
-                    route_within_stops.append(route[i])
-                    break
+        for node in route:
+            if node in self.stops_set:
+                route_within_stops.append(node)
 
         return route_within_stops, route
 
@@ -143,6 +141,10 @@ class CandidateLineGenerator:
         with tqdm(total=nb_lines, desc='Generating candidate lines') as progress_bar:
             while len(all_lines) < nb_lines and iter < 2 * nb_lines:
                 iter += 1
+
+                if iter == 10:
+                    break
+
                 try:
                     length = random.randint(self.min_length, self.max_length)
                     new_line, route = self.generate_new_line_skeleton_manhattan(length)
@@ -190,7 +192,7 @@ def generate_candidate_lines(
 
     logging.info("Randomly selecting stops")
     potential_stops = [i for i in range(travel_time_provider.get_node_count())]
-    stops = []
+    stops: list[int] = []
     for _ in range(number_of_stops):
         stop_index = random.randint(0, len(potential_stops) - 1)
         new_stop = potential_stops.pop(stop_index)
