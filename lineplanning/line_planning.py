@@ -116,7 +116,7 @@ class LinePlanningSolver:
                     activation = var.X
                     if activation > 0:
                         csv_file.write(
-                            f"{l // max_frequency},{l % max_frequency},{line_costs[l]}\n"
+                            f"{l // max_frequency},{(l % max_frequency) + 1},{line_costs[l]}\n"
                         )
             logging.info("Exported used lines to %s", csv_path)
         except OSError as exc:
