@@ -23,7 +23,10 @@ import lineplanning.line_planning
 experiment_data_path = Path(r"C:\Google Drive AIC\My Drive\AIC Experiment Data")
 
 
-iteration_count = 2
+iteration_count = 10
+
+# Upper bound on per-route frequency y_ρ in the MoD-aware ILP (manuscript §4.1.1).
+max_frequency = 20
 
 line_planning_path = experiment_data_path / "Line Planning"
 demand_file = None
@@ -137,7 +140,6 @@ def solution_to_darp_requests(
     request_assignments: List[Tuple[str, Optional[int]]],
     request_times: Optional[List[Union[int, float]]] = None,
     delta_transfer_seconds: Union[int, float] = 0,
-    max_frequency: int = 1,
 ) -> List[dict]:
     """
     Build the set of MoD requests R_MoD for the conventional model (section 4.2.1).
@@ -185,8 +187,8 @@ def solution_to_darp_requests(
             request_id += 1
             continue
 
-        # Assigned to line ℓ: first-mile and last-mile
-        route = line_idx // max_frequency
+        # Assigned to route ρ (candidate line index); MoD-aware ILP uses route-aggregated variables (§4.1.1)
+        route = line_idx
         opt = line_instance.optimal_trip_options[r][route]
         sb = opt.mt_pickup_node
         su = opt.mt_drop_off_node
@@ -250,19 +252,18 @@ def load_darp_requests_csv(path: Union[Path, str]) -> List[dict]:
 
 def load_request_assignments_csv(
     path: Union[Path, str],
-    max_frequency: int = 1,
 ) -> List[Tuple[str, Optional[int]]]:
     """
     Load request assignments from passenger_assignments.csv (exported by the ILP solver).
 
     The CSV has columns: passenger, line, mod_cost
     where `line` is either:
-    - an integer (route_index) if assigned to a line
+    - an integer (route index ρ) if assigned to a line
     - "no_MT" if assigned to MoD-only
     - "Dropped" if dropped (treated as no_MT here)
 
-    Returns a list of (kind, line_idx) tuples where kind is "no_MT" or "line".
-    line_idx is the line index (route_index * max_frequency), not the route_index.
+    Returns a list of (kind, route_index) tuples where kind is "no_MT" or "line";
+    for "line", the second entry is the route index ρ (0 .. nb_lines-1).
     """
     import pandas as pd
     path = Path(path)
@@ -276,8 +277,7 @@ def load_request_assignments_csv(
             request_assignments.append(("no_MT", None))
         else:
             route_index = int(line_value)
-            line_idx = route_index * max_frequency
-            request_assignments.append(("line", line_idx))
+            request_assignments.append(("line", route_index))
     return request_assignments
 
 
@@ -512,23 +512,28 @@ for i in range(iteration_count):
         darp_requests = load_darp_requests_csv(requests_csv_path)
         request_assignments = load_request_assignments_csv(
             passenger_assignments_csv_path,
-            max_frequency=lineplanning.line_planning.max_frequency,
         )
     else:
         # 1. Solve the line selection ILP (section 4.1); get selected lines and request-line assignments
-        obj_val, run_time_ILP, selected_lines, request_assignments = solver.solve_MoD_aware_ILP(
-            export_model=True,
-            export_solution=True,
-            output_dir=results_dir_path_per_iteration,
-            gurobi_log_file=results_dir_path_per_iteration / "gurobi.log",
+        obj_val, run_time_ILP, selected_lines, request_assignments, line_cost, mod_cost = (
+            solver.solve_MoD_aware_ILP(
+                export_model=True,
+                export_solution=True,
+                output_dir=results_dir_path_per_iteration,
+                gurobi_log_file=results_dir_path_per_iteration / "gurobi.log",
+                max_route_frequency=max_frequency,
+            )
         )
         # 1.2 Write metrics.json
         results_payload = {
             "iteration": i + 1,
             "objective_value": obj_val,
+            "line_cost": line_cost,
+            "mod_cost": mod_cost,
             "run_time_seconds": run_time_ILP,
             "instance_size": instance_size_label,
             "demand_file": str(demand_file),
+            "max_route_frequency": max_frequency,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
         results_file = results_dir_path_per_iteration / "metrics.json"
@@ -541,7 +546,6 @@ for i in range(iteration_count):
             request_assignments,
             request_times=None,
             delta_transfer_seconds=0,
-            max_frequency=lineplanning.line_planning.max_frequency,
         )
         write_darp_requests_csv(darp_requests, requests_csv_path, time_format="seconds")
         write_darp_vehicles_csv(darp_requests, results_dir_path_per_iteration / "vehicles.csv", capacity=5, time_format="seconds")
