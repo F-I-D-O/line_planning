@@ -23,9 +23,14 @@ import lineplanning.line_planning
 experiment_data_path = Path(r"C:\Google Drive AIC\My Drive\AIC Experiment Data")
 
 
-iteration_count = 2
+iteration_count = 10
+
+# Upper bound on per-route frequency y_ρ in the MoD-aware ILP (manuscript §4.1.1).
+max_frequency = 20
 
 line_planning_path = experiment_data_path / "Line Planning"
+demand_file = None
+dm_file = None
 
 # instance_dir = experiment_data_path / "DARP/Instances/Manhattan"
 # candidate_lines_file = instance_dir / "lines.txt"
@@ -34,11 +39,89 @@ line_planning_path = experiment_data_path / "Line Planning"
 # results_dir_path = line_planning_path / "Results/manhattan_test/mod-aware"
 
 # Chyse
-instance_dir = experiment_data_path / "Line Planning/Instances/Chyse"
+# instance_dir = experiment_data_path / "Line Planning/Instances/Chyse"
+# candidate_lines_file = instance_dir / "lines.txt"
+# dm_file = instance_dir / "dm.csv"
+# demand_file = instance_dir / "requests.csv"
+# results_dir_path = line_planning_path / "Results/chyse_test/mod-aware"
+
+# Manhattan 10% demand
+instance_dir = experiment_data_path / "Line Planning/Instances/manhattan-2_h-10_percent/instance_01"
 candidate_lines_file = instance_dir / "lines.txt"
-dm_file = instance_dir / "dm.csv"
-demand_file = instance_dir / "requests.csv"
-results_dir_path = line_planning_path / "Results/chyse_test/mod-aware"
+results_dir_path = line_planning_path / "Results/manhattan-2_h-10_percent/instance_01/mod-aware"
+
+def _resolve_config_path(instance_dir_path: Path) -> Path:
+    config_candidates = [
+        instance_dir_path / "config.yaml",
+        instance_dir_path / "config.yml",
+        instance_dir_path / "instance_config.yaml",
+        instance_dir_path / "instance_config.yml",
+    ]
+    for p in config_candidates:
+        if p.exists():
+            return p
+    raise FileNotFoundError(
+        "Could not find an instance config file to infer demand/dm paths. "
+        f"Tried: {[str(p) for p in config_candidates]}"
+    )
+
+
+def _coerce_path(v: object) -> Path:
+    if isinstance(v, Path):
+        return v
+    if isinstance(v, str):
+        return Path(v)
+    raise TypeError(f"Expected str/Path, got {type(v).__name__}")
+
+
+def _load_demand_and_dm_from_instance_config(instance_dir_path: Path) -> Tuple[Path, Path]:
+    config_path = _resolve_config_path(instance_dir_path)
+    config_dir = config_path.parent
+
+    with config_path.open("r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    if not isinstance(cfg, dict):
+        raise ValueError(f"Expected a mapping at top-level in {config_path}, got {type(cfg).__name__}.")
+
+    demand_cfg = cfg.get("demand")
+    dm_filepath = cfg.get("dm_filepath")
+
+    if not isinstance(demand_cfg, dict):
+        raise ValueError(f"Expected config['demand'] to be a mapping in {config_path}.")
+
+    demand_filepath = demand_cfg.get("filepath")
+
+    if not demand_filepath:
+        raise KeyError(
+            f"Missing demand filepath in {config_path}. Expected keys like demand.filepath."
+        )
+    if not dm_filepath:
+        raise KeyError(
+            f"Missing dm filepath in {config_path}. Expected key like dm_filepath."
+        )
+
+    demand_path = _coerce_path(demand_filepath)
+    dm_path = _coerce_path(dm_filepath)
+
+    if not demand_path.is_absolute():
+        demand_path = (config_dir / demand_path).resolve()
+    if not dm_path.is_absolute():
+        dm_path = (config_dir / dm_path).resolve()
+
+    return demand_path, dm_path
+
+
+if demand_file is None or dm_file is None:
+    inferred_demand_file, inferred_dm_file = _load_demand_and_dm_from_instance_config(instance_dir)
+    if demand_file is None:
+        demand_file = inferred_demand_file
+    if dm_file is None:
+        dm_file = inferred_dm_file
+
+if demand_file is None or dm_file is None:
+    raise ValueError(
+        "demand_file and dm_file must be set either directly in the script or via instance_dir/config.yaml."
+    )
 
 # Perivier instance - broken triangle inequality
 # test_data_path = Path(__file__).parent.parent / "test_data"
@@ -57,7 +140,6 @@ def solution_to_darp_requests(
     request_assignments: List[Tuple[str, Optional[int]]],
     request_times: Optional[List[Union[int, float]]] = None,
     delta_transfer_seconds: Union[int, float] = 0,
-    max_frequency: int = 1,
 ) -> List[dict]:
     """
     Build the set of MoD requests R_MoD for the conventional model (section 4.2.1).
@@ -105,8 +187,8 @@ def solution_to_darp_requests(
             request_id += 1
             continue
 
-        # Assigned to line ℓ: first-mile and last-mile
-        route = line_idx // max_frequency
+        # Assigned to route ρ (candidate line index); MoD-aware ILP uses route-aggregated variables (§4.1.1)
+        route = line_idx
         opt = line_instance.optimal_trip_options[r][route]
         sb = opt.mt_pickup_node
         su = opt.mt_drop_off_node
@@ -170,19 +252,18 @@ def load_darp_requests_csv(path: Union[Path, str]) -> List[dict]:
 
 def load_request_assignments_csv(
     path: Union[Path, str],
-    max_frequency: int = 1,
 ) -> List[Tuple[str, Optional[int]]]:
     """
     Load request assignments from passenger_assignments.csv (exported by the ILP solver).
 
     The CSV has columns: passenger, line, mod_cost
     where `line` is either:
-    - an integer (route_index) if assigned to a line
+    - an integer (route index ρ) if assigned to a line
     - "no_MT" if assigned to MoD-only
     - "Dropped" if dropped (treated as no_MT here)
 
-    Returns a list of (kind, line_idx) tuples where kind is "no_MT" or "line".
-    line_idx is the line index (route_index * max_frequency), not the route_index.
+    Returns a list of (kind, route_index) tuples where kind is "no_MT" or "line";
+    for "line", the second entry is the route index ρ (0 .. nb_lines-1).
     """
     import pandas as pd
     path = Path(path)
@@ -196,8 +277,7 @@ def load_request_assignments_csv(
             request_assignments.append(("no_MT", None))
         else:
             route_index = int(line_value)
-            line_idx = route_index * max_frequency
-            request_assignments.append(("line", line_idx))
+            request_assignments.append(("line", route_index))
     return request_assignments
 
 
@@ -432,23 +512,28 @@ for i in range(iteration_count):
         darp_requests = load_darp_requests_csv(requests_csv_path)
         request_assignments = load_request_assignments_csv(
             passenger_assignments_csv_path,
-            max_frequency=lineplanning.line_planning.max_frequency,
         )
     else:
         # 1. Solve the line selection ILP (section 4.1); get selected lines and request-line assignments
-        obj_val, run_time_ILP, selected_lines, request_assignments = solver.solve_MoD_aware_ILP(
-            export_model=True,
-            export_solution=True,
-            output_dir=results_dir_path_per_iteration,
-            gurobi_log_file=results_dir_path_per_iteration / "gurobi.log",
+        obj_val, run_time_ILP, selected_lines, request_assignments, line_cost, mod_cost = (
+            solver.solve_MoD_aware_ILP(
+                export_model=True,
+                export_solution=True,
+                output_dir=results_dir_path_per_iteration,
+                gurobi_log_file=results_dir_path_per_iteration / "gurobi.log",
+                max_route_frequency=max_frequency,
+            )
         )
         # 1.2 Write metrics.json
         results_payload = {
             "iteration": i + 1,
             "objective_value": obj_val,
+            "line_cost": line_cost,
+            "mod_cost": mod_cost,
             "run_time_seconds": run_time_ILP,
             "instance_size": instance_size_label,
             "demand_file": str(demand_file),
+            "max_route_frequency": max_frequency,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
         results_file = results_dir_path_per_iteration / "metrics.json"
@@ -461,7 +546,6 @@ for i in range(iteration_count):
             request_assignments,
             request_times=None,
             delta_transfer_seconds=0,
-            max_frequency=lineplanning.line_planning.max_frequency,
         )
         write_darp_requests_csv(darp_requests, requests_csv_path, time_format="seconds")
         write_darp_vehicles_csv(darp_requests, results_dir_path_per_iteration / "vehicles.csv", capacity=5, time_format="seconds")
