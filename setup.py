@@ -13,4 +13,7 @@ setuptools.setup(
         "darpinstances",
         "pyYAML"
     ],
+    extras_require={
+        "viz": ["geopandas"],
+    },
 )
