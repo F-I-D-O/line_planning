@@ -371,9 +371,10 @@ def generate_candidate_lines(
 
     logging.info("Generating candidate lines")
     all_lines, _ = line_generator.generate_lines_skeleton_manhattan(nb_lines)
+    lines_path = output_path / "lines.txt"
 
-    with open(output_path, "w") as f:
-        logging.info("Exporting candidate lines to %s", output_path)
+    with open(lines_path, "w") as f:
+        logging.info("Exporting candidate lines to %s", lines_path)
         for line in all_lines:
             f.write(",".join([str(i) for i in line]) + "\n")
 
