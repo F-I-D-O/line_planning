@@ -78,16 +78,6 @@ class TripOption(NamedTuple):
     last_mile_cost: float
     mt_cost: float
 
-class NumpyEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, np.integer):
-            return int(obj)
-        elif isinstance(obj, np.floating):
-            return float(obj)
-        elif isinstance(obj, np.ndarray):
-            return obj.tolist()
-        return json.JSONEncoder.default(self, obj)
-
 class line_instance:
 
     # This class represents abstract instance of the line planning problem, which do not require to know the geometry of the underlying network.
@@ -162,19 +152,6 @@ class line_instance:
         return "100_percent"
 
     @staticmethod
-    def _serialize_trip_option(option: TripOption) -> dict:
-        return {
-            "value": option.value,
-            "mt_pickup_node": option.mt_pickup_node,
-            "mt_drop_off_node": option.mt_drop_off_node,
-            "mt_pickup_line_edge_index": option.mt_pickup_line_edge_index,
-            "mt_drop_off_line_edge_index": option.mt_drop_off_line_edge_index,
-            "first_mile_cost": option.first_mile_cost,
-            "last_mile_cost": option.last_mile_cost,
-            "mt_cost": option.mt_cost,
-        }
-
-    @staticmethod
     def _deserialize_trip_option(data: dict) -> TripOption:
         return TripOption(
             value=data["value"],
@@ -186,6 +163,58 @@ class line_instance:
             last_mile_cost=data["last_mile_cost"],
             mt_cost=data["mt_cost"],
         )
+
+    _PREPROCESSING_CSV_COLUMNS = [
+        "passenger_idx",
+        "line_idx",
+        "value",
+        "mt_pickup_node",
+        "mt_drop_off_node",
+        "mt_pickup_line_edge_index",
+        "mt_drop_off_line_edge_index",
+        "first_mile_cost",
+        "last_mile_cost",
+        "mt_cost",
+    ]
+
+    def _aggregates_from_line_trip_options(
+        self,
+        optimal_trip_options_per_line: List[List[TripOption]],
+        candidate_set_of_lines,
+        nb_pass: int,
+        nb_lines: int,
+    ) -> Tuple[list, list, list, List[List[List[int]]]]:
+        """
+        Build set_of_lines, pass_to_lines, lines_to_passengers, edge_to_passengers from
+        per-line trip options only (no synthetic no-MT row), matching preprocessing().
+        """
+        pass_to_lines = [list(range(nb_lines)) for _ in range(nb_pass)]
+        lines_to_passengers = [list(range(nb_pass)) for _ in range(nb_lines)]
+        set_of_lines = []
+        edge_to_passengers: List[List[List[int]]] = []
+        for line in range(nb_lines):
+            line_length = len(candidate_set_of_lines[line]) - 1
+            pass_covered = []
+            edge_to_passengers.append([[] for _ in range(line_length)])
+            for p in range(nb_pass):
+                optimal_trip_option = optimal_trip_options_per_line[p][line]
+                pass_covered.append(
+                    [
+                        p,
+                        [
+                            optimal_trip_option.mt_pickup_node,
+                            optimal_trip_option.mt_drop_off_node,
+                        ],
+                        optimal_trip_option.value,
+                    ]
+                )
+                for line_edge in range(
+                    optimal_trip_option.mt_pickup_line_edge_index,
+                    optimal_trip_option.mt_drop_off_line_edge_index,
+                ):
+                    edge_to_passengers[line][line_edge].append(p)
+            set_of_lines.append([line_length, pass_covered])
+        return set_of_lines, pass_to_lines, lines_to_passengers, edge_to_passengers
 
     def _get_preprocessing_cache_path(
         self,
@@ -214,17 +243,15 @@ class line_instance:
         detour_suffix = detour_factor if detour_factor is not None else "none"
         
         cache_dir = self.results_dir / "preprocessing"
-        filename = f"{demand_name}_{candidate_line_name}_detour_{detour_suffix}_{cache_hash}.json"
+        filename = f"{demand_name}_{candidate_line_name}_detour_{detour_suffix}_{cache_hash}.csv"
         return cache_dir / filename
 
-    def _load_preprocessing_cache(self, cache_path: Path):
-        if not cache_path.exists():
-            return None
+    def _load_preprocessing_cache_legacy_json(self, json_path: Path):
         try:
-            with cache_path.open("r", encoding="utf-8") as cache_file:
+            with json_path.open("r", encoding="utf-8") as cache_file:
                 data = json.load(cache_file)
         except (OSError, json.JSONDecodeError) as exc:
-            logging.warning("Failed to load preprocessing cache %s: %s", cache_path, exc)
+            logging.warning("Failed to load preprocessing cache %s: %s", json_path, exc)
             return None
 
         try:
@@ -238,10 +265,10 @@ class line_instance:
             lines_to_passengers = data["lines_to_passengers"]
             edge_to_passengers = data["edge_to_passengers"]
         except KeyError as exc:
-            logging.warning("Missing key in preprocessing cache %s: %s", cache_path, exc)
+            logging.warning("Missing key in preprocessing cache %s: %s", json_path, exc)
             return None
 
-        logging.info("Loaded preprocessing data from cache %s", cache_path)
+        logging.info("Loaded preprocessing data from legacy JSON cache %s", json_path)
         return (
             set_of_lines,
             pass_to_lines,
@@ -250,33 +277,125 @@ class line_instance:
             edge_to_passengers,
         )
 
+    def _load_preprocessing_cache(
+        self,
+        cache_path: Path,
+        candidate_set_of_lines,
+        passengers: List[List[int]],
+        distances: np.ndarray,
+        nb_pass: int,
+        nb_lines: int,
+    ):
+        if cache_path.exists():
+            try:
+                df = pd.read_csv(cache_path)
+            except (OSError, ValueError) as exc:
+                logging.warning("Failed to read preprocessing cache %s: %s", cache_path, exc)
+                return None
+
+            missing = set(self._PREPROCESSING_CSV_COLUMNS) - set(df.columns)
+            if missing:
+                logging.warning(
+                    "Preprocessing cache %s missing columns %s", cache_path, sorted(missing)
+                )
+                return None
+
+            df = df.sort_values(["passenger_idx", "line_idx"])
+            optimal_trip_options: List[List[TripOption]] = [[] for _ in range(nb_pass)]
+            try:
+                for _, row in df.iterrows():
+                    p = int(row["passenger_idx"])
+                    optimal_trip_options[p].append(
+                        TripOption(
+                            float(row["value"]),
+                            int(row["mt_pickup_node"]),
+                            int(row["mt_drop_off_node"]),
+                            int(row["mt_pickup_line_edge_index"]),
+                            int(row["mt_drop_off_line_edge_index"]),
+                            float(row["first_mile_cost"]),
+                            float(row["last_mile_cost"]),
+                            float(row["mt_cost"]),
+                        )
+                    )
+            except (ValueError, TypeError, KeyError) as exc:
+                logging.warning("Invalid row in preprocessing cache %s: %s", cache_path, exc)
+                return None
+
+            for p in range(nb_pass):
+                if len(optimal_trip_options[p]) != nb_lines:
+                    logging.warning(
+                        "Preprocessing cache %s: expected %d rows per passenger, got %d for p=%d",
+                        cache_path,
+                        nb_lines,
+                        len(optimal_trip_options[p]),
+                        p,
+                    )
+                    return None
+
+            (
+                set_of_lines,
+                pass_to_lines,
+                lines_to_passengers,
+                edge_to_passengers,
+            ) = self._aggregates_from_line_trip_options(
+                optimal_trip_options, candidate_set_of_lines, nb_pass, nb_lines
+            )
+            for p in range(nb_pass):
+                travel_time = distances[passengers[p][0]][passengers[p][1]]
+                optimal_trip_options[p].append(
+                    TripOption(0, -1, -1, -1, -1, travel_time, 0, 0)
+                )
+
+            logging.info("Loaded preprocessing data from cache %s", cache_path)
+            return (
+                set_of_lines,
+                pass_to_lines,
+                optimal_trip_options,
+                lines_to_passengers,
+                edge_to_passengers,
+            )
+
+        legacy_json = cache_path.with_suffix(".json")
+        if legacy_json.exists():
+            return self._load_preprocessing_cache_legacy_json(legacy_json)
+
+        return None
+
     def _save_preprocessing_cache(
         self,
         cache_path: Path,
-        set_of_lines,
-        pass_to_lines,
-        optimal_trip_options,
-        lines_to_passengers,
-        edge_to_passengers,
+        optimal_trip_options: List[List[TripOption]],
     ) -> None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        optimal_trip_options_serialized = [
-            [self._serialize_trip_option(opt) for opt in options]
-            for options in optimal_trip_options
-        ]
-        cache_payload = {
-            "set_of_lines": set_of_lines,
-            "pass_to_lines": pass_to_lines,
-            "optimal_trip_options": optimal_trip_options_serialized,
-            "lines_to_passengers": lines_to_passengers,
-            "edge_to_passengers": edge_to_passengers,
-        }
+        rows = []
+        for p, options in enumerate(optimal_trip_options):
+            for line_idx, opt in enumerate(options[:-1]):
+                rows.append(
+                    {
+                        "passenger_idx": p,
+                        "line_idx": line_idx,
+                        "value": opt.value,
+                        "mt_pickup_node": opt.mt_pickup_node,
+                        "mt_drop_off_node": opt.mt_drop_off_node,
+                        "mt_pickup_line_edge_index": opt.mt_pickup_line_edge_index,
+                        "mt_drop_off_line_edge_index": opt.mt_drop_off_line_edge_index,
+                        "first_mile_cost": opt.first_mile_cost,
+                        "last_mile_cost": opt.last_mile_cost,
+                        "mt_cost": opt.mt_cost,
+                    }
+                )
+        df = pd.DataFrame(rows, columns=self._PREPROCESSING_CSV_COLUMNS)
         try:
-            with cache_path.open("w", encoding="utf-8") as cache_file:
-                json.dump(cache_payload, cache_file, cls=NumpyEncoder)
+            df.to_csv(cache_path, index=False)
         except OSError as exc:
             logging.warning("Failed to write preprocessing cache %s: %s", cache_path, exc)
             return
+        legacy_json = cache_path.with_suffix(".json")
+        if legacy_json.exists():
+            try:
+                legacy_json.unlink()
+            except OSError as exc:
+                logging.warning("Could not remove legacy cache %s: %s", legacy_json, exc)
         logging.info("Stored preprocessing data to cache %s", cache_path)
 
     def manhattan_instance(self, detour_factor) -> Tuple[
@@ -319,7 +438,14 @@ class line_instance:
         logging.info('Travel times computed')
 
         cache_path = self._get_preprocessing_cache_path(detour_factor)
-        cached_preprocessing = self._load_preprocessing_cache(cache_path)
+        cached_preprocessing = self._load_preprocessing_cache(
+            cache_path,
+            candidate_set_of_lines,
+            passengers,
+            distances,
+            nb_pass,
+            nb_lines,
+        )
 
         if cached_preprocessing is not None:
             (
@@ -344,14 +470,7 @@ class line_instance:
                 detour_factor,
                 nb_pass,
             )
-            self._save_preprocessing_cache(
-                cache_path,
-                set_of_lines,
-                pass_to_lines,
-                optimal_trip_options,
-                lines_to_passengers,
-                edge_to_passengers,
-            )
+            self._save_preprocessing_cache(cache_path, optimal_trip_options)
 
         granularity = self.granularity
 
@@ -380,44 +499,25 @@ class line_instance:
         self, candidate_set_of_lines, passengers: List[List[int]], travel_times_on_lines, distances, detour_factor, nb_pass
     ) -> Tuple[list, list, List[List[TripOption]], list, List[List[List[int]]]]:
         logging.info('Preprocessing optimal trip options')
-        set_of_lines = []
-        pass_to_lines = [[] for _ in range(nb_pass)]
-        value = 0
-        
         nb_lines = len(candidate_set_of_lines)
 
-        # optimal trip option for each passenger-line combination
         optimal_trip_options: List[List[TripOption]] = [[] for _ in range(nb_pass)]
 
-        lines_to_passengers = []
-
-        # for each edge on each line, this collection contains a list of passengers traveling on the line
-        edge_to_passengers: List[List[List[int]]] = []
-
         for line in tqdm(range(nb_lines), desc='Processing lines'):
-            line_length = len(candidate_set_of_lines[line]) - 1
-            pass_covered = []
-            lines_to_passengers.append([])
-            edge_to_passengers.append([[] for _ in range(line_length)])
             for p in range(nb_pass):
                 optimal_trip_option = self.get_optimal_trip(
                     passengers[p], candidate_set_of_lines[line], travel_times_on_lines[line], distances, detour_factor
                 )
-
-                pass_covered.append(
-                    [
-                        p,
-                        [optimal_trip_option.mt_pickup_node, optimal_trip_option.mt_drop_off_node],
-                        optimal_trip_option.value
-                    ]
-                )
-                pass_to_lines[p].append(line)
-                lines_to_passengers[line].append(p)
-                for line_edge in range(optimal_trip_option.mt_pickup_line_edge_index, optimal_trip_option.mt_drop_off_line_edge_index):
-                    edge_to_passengers[line][line_edge].append(p)
-
                 optimal_trip_options[p].append(optimal_trip_option)
-            set_of_lines.append([line_length, pass_covered])
+
+        (
+            set_of_lines,
+            pass_to_lines,
+            lines_to_passengers,
+            edge_to_passengers,
+        ) = self._aggregates_from_line_trip_options(
+            optimal_trip_options, candidate_set_of_lines, nb_pass, nb_lines
+        )
 
         # add the no MT option for each request. The MoD cost is stored in the first_mile_cost field of TripOption.
         for p in range(nb_pass):

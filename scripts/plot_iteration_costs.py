@@ -268,3 +268,5 @@ if OUTPUT_HTML is not None:
 
 if SHOW_IN_BROWSER:
     fig.show()
+
+# %%
