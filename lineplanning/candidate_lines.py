@@ -14,10 +14,8 @@ from tqdm import tqdm
 # default configuration (used only when running this module as a script)
 # area_path = Path(r"C:\Google Drive AIC\My Drive\AIC Experiment Data\DARP\Instances\Manhattan")
 DEFAULT_AREA_PATH = Path(r"C:\Google Drive AIC\My Drive\AIC Experiment Data\Line Planning\Instances\Chyse")
-DEFAULT_NUMBER_OF_STOPS = 10
-DEFAULT_NB_LINES = 30
-DEFAULT_MIN_LENGTH = 2
-DEFAULT_MAX_LENGTH = 10
+DEFAULT_MIN_LENGTH = 10
+DEFAULT_MAX_LENGTH = 30
 DEFAULT_MIN_START_END_DISTANCE = 20
 DEFAULT_DETOUR_SKELETON = 2
 # DEFAULT_AREA_NAME = 'Manhattan, New York, New York, USA'
@@ -299,8 +297,8 @@ class CandidateLineGenerator:
 def generate_candidate_lines(
     area_path: Path,
     output_path: Path,
-    number_of_stops: int = DEFAULT_NUMBER_OF_STOPS,
-    nb_lines: int = DEFAULT_NB_LINES,
+    number_of_stops: int,
+    nb_lines: int,
     min_length: int = DEFAULT_MIN_LENGTH,
     max_length: int = DEFAULT_MAX_LENGTH,
     min_start_end_distance: int = DEFAULT_MIN_START_END_DISTANCE,
@@ -399,17 +397,3 @@ def generate_candidate_lines(
         logging.info("Geo export skipped: graph not loaded from map/edges.csv")
     elif export_geopackage and edge_path.exists() and not node_xy:
         pass
-
-
-if __name__ == "__main__":
-    generate_candidate_lines(
-        area_path=DEFAULT_AREA_PATH,
-        output_path=DEFAULT_AREA_PATH,
-        number_of_stops=DEFAULT_NUMBER_OF_STOPS,
-        nb_lines=DEFAULT_NB_LINES,
-        min_length=DEFAULT_MIN_LENGTH,
-        max_length=DEFAULT_MAX_LENGTH,
-        min_start_end_distance=DEFAULT_MIN_START_END_DISTANCE,
-        detour_skeleton=DEFAULT_DETOUR_SKELETON,
-        area_name=DEFAULT_AREA_NAME,
-    )

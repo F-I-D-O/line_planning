@@ -78,6 +78,36 @@ class TripOption(NamedTuple):
     last_mile_cost: float
     mt_cost: float
 
+
+def preprocessing_csv_path(
+    results_dir: Path,
+    demand_file: Optional[Path],
+    candidate_lines_file: Path,
+    detour_factor: Optional[int],
+) -> Path:
+    """
+    Path to the preprocessing CSV cache ``line_instance`` uses for the given
+    demand file, candidate lines file, detour factor, and results directory.
+    """
+    demand_file_path = Path(demand_file).resolve() if demand_file is not None else None
+    candidate_line_file_path = Path(candidate_lines_file).resolve()
+
+    demand_file_str = str(demand_file_path) if demand_file_path is not None else "none"
+    candidate_line_file_str = str(candidate_line_file_path)
+    detour_factor_str = str(detour_factor) if detour_factor is not None else "none"
+
+    cache_key = f"{demand_file_str}|{candidate_line_file_str}|{detour_factor_str}"
+    cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:12]
+
+    demand_name = demand_file_path.stem if demand_file_path is not None else "none"
+    candidate_line_name = candidate_line_file_path.stem
+    detour_suffix = detour_factor if detour_factor is not None else "none"
+
+    cache_dir = Path(results_dir) / "preprocessing"
+    filename = f"{demand_name}_{candidate_line_name}_detour_{detour_suffix}_{cache_hash}.csv"
+    return cache_dir / filename
+
+
 class line_instance:
 
     # This class represents abstract instance of the line planning problem, which do not require to know the geometry of the underlying network.
@@ -224,27 +254,12 @@ class line_instance:
         Generate cache path based on demand file, candidate line file, and detour factor.
         Uses hash of file paths to ensure uniqueness.
         """
-        # Normalize file paths to absolute paths for consistent hashing
-        demand_file_path = Path(self.demand_file).resolve() if self.demand_file else None
-        candidate_line_file_path = self.candidate_line_file.resolve()
-        
-        # Create a string identifier from the three components
-        demand_file_str = str(demand_file_path) if demand_file_path else "none"
-        candidate_line_file_str = str(candidate_line_file_path)
-        detour_factor_str = str(detour_factor) if detour_factor is not None else "none"
-        
-        # Create a hash from the three components to ensure uniqueness
-        cache_key = f"{demand_file_str}|{candidate_line_file_str}|{detour_factor_str}"
-        cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:12]
-        
-        # Use friendly names for readability in directory structure
-        demand_name = demand_file_path.stem if demand_file_path else "none"
-        candidate_line_name = candidate_line_file_path.stem
-        detour_suffix = detour_factor if detour_factor is not None else "none"
-        
-        cache_dir = self.results_dir / "preprocessing"
-        filename = f"{demand_name}_{candidate_line_name}_detour_{detour_suffix}_{cache_hash}.csv"
-        return cache_dir / filename
+        return preprocessing_csv_path(
+            self.results_dir,
+            Path(self.demand_file) if self.demand_file is not None else None,
+            self.candidate_line_file,
+            detour_factor,
+        )
 
     def _load_preprocessing_cache_legacy_json(self, json_path: Path):
         try:
@@ -303,18 +318,38 @@ class line_instance:
             df = df.sort_values(["passenger_idx", "line_idx"])
             optimal_trip_options: List[List[TripOption]] = [[] for _ in range(nb_pass)]
             try:
-                for _, row in df.iterrows():
-                    p = int(row["passenger_idx"])
-                    optimal_trip_options[p].append(
+                col_zip = zip(
+                    df["passenger_idx"].to_numpy(copy=False),
+                    df["value"].to_numpy(copy=False),
+                    df["mt_pickup_node"].to_numpy(copy=False),
+                    df["mt_drop_off_node"].to_numpy(copy=False),
+                    df["mt_pickup_line_edge_index"].to_numpy(copy=False),
+                    df["mt_drop_off_line_edge_index"].to_numpy(copy=False),
+                    df["first_mile_cost"].to_numpy(copy=False),
+                    df["last_mile_cost"].to_numpy(copy=False),
+                    df["mt_cost"].to_numpy(copy=False),
+                )
+                for (
+                    p,
+                    value,
+                    mt_pickup_node,
+                    mt_drop_off_node,
+                    mt_pickup_line_edge_index,
+                    mt_drop_off_line_edge_index,
+                    first_mile_cost,
+                    last_mile_cost,
+                    mt_cost,
+                ) in tqdm(col_zip, total=len(df), desc="Loading preprocessing cache"):
+                    optimal_trip_options[int(p)].append(
                         TripOption(
-                            float(row["value"]),
-                            int(row["mt_pickup_node"]),
-                            int(row["mt_drop_off_node"]),
-                            int(row["mt_pickup_line_edge_index"]),
-                            int(row["mt_drop_off_line_edge_index"]),
-                            float(row["first_mile_cost"]),
-                            float(row["last_mile_cost"]),
-                            float(row["mt_cost"]),
+                            float(value),
+                            int(mt_pickup_node),
+                            int(mt_drop_off_node),
+                            int(mt_pickup_line_edge_index),
+                            int(mt_drop_off_line_edge_index),
+                            float(first_mile_cost),
+                            float(last_mile_cost),
+                            float(mt_cost),
                         )
                     )
             except (ValueError, TypeError, KeyError) as exc:
