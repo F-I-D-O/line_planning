@@ -19,10 +19,10 @@ and histogram under a single run folder.
 - If a valid preprocessing CSV already exists for this demand / lines path / detour,
   ``line_instance`` loads it (no recomputation).
 
-**Metrics "best" MT option:** minimizes door-to-door time ``first_mile + last_mile + mt_cost``.
+**Metrics "best" MT option:** minimizes ``first_mile + last_mile`` (ignores ``mt_cost``).
 
-**Histogram:** matches ``plot_mt_vs_direct_cost_histogram.py`` — best MT by minimum
-``first_mile + last_mile`` only vs direct OD time in ``opts[-1].first_mile_cost``.
+**Histogram:** same criterion — best MT by minimum ``first_mile + last_mile`` vs direct OD time
+in ``opts[-1].first_mile_cost``.
 """
 
 from __future__ import annotations
@@ -258,9 +258,9 @@ def _compute_metrics_row(
             n_no_valid_mt += 1
             continue
 
-        best_dd = min(valid, key=_total_time)
-        mod_b = _mod_cost(best_dd)
-        tot_b = _total_time(best_dd)
+        best_mt = min(valid, key=_mod_cost)
+        mod_b = _mod_cost(best_mt)
+        tot_b = _total_time(best_mt)
         mod_costs_best.append(mod_b)
         total_times_best.append(tot_b)
         mean_direct_vals.append(direct)
@@ -269,8 +269,8 @@ def _compute_metrics_row(
         if mod_b > direct:
             n_mod_worse += 1
 
-        by_total = sorted(valid, key=_total_time)
-        top = by_total[:10]
+        by_mod = sorted(valid, key=_mod_cost)
+        top = by_mod[:10]
         avg_mod = float(np.mean([_mod_cost(o) for o in top]))
         rel_diffs_top10.append((avg_mod - direct) / direct)
 
@@ -417,6 +417,8 @@ def main() -> None:
         required=True,
         help="Label suffix in folder v_<N>-<sanitized_label> and in metrics.csv.",
     )
+    parser.add_argument("--number-of-stops", type=int, required=True)
+    parser.add_argument("--nb-lines", type=int, required=True)
     parser.add_argument("--detour-factor", type=int, default=3)
     parser.add_argument("--granularity", type=int, default=1)
     parser.add_argument("--cost", type=int, default=1)
@@ -425,8 +427,6 @@ def main() -> None:
     parser.add_argument("--proba", type=float, default=0.1)
     parser.add_argument("--capacity", type=int, default=30)
     parser.add_argument("--method", type=int, default=3)
-    parser.add_argument("--number-of-stops", type=int, default=400)
-    parser.add_argument("--nb-lines", type=int, default=1000)
     parser.add_argument("--min-length-line", type=int, default=DEFAULT_MIN_LENGTH)
     parser.add_argument("--max-length-line", type=int, default=DEFAULT_MAX_LENGTH)
     parser.add_argument(

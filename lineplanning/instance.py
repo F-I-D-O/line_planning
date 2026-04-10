@@ -588,7 +588,7 @@ class line_instance:
                 mod_travel_time = first_mile_travel_time + last_mile_travel_time
                 mt_travel_time = travel_times_on_line[pickup_index][drop_off_index]
                 total_travel_time = mod_travel_time + mt_travel_time
-                value = shortest_travel_time - mod_travel_time
+                value = int(shortest_travel_time) - int(mod_travel_time)
                 if ((
                     value > optimal_trip_option.value and total_travel_time <= detour_factor * shortest_travel_time) or (
                     value == optimal_trip_option.value and mt_travel_time < optimal_trip_option.mt_cost)):
