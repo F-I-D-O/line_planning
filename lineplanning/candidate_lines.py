@@ -43,6 +43,25 @@ def load_graph(edges_path: Path) -> nx.DiGraph:
     return nx.from_pandas_edgelist(edge_df, source='u', target='v', edge_attr='travel_time', create_using=nx.DiGraph())
 
 
+def _is_simple_graph_path(route: list) -> bool:
+    """True iff the path has no repeated nodes (no self-intersection on the graph)."""
+    return len(set(route)) == len(route)
+
+
+def _two_shortest_legs_share_only_junction(
+    route_left: list, route_right: list
+) -> bool:
+    """
+    Both legs are simple, and their node sets overlap in exactly one node (the junction).
+    Matches the union checks used in scripts/random.py for skeleton validation.
+    """
+    if not _is_simple_graph_path(route_left) or not _is_simple_graph_path(route_right):
+        return False
+    s_left, s_right = set(route_left), set(route_right)
+    union = s_left | s_right
+    return len(union) == len(s_left) + len(s_right) - 1
+
+
 def full_route_for_stop_sequence(
     G: nx.DiGraph, stops: list[int], weight: str = "travel_time"
 ) -> list:
@@ -239,7 +258,11 @@ class CandidateLineGenerator:
             end_index = random.randint(0, n - 2)
             end = remaining_stops[end_index]
             if self.travel_time_provider.get_travel_time(start, end) >= min_distance:
-                break
+                route_direct = nx.shortest_path(
+                    self.G, start, end, weight="travel_time"
+                )
+                if _is_simple_graph_path(route_direct):
+                    break
 
         end = remaining_stops.pop(end_index)
 
@@ -250,7 +273,16 @@ class CandidateLineGenerator:
             inter = remaining_stops[inter_index]
             if self.travel_time_provider.get_travel_time(start, inter) + self.travel_time_provider.get_travel_time(end, inter) <= \
                 self.travel_time_provider.get_travel_time(start, end) * self.detour_skeleton:
-                break
+                route_to_inter = nx.shortest_path(
+                    self.G, start, inter, weight="travel_time"
+                )
+                route_inter_to_end = nx.shortest_path(
+                    self.G, inter, end, weight="travel_time"
+                )
+                if _two_shortest_legs_share_only_junction(
+                    route_to_inter, route_inter_to_end
+                ):
+                    break
         inter = remaining_stops.pop(inter_index)
 
         i = 0
@@ -260,7 +292,16 @@ class CandidateLineGenerator:
             inter_2 = remaining_stops[inter_index_2]
             if self.travel_time_provider.get_travel_time(inter_2, inter) + self.travel_time_provider.get_travel_time(end, inter_2) <= \
                 self.travel_time_provider.get_travel_time(inter, end) * self.detour_skeleton:
-                break
+                route_to_inter_2 = nx.shortest_path(
+                    self.G, inter, inter_2, weight="travel_time"
+                )
+                route_inter_2_to_end = nx.shortest_path(
+                    self.G, inter_2, end, weight="travel_time"
+                )
+                if _two_shortest_legs_share_only_junction(
+                    route_to_inter_2, route_inter_2_to_end
+                ):
+                    break
         inter_2 = remaining_stops.pop(inter_index_2)
 
         route_within_stops_1, route1 = self.compute_route_between_stops(start, inter)
