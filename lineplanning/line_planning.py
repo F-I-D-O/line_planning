@@ -1,7 +1,9 @@
+import argparse
 import csv
 import json
 import logging
 import re
+import sys
 import time
 from collections import defaultdict
 from copy import deepcopy
@@ -12,55 +14,20 @@ import numpy as np
 import pandas as pd
 from gurobipy import *
 
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 from lineplanning.instance import *
+from lineplanning.instance_config import (
+    load_experiment_yaml,
+    load_line_planning_instance_config,
+    resolve_instance_config_path,
+    resolve_results_dir,
+)
 import lineplanning.log
 
-test_data_path = Path(__file__).parent / "test_data"
-line_planning_results_path = Path(r"C:\Google Drive AIC\My Drive\AIC Experiment Data\Line Planning\Results")
-
-# Distance matrix file
-# dm_file = Path(r"C:\Google Drive AIC\My Drive\AIC Experiment Data\Line Planning\Instances/original/dm.h5")
-
-# Results directory - user is responsible for organizing subdirectories as needed
-# results_dir = line_planning_results_path / "original_instances/test_one_percent"
-results_dir = line_planning_results_path / "original_instances/test_one_percent-RGT"
-
-# budgets = [10_000, 20_000, 30_000, 40_000, 50_000, 100_000, 200_000]
-budgets = [30_000]
-# budgets = [200_000]
-# budgets = [500_000]
-
-# By default, 100% demand is used...
-# demand_file = test_data_path / "OD_matrix_april_fhv.txt"
-# demand_file = test_data_path / "OD_matrix_march_fhv.txt"
-# demand_file = test_data_path / "OD_matrix_feb_fhv.txt"
-# candidate_lines_file = test_data_path / "all_lines_nodes_1000_c5.txt"
-
-# 50% demand
-# demand_file = "OD_matrix_april_fhv_50_percent.txt"
-# nb_l = 500
-
-# 10% demand
-# demand_file = "OD_matrix_april_fhv_10_percent.txt"
-# nb_l = 100
-
-# # 1% demand
-# demand_file = test_data_path / "OD_matrix_april_fhv_1_percent.txt"
-# candidate_lines_file = test_data_path / "all_lines_nodes_10_c5.txt"
-
-# RGT demand
-area_path = Path(r"C:\Google Drive AIC\My Drive\AIC Experiment Data\DARP\Instances\Manhattan")
-demand_file = area_path / r'C:\Google Drive AIC\My Drive\AIC Experiment Data\DARP\Instances\Manhattan\instances\start_18-00\duration_01_min\max_delay_05_min/requests.csv'
-candidate_lines_file = area_path / "lines.txt"
-dm_file = area_path / "dm.h5"
-
-use_model_with_mod_costs = False # stage 1 model
-use_model_with_empty_trips = False # stage 2 model
-
-# Run the solution method proposed in Périvier et al., 2021
-run_proposed_method = False
-
-# Time limit for the Gurobi solver
+# Time limit for the Gurobi solver (overridden per run from experiment YAML)
 allowed_time = 3600 * 24
 
 EPS = 1.e-5
@@ -1274,97 +1241,153 @@ class LinePlanningSolver:
 
         return best_value, budg, op, v, nb_respect, mean, execution_time
 
-if __name__ == "__main__":
-    np.random.seed(127)
 
-    average_value_LP = 0
-    average_value_ILP = 0
-    obj_val = 0
-    time_LP = 0
-    time_ILP = 0
+def _parse_optional_budget(raw: object) -> Optional[float]:
+    if raw is None:
+        return None
+    if isinstance(raw, str) and raw.strip().lower() in ("", "none", "null", "inf", "infinity"):
+        return None
+    return float(raw)
 
-    max_frequency = 1
+
+def _ilp_budget_rhs(budget: Optional[float]) -> float:
+    if budget is None:
+        return GRB.INFINITY
+    return float(budget)
+
+
+def run_experiment(experiment_config_path: Path) -> None:
+    """
+    Run one line-planning experiment from a YAML file.
+
+    The YAML must define ``instance`` (path to instance ``config.yaml``),
+    ``results_dir``, optional ``line_instance`` / ``solver`` blocks, and
+    optional ``budget`` (omit for an unconstrained ILP budget).
+    """
+    experiment_config_path = experiment_config_path.resolve()
+    exp = load_experiment_yaml(experiment_config_path)
+    inst_path = resolve_instance_config_path(experiment_config_path, exp)
+    inst = load_line_planning_instance_config(inst_path)
+    base_results_directory = resolve_results_dir(experiment_config_path, exp)
+
+    global allowed_time, fixed_cost, max_frequency
+
+    solver_cfg = exp.get("solver") or {}
+    allowed_time = float(solver_cfg.get("allowed_time", 3600 * 24))
+    fixed_cost = int(solver_cfg.get("fixed_cost", 1))
+    max_frequency = int(solver_cfg.get("max_frequency", 1))
+
+    use_model_with_mod_costs = bool(solver_cfg.get("use_model_with_mod_costs", False))
+    use_model_with_empty_trips = bool(solver_cfg.get("use_model_with_empty_trips", False))
+    run_proposed_method = bool(solver_cfg.get("run_proposed_method", False))
+
+    li = exp.get("line_instance") or {}
+    np.random.seed(int(exp.get("random_seed", 127)))
 
     line_inst = line_instance(
-        candidate_lines_file=candidate_lines_file,
-        cost=1,
-        max_length=15,
-        min_length=8,
-        proba=0.1,
-        capacity=30,
-        detour_factor=3,
-        method=3,
-        granularity=1,
-        demand_file=demand_file,
-        results_dir=results_dir,
-        dm_file=dm_file,
+        candidate_lines_file=inst.lines_file,
+        cost=int(li.get("cost", 1)),
+        max_length=int(li.get("max_length", 15)),
+        min_length=int(li.get("min_length", 8)),
+        proba=float(li.get("proba", 0.1)),
+        capacity=int(li.get("capacity", 30)),
+        detour_factor=li.get("detour_factor", 3),
+        method=int(li.get("method", 3)),
+        granularity=int(li.get("granularity", 1)),
+        demand_file=inst.demand_file,
+        results_dir=base_results_directory,
+        dm_file=inst.dm_file,
     )
 
-    instance_size_label = get_instance_size_label(demand_file)
+    budget = _parse_optional_budget(exp.get("budget"))
+
+    instance_size_label = get_instance_size_label(str(inst.demand_file))
     method_label = _get_method_label(use_model_with_mod_costs, use_model_with_empty_trips)
-    base_results_directory = results_dir
     base_results_directory.mkdir(parents=True, exist_ok=True)
 
-    for budget in budgets:
+    if budget is not None:
+        budget_slug = int(budget) if float(budget).is_integer() else budget
+        method_directory = base_results_directory / f"budget_{budget_slug}" / method_label
         line_inst.B = budget * 0.95
-        logging.info("Computing the line planning problem with budget %s", budget)
+    else:
+        method_directory = base_results_directory / method_label
+        line_inst.B = GRB.INFINITY
 
-        candidate_set_of_lines = line_inst.candidate_set_of_lines
-        print("candidate_set_of_lines")
-        solver = LinePlanningSolver(line_inst)
+    candidate_set_of_lines = line_inst.candidate_set_of_lines
+    logging.info("Loaded %d candidate routes.", len(candidate_set_of_lines))
+    solver = LinePlanningSolver(line_inst)
 
-        # Execute the proposed method with LP solving and rounding
-        if run_proposed_method:
-            best_value, budg, op, v, nb_respect, mean, execution_time = solver.execute_proposed_method(
-                budget, candidate_set_of_lines
+    if run_proposed_method:
+        prop_budget = float("inf") if budget is None else float(budget)
+        best_value, budg, op, v, nb_respect, mean, execution_time = solver.execute_proposed_method(
+            prop_budget, candidate_set_of_lines
+        )
+        logging.info(
+            "Proposed method finished: best_value=%s budg=%s nb_respect=%s time=%s",
+            best_value,
+            budg,
+            nb_respect,
+            execution_time,
+        )
+
+    method_directory.mkdir(parents=True, exist_ok=True)
+    run_log_path = method_directory / "run.log"
+    gurobi_log_path = method_directory / "gurobi.log"
+    log_handler = _configure_run_logging(run_log_path)
+    obj_val = 0.0
+    run_time_ilp = 0.0
+    try:
+        logging.info("Solving the line planning problem with ILP (budget=%s)", budget)
+        solver.line_instance.B = _ilp_budget_rhs(budget)
+        if use_model_with_mod_costs:
+            obj_val, run_time_ilp = solver.solve_modified_ILP(
+                export_model=True,
+                export_solution=True,
+                output_dir=method_directory,
+                gurobi_log_file=gurobi_log_path,
             )
-            time_LP += execution_time
-            average_value_LP += best_value
+        elif use_model_with_empty_trips:
+            obj_val, run_time_ilp = solver.solve_ILP_with_empty_trips(
+                export_model=True,
+                export_solution=True,
+                output_dir=method_directory,
+                gurobi_log_file=gurobi_log_path,
+            )
+        else:
+            obj_val, run_time_ilp = solver.solve_ILP(
+                export_model=True,
+                export_solution=True,
+                output_dir=method_directory,
+                gurobi_log_file=gurobi_log_path,
+            )
+    finally:
+        root_logger = logging.getLogger()
+        root_logger.removeHandler(log_handler)
+        log_handler.close()
 
-        budget_directory = base_results_directory / f"budget_{budget}"
-        method_directory = budget_directory / method_label
-        method_directory.mkdir(parents=True, exist_ok=True)
+    results_payload: Dict[str, Union[str, float, int, None]] = {
+        "objective_value": obj_val,
+        "run_time_seconds": run_time_ilp,
+        "method": method_label,
+        "instance_size": instance_size_label,
+        "demand_file": str(inst.demand_file),
+        "instance_config": str(inst.config_path),
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    if budget is not None:
+        results_payload["budget"] = budget
+    results_file = method_directory / "metrics.json"
+    results_file.write_text(json.dumps(results_payload, indent=2))
 
-        run_log_path = method_directory / "run.log"
-        gurobi_log_path = method_directory / "gurobi.log"
-        log_handler = _configure_run_logging(run_log_path)
-        try:
-            logging.info("Solving the line planning problem with ILP")
-            solver.line_instance.B = budget
-            if use_model_with_mod_costs:
-                obj_val, run_time_ILP = solver.solve_modified_ILP(
-                    export_model=True,
-                    export_solution=True,
-                    output_dir=method_directory,
-                    gurobi_log_file=gurobi_log_path,
-                )
-            elif use_model_with_empty_trips:
-                obj_val, run_time_ILP = solver.solve_ILP_with_empty_trips(
-                    export_model=True,
-                    export_solution=True,
-                    output_dir=method_directory,
-                    gurobi_log_file=gurobi_log_path,
-                )
-            else:
-                obj_val, run_time_ILP = solver.solve_ILP(
-                    export_model=True,
-                    export_solution=True,
-                    output_dir=method_directory,
-                    gurobi_log_file=gurobi_log_path,
-                )
-        finally:
-            root_logger = logging.getLogger()
-            root_logger.removeHandler(log_handler)
-            log_handler.close()
 
-        results_payload = {
-            "budget": budget,
-            "objective_value": obj_val,
-            "run_time_seconds": run_time_ILP,
-            "method": method_label,
-            "instance_size": instance_size_label,
-            "demand_file": str(demand_file),
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        }
-        results_file = method_directory / "metrics.json"
-        results_file.write_text(json.dumps(results_payload, indent=2))
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Line planning experiment driver (YAML experiment references instance config.yaml).",
+    )
+    parser.add_argument(
+        "experiment_config",
+        type=Path,
+        help="Path to experiment YAML (must set 'instance' and 'results_dir').",
+    )
+    args = parser.parse_args()
+    run_experiment(args.experiment_config)
