@@ -289,7 +289,7 @@ def _compute_metrics_row(
         "n_no_valid_mt": n_no_valid_mt,
         "mean_total_time_best": float(np.mean(total_times_best)) if total_times_best else "",
         "mean_direct_time": float(np.mean(mean_direct_vals)) if mean_direct_vals else "",
-        "nb_lines": inst.nb_lines // inst.granularity if inst.granularity else inst.nb_lines,
+        "nb_lines": inst.nb_lines,
     }
     return row
 
@@ -420,7 +420,6 @@ def main() -> None:
     parser.add_argument("--number-of-stops", type=int, required=True)
     parser.add_argument("--nb-lines", type=int, required=True)
     parser.add_argument("--maximum-detour", type=int, default=3)
-    parser.add_argument("--granularity", type=int, default=1)
     parser.add_argument("--capacity", type=int, default=30)
     parser.add_argument("--min-length-line", type=int, default=DEFAULT_MIN_LENGTH)
     parser.add_argument("--max-length-line", type=int, default=DEFAULT_MAX_LENGTH)
@@ -510,7 +509,6 @@ def main() -> None:
         candidate_lines_file=candidate_lines_file,
         capacity=args.capacity,
         maximum_detour=args.maximum_detour,
-        granularity=args.granularity,
         demand_file=demand_file,
         results_dir=run_dir,
         dm_file=dm_file,

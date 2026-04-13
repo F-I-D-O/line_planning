@@ -8,7 +8,7 @@ import time
 from collections import defaultdict
 from copy import deepcopy
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -46,12 +46,47 @@ def get_instance_size_label(demand_file_path: Optional[str]) -> str:
     return "100_percent"
 
 
-def _get_method_label(use_mod_costs: bool, use_empty_trips: bool) -> str:
-    if use_mod_costs:
-        return "stage_1"
-    if use_empty_trips:
-        return "stage_2"
-    return "original"
+# ``solver.method`` in experiment YAML — exactly one runner branch in ``run_experiment``.
+VALID_SOLVER_METHODS = frozenset(
+    {
+        "approximation",
+        "ilp",
+        "ilp_with_mod_costs",
+        "ilp_with_empty_trips",
+        "non_budget_ilp",
+    }
+)
+
+
+def _resolve_solver_method(solver_cfg: Dict[str, Any]) -> str:
+    """
+    Return the canonical solver method string.
+
+    Supports legacy boolean flags (``run_proposed_method``, ``use_model_with_mod_costs``,
+    ``use_model_with_empty_trips``) when ``method`` is absent or null.
+    """
+    if "method" in solver_cfg:
+        raw = solver_cfg["method"]
+        if raw is None:
+            pass
+        elif isinstance(raw, str):
+            if raw in VALID_SOLVER_METHODS:
+                return raw
+            raise ValueError(
+                f"Unknown solver.method {raw!r}; expected one of {sorted(VALID_SOLVER_METHODS)}"
+            )
+        else:
+            raise ValueError(
+                f"solver.method must be a string (one of {sorted(VALID_SOLVER_METHODS)}), "
+                f"got {type(raw).__name__}: {raw!r}"
+            )
+    if solver_cfg.get("run_proposed_method"):
+        return "approximation"
+    if solver_cfg.get("use_model_with_mod_costs"):
+        return "ilp_with_mod_costs"
+    if solver_cfg.get("use_model_with_empty_trips"):
+        return "ilp_with_empty_trips"
+    return "ilp"
 
 
 def _configure_run_logging(log_path: Path) -> logging.Handler:
@@ -1275,8 +1310,14 @@ def run_experiment(experiment_config_path: Path) -> None:
     The YAML must define ``instance`` (path to instance ``config.yaml``),
     ``results_dir``, optional ``mass_transport`` / ``line_instance`` / ``solver`` blocks, and
     optional ``budget`` (omit for an unconstrained ILP budget).
-    When ``solver.run_proposed_method`` is true, optional ``solver.method`` sets the Gurobi
-    ``Method`` parameter for each column-generation sub-MIP (omit or ``0`` for Gurobi default).
+
+    The ``solver`` block must set ``method`` to exactly one of:
+    ``approximation``, ``ilp``, ``ilp_with_mod_costs``, ``ilp_with_empty_trips``, ``non_budget_ilp``.
+    Legacy boolean flags (``run_proposed_method``, ``use_model_with_mod_costs``,
+    ``use_model_with_empty_trips``) are still accepted when ``method`` is omitted.
+
+    For ``method: approximation``, optional ``solver.approximation_subproblem_method`` (int)
+    sets Gurobi ``Method`` on each column-generation sub-MIP (omit or ``0`` for default).
     """
     experiment_config_path = experiment_config_path.resolve()
     exp = load_experiment_yaml(experiment_config_path)
@@ -1291,18 +1332,17 @@ def run_experiment(experiment_config_path: Path) -> None:
     fixed_cost = int(solver_cfg.get("fixed_cost", 1))
     max_frequency = int(solver_cfg.get("max_frequency", 1))
 
-    use_model_with_mod_costs = bool(solver_cfg.get("use_model_with_mod_costs", False))
-    use_model_with_empty_trips = bool(solver_cfg.get("use_model_with_empty_trips", False))
-    run_proposed_method = bool(solver_cfg.get("run_proposed_method", False))
+    solver_method = _resolve_solver_method(solver_cfg)
 
     mt = dict(exp.get("mass_transport") or {})
     li = dict(exp.get("line_instance") or {})
+    li.pop("granularity", None)
+    legacy_sub_mip_method = li.pop("method", None)
 
     line_inst = line_instance(
         candidate_lines_file=inst.lines_file,
         capacity=int(mt.get("capacity", 30)),
         maximum_detour=mt.get("maximum_detour", 3),
-        granularity=int(li.get("granularity", 1)),
         demand_file=inst.demand_file,
         results_dir=base_results_directory,
         dm_file=inst.dm_file,
@@ -1311,70 +1351,90 @@ def run_experiment(experiment_config_path: Path) -> None:
     budget = _parse_optional_budget(exp.get("budget"))
 
     instance_size_label = get_instance_size_label(str(inst.demand_file))
-    method_label = _get_method_label(use_model_with_mod_costs, use_model_with_empty_trips)
+    method_slug = solver_method
     base_results_directory.mkdir(parents=True, exist_ok=True)
 
     if budget is not None:
         budget_slug = int(budget) if float(budget).is_integer() else budget
-        method_directory = base_results_directory / f"budget_{budget_slug}" / method_label
+        method_directory = base_results_directory / f"budget_{budget_slug}" / method_slug
         line_inst.B = budget * 0.95
     else:
-        method_directory = base_results_directory / method_label
+        method_directory = base_results_directory / method_slug
         line_inst.B = GRB.INFINITY
 
     candidate_set_of_lines = line_inst.candidate_set_of_lines
     logging.info("Loaded %d candidate routes.", len(candidate_set_of_lines))
     solver = LinePlanningSolver(line_inst)
 
-    if run_proposed_method:
-        prop_budget = float("inf") if budget is None else float(budget)
-        raw_sub_mip_method = solver_cfg.get("method", 3)
-        gurobi_subproblem_method = (
-            int(raw_sub_mip_method) if raw_sub_mip_method is not None else None
-        )
-        best_value, budg, op, v, nb_respect, mean, execution_time = solver.execute_proposed_method(
-            prop_budget,
-            candidate_set_of_lines,
-            gurobi_subproblem_method=gurobi_subproblem_method,
-        )
-        logging.info(
-            "Proposed method finished: best_value=%s budg=%s nb_respect=%s time=%s",
-            best_value,
-            budg,
-            nb_respect,
-            execution_time,
-        )
-
     method_directory.mkdir(parents=True, exist_ok=True)
     run_log_path = method_directory / "run.log"
     gurobi_log_path = method_directory / "gurobi.log"
     log_handler = _configure_run_logging(run_log_path)
-    obj_val = 0.0
-    run_time_ilp = 0.0
+    obj_val: Union[float, int] = 0.0
+    run_time_sec = 0.0
+    line_obj_component: Optional[float] = None
+    mod_obj_component: Optional[float] = None
     try:
-        logging.info("Solving the line planning problem with ILP (budget=%s)", budget)
-        solver.line_instance.B = _ilp_budget_rhs(budget)
-        if use_model_with_mod_costs:
-            obj_val, run_time_ilp = solver.solve_modified_ILP(
-                export_model=True,
-                export_solution=True,
-                output_dir=method_directory,
-                gurobi_log_file=gurobi_log_path,
+        if solver_method == "approximation":
+            prop_budget = float("inf") if budget is None else float(budget)
+            raw_sub_mip = solver_cfg.get("approximation_subproblem_method", legacy_sub_mip_method)
+            gurobi_subproblem_method = int(raw_sub_mip) if raw_sub_mip is not None else None
+            logging.info("Running solver.method=approximation (budget cap for rounding=%s)", prop_budget)
+            best_value, budg, op, v, nb_respect, mean, execution_time = solver.execute_proposed_method(
+                prop_budget,
+                candidate_set_of_lines,
+                gurobi_subproblem_method=gurobi_subproblem_method,
             )
-        elif use_model_with_empty_trips:
-            obj_val, run_time_ilp = solver.solve_ILP_with_empty_trips(
+            obj_val = float(best_value)
+            run_time_sec = float(execution_time)
+            logging.info(
+                "Approximation finished: best_value=%s budg=%s nb_respect=%s time=%s",
+                best_value,
+                budg,
+                nb_respect,
+                execution_time,
+            )
+        elif solver_method in ("ilp", "ilp_with_mod_costs", "ilp_with_empty_trips"):
+            logging.info("Running solver.method=%s (budget=%s)", solver_method, budget)
+            solver.line_instance.B = _ilp_budget_rhs(budget)
+            if solver_method == "ilp_with_mod_costs":
+                obj_val, run_time_sec = solver.solve_modified_ILP(
+                    export_model=True,
+                    export_solution=True,
+                    output_dir=method_directory,
+                    gurobi_log_file=gurobi_log_path,
+                )
+            elif solver_method == "ilp_with_empty_trips":
+                obj_val, run_time_sec = solver.solve_ILP_with_empty_trips(
+                    export_model=True,
+                    export_solution=True,
+                    output_dir=method_directory,
+                    gurobi_log_file=gurobi_log_path,
+                )
+            else:
+                obj_val, run_time_sec = solver.solve_ILP(
+                    export_model=True,
+                    export_solution=True,
+                    output_dir=method_directory,
+                    gurobi_log_file=gurobi_log_path,
+                )
+        elif solver_method == "non_budget_ilp":
+            logging.info("Running solver.method=non_budget_ilp (MoD-aware route-aggregated ILP)")
+            (
+                obj_val,
+                run_time_sec,
+                _selected_lines,
+                _request_assignments,
+                line_obj_component,
+                mod_obj_component,
+            ) = solver.solve_MoD_aware_ILP(
                 export_model=True,
                 export_solution=True,
                 output_dir=method_directory,
                 gurobi_log_file=gurobi_log_path,
             )
         else:
-            obj_val, run_time_ilp = solver.solve_ILP(
-                export_model=True,
-                export_solution=True,
-                output_dir=method_directory,
-                gurobi_log_file=gurobi_log_path,
-            )
+            raise AssertionError("unreachable solver_method")
     finally:
         root_logger = logging.getLogger()
         root_logger.removeHandler(log_handler)
@@ -1382,13 +1442,17 @@ def run_experiment(experiment_config_path: Path) -> None:
 
     results_payload: Dict[str, Union[str, float, int, None]] = {
         "objective_value": obj_val,
-        "run_time_seconds": run_time_ilp,
-        "method": method_label,
+        "run_time_seconds": run_time_sec,
+        "method": solver_method,
         "instance_size": instance_size_label,
         "demand_file": str(inst.demand_file),
         "instance_config": str(inst.config_path),
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
+    if line_obj_component is not None:
+        results_payload["line_objective_component"] = line_obj_component
+    if mod_obj_component is not None:
+        results_payload["mod_objective_component"] = mod_obj_component
     if budget is not None:
         results_payload["budget"] = budget
     results_file = method_directory / "metrics.json"

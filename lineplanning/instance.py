@@ -121,12 +121,10 @@ class line_instance:
         candidate_lines_file,
         capacity,
         maximum_detour=None,
-        granularity=1,
         demand_file=None,
         results_dir=None,
         dm_file=None
     ):
-        self.granularity = granularity
         self.B = None
         self.candidate_set_of_lines = None  # candidate_set_of_lines[l] contains the nodes served by line l (only useful when building instance from real network)
         self.lengths_travel_times = None  # used only for the manhattan instance
@@ -150,7 +148,7 @@ class line_instance:
         with open(self.candidate_line_file, 'r') as f:
             nb_lines = sum(1 for line in f if line.strip())  # Count non-empty lines only
         logging.info('Found %s candidate lines in file', nb_lines)
-        self.nb_lines = nb_lines * granularity  # number of lines in the candidate set (after granularity)
+        self.nb_lines = nb_lines
         (
             self.set_of_lines,
             self.pass_to_lines,
@@ -497,16 +495,10 @@ class line_instance:
             )
             self._save_preprocessing_cache(cache_path, optimal_trip_options)
 
-        granularity = self.granularity
-
-        candidate_set_of_lines_tmp = []
-        for l in range(len(candidate_set_of_lines)):
-            for t in range(granularity):
-                candidate_set_of_lines_tmp.append(candidate_set_of_lines[l])
-        candidate_set_of_lines = candidate_set_of_lines_tmp
-
-        lengths_travel_times = [travel_times_on_lines[l // granularity][0][len(candidate_set_of_lines[l]) - 1] for l in
-            range(len(candidate_set_of_lines))]
+        lengths_travel_times = [
+            travel_times_on_lines[l][0][len(candidate_set_of_lines[l]) - 1]
+            for l in range(len(candidate_set_of_lines))
+        ]
 
         return (
             set_of_lines,

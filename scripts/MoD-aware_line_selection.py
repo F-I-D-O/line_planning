@@ -481,7 +481,6 @@ line_inst = lineplanning.instance.line_instance(
     candidate_lines_file=candidate_lines_file,
     capacity=30,
     maximum_detour=3,
-    granularity=1,
     demand_file=demand_file,
     results_dir=results_dir_path,
     dm_file=dm_file,
@@ -510,6 +509,7 @@ for i in range(iteration_count):
         )
     else:
         # 1. Solve the line selection ILP (section 4.1); get selected lines and request-line assignments
+        # Same formulation as experiment ``solver.method: non_budget_ilp`` in ``run_experiment``.
         obj_val, run_time_ILP, selected_lines, request_assignments, line_cost, mod_cost = (
             solver.solve_MoD_aware_ILP(
                 export_model=True,

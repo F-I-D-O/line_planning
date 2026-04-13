@@ -4,7 +4,7 @@ Write self-contained instance directories + per-experiment directories.
 Instances (copied demand + lines from repo ``test_data/``, local config.yaml):
   C:\\...\\Line Planning\\Instances\\original-generated\\<instance_stem>\\
 
-Experiments (one folder each, ``experiment.yaml`` with ``mass_transport`` / ``line_instance`` / ``solver``, results_dir ``.``):
+Experiments (one folder each, ``experiment.yaml`` with ``mass_transport`` / ``solver`` and optional ``line_instance``, results_dir ``.``):
   C:\\...\\Line Planning\\Results\\original-generated\\<experiment_stem>\\
 
 If the Google Drive tree cannot be created, the same structure is written under
@@ -40,14 +40,10 @@ DEFAULT_MASS_TRANSPORT: Dict[str, Any] = {
     "maximum_detour": 3,
 }
 
-DEFAULT_LINE_INSTANCE: Dict[str, Any] = {
-    "granularity": 1,
-}
+DEFAULT_LINE_INSTANCE: Dict[str, Any] = {}
 
 DEFAULT_SOLVER: Dict[str, Any] = {
-    "use_model_with_mod_costs": False,
-    "use_model_with_empty_trips": False,
-    "run_proposed_method": False,
+    "method": "ilp",
     "allowed_time": 86400,
     "fixed_cost": 1,
     "max_frequency": 1,
@@ -112,17 +108,19 @@ def _experiment_yaml(
     solver: Optional[Dict[str, Any]] = None,
     budget: Any = None,
 ) -> Dict[str, Any]:
+    li_merged = dict(
+        DEFAULT_LINE_INSTANCE if line_instance is None else {**DEFAULT_LINE_INSTANCE, **line_instance}
+    )
     out: Dict[str, Any] = {
         "instance": instance_relpath,
         "results_dir": ".",
         "mass_transport": dict(
             DEFAULT_MASS_TRANSPORT if mass_transport is None else {**DEFAULT_MASS_TRANSPORT, **mass_transport}
         ),
-        "line_instance": dict(
-            DEFAULT_LINE_INSTANCE if line_instance is None else {**DEFAULT_LINE_INSTANCE, **line_instance}
-        ),
         "solver": dict(DEFAULT_SOLVER if solver is None else {**DEFAULT_SOLVER, **solver}),
     }
+    if li_merged:
+        out["line_instance"] = li_merged
     if budget is not None:
         out["budget"] = budget
     return out
@@ -178,7 +176,7 @@ def write_bundle(instances_root: Path, experiments_root: Path) -> None:
             "april_fhv_100",
             _experiment_yaml(
                 instance_relpath="",
-                solver={**DEFAULT_SOLVER, "use_model_with_mod_costs": True},
+                solver={**DEFAULT_SOLVER, "method": "ilp_with_mod_costs"},
             ),
         ),
         (
@@ -186,7 +184,7 @@ def write_bundle(instances_root: Path, experiments_root: Path) -> None:
             "april_fhv_100",
             _experiment_yaml(
                 instance_relpath="",
-                solver={**DEFAULT_SOLVER, "use_model_with_empty_trips": True},
+                solver={**DEFAULT_SOLVER, "method": "ilp_with_empty_trips"},
             ),
         ),
         ("exp_unlimited_budget", "april_fhv_100", _experiment_yaml(instance_relpath="")),

@@ -37,7 +37,6 @@ RESULTS_DIR = Path(
     r"C:\Google Drive AIC\My Drive\AIC Experiment Data\Line Planning\Results\manhattan-2_h-10_percent\instance_01\mod-aware"
 )
 MAXIMUM_DETOUR = 3
-GRANULARITY = 1
 
 # If set, write interactive HTML; if None, skip
 OUTPUT_HTML: Path | None = None
@@ -103,7 +102,6 @@ line_inst = lineplanning.instance.line_instance(
     candidate_lines_file=CANDIDATE_LINES_FILE,
     capacity=30,
     maximum_detour=MAXIMUM_DETOUR,
-    granularity=GRANULARITY,
     demand_file=demand_file,
     results_dir=RESULTS_DIR,
     dm_file=dm_file,
