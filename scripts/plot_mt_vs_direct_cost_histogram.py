@@ -36,7 +36,7 @@ CANDIDATE_LINES_FILE = INSTANCE_DIR / "lines.txt"
 RESULTS_DIR = Path(
     r"C:\Google Drive AIC\My Drive\AIC Experiment Data\Line Planning\Results\manhattan-2_h-10_percent\instance_01\mod-aware"
 )
-DETOUR_FACTOR = 3
+MAXIMUM_DETOUR = 3
 GRANULARITY = 1
 
 # If set, write interactive HTML; if None, skip
@@ -101,13 +101,8 @@ demand_file, dm_file = _load_demand_and_dm_from_instance_config(INSTANCE_DIR)
 
 line_inst = lineplanning.instance.line_instance(
     candidate_lines_file=CANDIDATE_LINES_FILE,
-    cost=1,
-    max_length=15,
-    min_length=8,
-    proba=0.1,
     capacity=30,
-    detour_factor=DETOUR_FACTOR,
-    method=3,
+    maximum_detour=MAXIMUM_DETOUR,
     granularity=GRANULARITY,
     demand_file=demand_file,
     results_dir=RESULTS_DIR,

@@ -83,25 +83,25 @@ def preprocessing_csv_path(
     results_dir: Path,
     demand_file: Optional[Path],
     candidate_lines_file: Path,
-    detour_factor: Optional[int],
+    maximum_detour: Optional[int],
 ) -> Path:
     """
     Path to the preprocessing CSV cache ``line_instance`` uses for the given
-    demand file, candidate lines file, detour factor, and results directory.
+    demand file, candidate lines file, maximum detour (see README), and results directory.
     """
     demand_file_path = Path(demand_file).resolve() if demand_file is not None else None
     candidate_line_file_path = Path(candidate_lines_file).resolve()
 
     demand_file_str = str(demand_file_path) if demand_file_path is not None else "none"
     candidate_line_file_str = str(candidate_line_file_path)
-    detour_factor_str = str(detour_factor) if detour_factor is not None else "none"
+    maximum_detour_str = str(maximum_detour) if maximum_detour is not None else "none"
 
-    cache_key = f"{demand_file_str}|{candidate_line_file_str}|{detour_factor_str}"
+    cache_key = f"{demand_file_str}|{candidate_line_file_str}|{maximum_detour_str}"
     cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:12]
 
     demand_name = demand_file_path.stem if demand_file_path is not None else "none"
     candidate_line_name = candidate_line_file_path.stem
-    detour_suffix = detour_factor if detour_factor is not None else "none"
+    detour_suffix = maximum_detour if maximum_detour is not None else "none"
 
     cache_dir = Path(results_dir) / "preprocessing"
     filename = f"{demand_name}_{candidate_line_name}_detour_{detour_suffix}_{cache_hash}.csv"
@@ -119,13 +119,8 @@ class line_instance:
     def __init__(
         self,
         candidate_lines_file,
-        cost,
-        max_length,
-        min_length,
-        proba,
         capacity,
-        detour_factor=None,
-        method=0,
+        maximum_detour=None,
         granularity=1,
         demand_file=None,
         results_dir=None,
@@ -133,12 +128,7 @@ class line_instance:
     ):
         self.granularity = granularity
         self.B = None
-        self.cost = cost
-        self.proba = proba  # probability that a passenger is covered by a line (when generating random instances)
-        self.max_length = max_length  # max length of a line (when generating random instances)
-        self.min_length = min_length  # min length of a line (when generating random instances)
         self.candidate_set_of_lines = None  # candidate_set_of_lines[l] contains the nodes served by line l (only useful when building instance from real network)
-        self.method = method  # method used by the ILP solver.
         self.lengths_travel_times = None  # used only for the manhattan instance
         self.capacity = capacity
         self.demand_file = demand_file
@@ -171,7 +161,7 @@ class line_instance:
             self.lengths_travel_times,
             self.dm,
             self.requests
-        ) = self.manhattan_instance(detour_factor)
+        ) = self.manhattan_instance(maximum_detour)
 
     def _get_instance_size_label(self, date: Optional[str]) -> str:
         if self.demand_file:
@@ -248,17 +238,17 @@ class line_instance:
 
     def _get_preprocessing_cache_path(
         self,
-        detour_factor: Optional[int],
+        maximum_detour: Optional[int],
     ) -> Path:
         """
-        Generate cache path based on demand file, candidate line file, and detour factor.
+        Generate cache path based on demand file, candidate line file, and maximum detour.
         Uses hash of file paths to ensure uniqueness.
         """
         return preprocessing_csv_path(
             self.results_dir,
             Path(self.demand_file) if self.demand_file is not None else None,
             self.candidate_line_file,
-            detour_factor,
+            maximum_detour,
         )
 
     def _load_preprocessing_cache_legacy_json(self, json_path: Path):
@@ -433,7 +423,7 @@ class line_instance:
                 logging.warning("Could not remove legacy cache %s: %s", legacy_json, exc)
         logging.info("Stored preprocessing data to cache %s", cache_path)
 
-    def manhattan_instance(self, detour_factor) -> Tuple[
+    def manhattan_instance(self, maximum_detour) -> Tuple[
         list, list, List[List[TripOption]], list, List[List[List[int]]], list, list, np.ndarray, List[List[int]]]:
         # TODO handle the case where remaining stops pop in skeleton method
 
@@ -472,7 +462,7 @@ class line_instance:
         travel_times_on_lines = self.compute_travel_times_on_lines(candidate_set_of_lines, distances)
         logging.info('Travel times computed')
 
-        cache_path = self._get_preprocessing_cache_path(detour_factor)
+        cache_path = self._get_preprocessing_cache_path(maximum_detour)
         cached_preprocessing = self._load_preprocessing_cache(
             cache_path,
             candidate_set_of_lines,
@@ -502,7 +492,7 @@ class line_instance:
                 passengers,
                 travel_times_on_lines,
                 distances,
-                detour_factor,
+                maximum_detour,
                 nb_pass,
             )
             self._save_preprocessing_cache(cache_path, optimal_trip_options)
@@ -531,7 +521,7 @@ class line_instance:
         )
 
     def preprocessing(
-        self, candidate_set_of_lines, passengers: List[List[int]], travel_times_on_lines, distances, detour_factor, nb_pass
+        self, candidate_set_of_lines, passengers: List[List[int]], travel_times_on_lines, distances, maximum_detour, nb_pass
     ) -> Tuple[list, list, List[List[TripOption]], list, List[List[List[int]]]]:
         logging.info('Preprocessing optimal trip options')
         nb_lines = len(candidate_set_of_lines)
@@ -541,7 +531,7 @@ class line_instance:
         for line in tqdm(range(nb_lines), desc='Processing lines'):
             for p in range(nb_pass):
                 optimal_trip_option = self.get_optimal_trip(
-                    passengers[p], candidate_set_of_lines[line], travel_times_on_lines[line], distances, detour_factor
+                    passengers[p], candidate_set_of_lines[line], travel_times_on_lines[line], distances, maximum_detour
                 )
                 optimal_trip_options[p].append(optimal_trip_option)
 
@@ -563,14 +553,14 @@ class line_instance:
 
         return set_of_lines, pass_to_lines, optimal_trip_options, lines_to_passengers, edge_to_passengers
 
-    def get_optimal_trip(self, passenger: List[int], line, travel_times_on_line, distances, detour_factor) -> TripOption:
+    def get_optimal_trip(self, passenger: List[int], line, travel_times_on_line, distances, maximum_detour) -> TripOption:
         """
         Return the optimal trip option for a given passenger on a given line (omega_{ell,p}).
         passenger = [origin, destination]
         line = [list of nodes in the line]
         travel_times_on_line[i][j] contains the time to travel from node number i to node number j on the line
         distances[i][j] distance matrix
-        detour_factor = maximum detour factor allowed
+        maximum_detour = maximum detour relative to shortest path (see experiment ``mass_transport.maximum_detour``).
         Return Mass transit pickup and drop off nodes, and other trip information
         """
         line_length = len(line)
@@ -590,7 +580,7 @@ class line_instance:
                 total_travel_time = mod_travel_time + mt_travel_time
                 value = int(shortest_travel_time) - int(mod_travel_time)
                 if ((
-                    value > optimal_trip_option.value and total_travel_time <= detour_factor * shortest_travel_time) or (
+                    value > optimal_trip_option.value and total_travel_time <= maximum_detour * shortest_travel_time) or (
                     value == optimal_trip_option.value and mt_travel_time < optimal_trip_option.mt_cost)):
                     optimal_trip_option = TripOption(
                         value,

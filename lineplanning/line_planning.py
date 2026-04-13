@@ -343,8 +343,13 @@ class LinePlanningSolver:
             logging.warning("Unable to write flows CSV %s: %s", csv_path, exc)
 
     # Implementation of the column generation process. Outputs the solution of the configuration LP before rounding.
-    def solve_master_LP(self):
+    def solve_master_LP(self, gurobi_subproblem_method: Optional[int] = None):
+        """
+        Column-generation master LP for the proposed method.
 
+        ``gurobi_subproblem_method``: optional Gurobi ``Method`` parameter for each
+        single-line sub-MIP (omit or ``0`` for Gurobi default).
+        """
         nb_pass = self.line_instance.nb_pass
         nb_lines = self.line_instance.nb_lines
         print(nb_pass, nb_lines)
@@ -481,9 +486,9 @@ class LinePlanningSolver:
                     single_line = Model("SLP") #single line sub-problem
                     single_line.ModelSense = -1 #maximize
 
-                    if self.line_instance.method != 0:
+                    if gurobi_subproblem_method is not None and gurobi_subproblem_method != 0:
                         single_line.Params.OutputFlag = 0
-                        single_line.Params.Method = self.line_instance.method
+                        single_line.Params.Method = gurobi_subproblem_method
 
                     y = {}
                     for p in lines_to_passengers[l]:
@@ -1181,20 +1186,26 @@ class LinePlanningSolver:
 
         return used_budget, total_value, opened_lines, passenger_assignment, values
 
-    def execute_proposed_method(self, Budget, candidate_set_of_lines):
+    def execute_proposed_method(
+        self,
+        Budget,
+        candidate_set_of_lines,
+        gurobi_subproblem_method: Optional[int] = None,
+    ):
         """
         Execute the proposed method with LP solving and rounding iterations to find the best solution.
-        
+
         Args:
             Budget: Budget constraint
             candidate_set_of_lines: Candidate set of lines
-            
+            gurobi_subproblem_method: optional Gurobi ``Method`` for column-generation sub-MIPs.
+
         Returns:
             tuple: (best_value, used_budget, opened_lines_info, values, nb_respect, mean_value, execution_time)
         """
         logging.info("Solving the line planning problem with the proposed method")
         print("LP")
-        solution, active_sets, sets, execution_time = self.solve_master_LP()
+        solution, active_sets, sets, execution_time = self.solve_master_LP(gurobi_subproblem_method)
 
         best_value = 0
         budg = 0
@@ -1205,6 +1216,7 @@ class LinePlanningSolver:
         v = None
         pass_ass = None  # for sanity check
 
+        np.random.seed(127)
         # Do 10000 iterations of the rounding process and keep the best one
         while iter <= 10000:
             used_budget, value, opened_lines, passenger_assignment, values = (
@@ -1261,8 +1273,10 @@ def run_experiment(experiment_config_path: Path) -> None:
     Run one line-planning experiment from a YAML file.
 
     The YAML must define ``instance`` (path to instance ``config.yaml``),
-    ``results_dir``, optional ``line_instance`` / ``solver`` blocks, and
+    ``results_dir``, optional ``mass_transport`` / ``line_instance`` / ``solver`` blocks, and
     optional ``budget`` (omit for an unconstrained ILP budget).
+    When ``solver.run_proposed_method`` is true, optional ``solver.method`` sets the Gurobi
+    ``Method`` parameter for each column-generation sub-MIP (omit or ``0`` for Gurobi default).
     """
     experiment_config_path = experiment_config_path.resolve()
     exp = load_experiment_yaml(experiment_config_path)
@@ -1281,18 +1295,13 @@ def run_experiment(experiment_config_path: Path) -> None:
     use_model_with_empty_trips = bool(solver_cfg.get("use_model_with_empty_trips", False))
     run_proposed_method = bool(solver_cfg.get("run_proposed_method", False))
 
-    li = exp.get("line_instance") or {}
-    np.random.seed(int(exp.get("random_seed", 127)))
+    mt = dict(exp.get("mass_transport") or {})
+    li = dict(exp.get("line_instance") or {})
 
     line_inst = line_instance(
         candidate_lines_file=inst.lines_file,
-        cost=int(li.get("cost", 1)),
-        max_length=int(li.get("max_length", 15)),
-        min_length=int(li.get("min_length", 8)),
-        proba=float(li.get("proba", 0.1)),
-        capacity=int(li.get("capacity", 30)),
-        detour_factor=li.get("detour_factor", 3),
-        method=int(li.get("method", 3)),
+        capacity=int(mt.get("capacity", 30)),
+        maximum_detour=mt.get("maximum_detour", 3),
         granularity=int(li.get("granularity", 1)),
         demand_file=inst.demand_file,
         results_dir=base_results_directory,
@@ -1319,8 +1328,14 @@ def run_experiment(experiment_config_path: Path) -> None:
 
     if run_proposed_method:
         prop_budget = float("inf") if budget is None else float(budget)
+        raw_sub_mip_method = solver_cfg.get("method", 3)
+        gurobi_subproblem_method = (
+            int(raw_sub_mip_method) if raw_sub_mip_method is not None else None
+        )
         best_value, budg, op, v, nb_respect, mean, execution_time = solver.execute_proposed_method(
-            prop_budget, candidate_set_of_lines
+            prop_budget,
+            candidate_set_of_lines,
+            gurobi_subproblem_method=gurobi_subproblem_method,
         )
         logging.info(
             "Proposed method finished: best_value=%s budg=%s nb_respect=%s time=%s",

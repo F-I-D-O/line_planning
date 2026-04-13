@@ -479,13 +479,8 @@ def aggregate_mod_costs_for_original_requests(
 # Loads candidate lines file and similar: once per the whole script
 line_inst = lineplanning.instance.line_instance(
     candidate_lines_file=candidate_lines_file,
-    cost=1,
-    max_length=15,
-    min_length=8,
-    proba=0.1,
     capacity=30,
-    detour_factor=3,
-    method=3,
+    maximum_detour=3,
     granularity=1,
     demand_file=demand_file,
     results_dir=results_dir_path,

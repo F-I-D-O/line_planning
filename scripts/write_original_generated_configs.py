@@ -4,7 +4,7 @@ Write self-contained instance directories + per-experiment directories.
 Instances (copied demand + lines from repo ``test_data/``, local config.yaml):
   C:\\...\\Line Planning\\Instances\\original-generated\\<instance_stem>\\
 
-Experiments (one folder each, ``experiment.yaml`` + results_dir ``.``):
+Experiments (one folder each, ``experiment.yaml`` with ``mass_transport`` / ``line_instance`` / ``solver``, results_dir ``.``):
   C:\\...\\Line Planning\\Results\\original-generated\\<experiment_stem>\\
 
 If the Google Drive tree cannot be created, the same structure is written under
@@ -35,14 +35,12 @@ REPO_BUNDLE_ROOT = REPO_ROOT / "experiments" / "original-generated"
 REPO_INSTANCES = REPO_BUNDLE_ROOT / "Instances"
 REPO_EXPERIMENTS = REPO_BUNDLE_ROOT / "Results"
 
-DEFAULT_LINE_INSTANCE: Dict[str, Any] = {
-    "cost": 1,
-    "max_length": 15,
-    "min_length": 8,
-    "proba": 0.1,
+DEFAULT_MASS_TRANSPORT: Dict[str, Any] = {
     "capacity": 30,
-    "detour_factor": 3,
-    "method": 3,
+    "maximum_detour": 3,
+}
+
+DEFAULT_LINE_INSTANCE: Dict[str, Any] = {
     "granularity": 1,
 }
 
@@ -77,8 +75,10 @@ def _dump(path: Path, data: Dict[str, Any]) -> None:
 
 def write_instance_bundle(instances_root: Path, stem: str, demand_name: str, lines_name: str) -> Path:
     """
-    Create ``instances_root/<stem>/`` with a full copy of repo ``test_data/`` files
-    (so the bundle does not reference the repository) plus ``config.yaml``.
+    Create ``instances_root/<stem>/`` with only the demand and candidate-lines
+    files referenced by ``config.yaml`` (copied from repo ``test_data/``), plus
+    ``config.yaml`` itself. The distance matrix stays at ``dm_filepath`` outside
+    this folder (see ``DM_REL_TO_INSTANCE``).
     Returns path to config.yaml.
     """
     inst_dir = instances_root / stem
@@ -88,9 +88,11 @@ def write_instance_bundle(instances_root: Path, stem: str, demand_name: str, lin
 
     if not TEST_DATA.is_dir():
         raise FileNotFoundError(f"Expected test_data directory at {TEST_DATA}")
-    for f in sorted(TEST_DATA.iterdir()):
-        if f.is_file():
-            shutil.copy2(f, inst_dir / f.name)
+    for name in (demand_name, lines_name):
+        src = TEST_DATA / name
+        if not src.is_file():
+            raise FileNotFoundError(f"Expected instance input file at {src}")
+        shutil.copy2(src, inst_dir / name)
 
     config = {
         "demand": {"filepath": f"./{demand_name}"},
@@ -105,15 +107,17 @@ def write_instance_bundle(instances_root: Path, stem: str, demand_name: str, lin
 def _experiment_yaml(
     *,
     instance_relpath: str,
+    mass_transport: Optional[Dict[str, Any]] = None,
     line_instance: Optional[Dict[str, Any]] = None,
     solver: Optional[Dict[str, Any]] = None,
     budget: Any = None,
-    random_seed: int = 127,
 ) -> Dict[str, Any]:
     out: Dict[str, Any] = {
         "instance": instance_relpath,
         "results_dir": ".",
-        "random_seed": random_seed,
+        "mass_transport": dict(
+            DEFAULT_MASS_TRANSPORT if mass_transport is None else {**DEFAULT_MASS_TRANSPORT, **mass_transport}
+        ),
         "line_instance": dict(
             DEFAULT_LINE_INSTANCE if line_instance is None else {**DEFAULT_LINE_INSTANCE, **line_instance}
         ),

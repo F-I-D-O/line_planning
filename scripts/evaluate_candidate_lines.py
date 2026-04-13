@@ -16,7 +16,7 @@ and histogram under a single run folder.
 - If ``.line_eval_complete`` exists (or legacy: histogram plus preprocessing CSV or old
   ``trip_options_preprocessing.csv``), exit without doing work.
 - If ``lines.txt`` exists, skip candidate line generation.
-- If a valid preprocessing CSV already exists for this demand / lines path / detour,
+- If a valid preprocessing CSV already exists for this demand / lines path / maximum detour,
   ``line_instance`` loads it (no recomputation).
 
 **Metrics "best" MT option:** minimizes ``first_mile + last_mile`` (ignores ``mt_cost``).
@@ -419,14 +419,9 @@ def main() -> None:
     )
     parser.add_argument("--number-of-stops", type=int, required=True)
     parser.add_argument("--nb-lines", type=int, required=True)
-    parser.add_argument("--detour-factor", type=int, default=3)
+    parser.add_argument("--maximum-detour", type=int, default=3)
     parser.add_argument("--granularity", type=int, default=1)
-    parser.add_argument("--cost", type=int, default=1)
-    parser.add_argument("--max-length", type=int, default=15)
-    parser.add_argument("--min-length", type=int, default=8)
-    parser.add_argument("--proba", type=float, default=0.1)
     parser.add_argument("--capacity", type=int, default=30)
-    parser.add_argument("--method", type=int, default=3)
     parser.add_argument("--min-length-line", type=int, default=DEFAULT_MIN_LENGTH)
     parser.add_argument("--max-length-line", type=int, default=DEFAULT_MAX_LENGTH)
     parser.add_argument(
@@ -504,7 +499,7 @@ def main() -> None:
         logging.info("lines.txt exists at %s; skipping candidate line generation.", candidate_lines_file)
 
     cache_csv = preprocessing_csv_path(
-        run_dir, demand_file, candidate_lines_file, args.detour_factor
+        run_dir, demand_file, candidate_lines_file, args.maximum_detour
     )
     if cache_csv.is_file():
         logging.info("Preprocessing cache present at %s; line_instance will load it if valid.", cache_csv)
@@ -513,13 +508,8 @@ def main() -> None:
 
     inst = line_instance(
         candidate_lines_file=candidate_lines_file,
-        cost=args.cost,
-        max_length=args.max_length,
-        min_length=args.min_length,
-        proba=args.proba,
         capacity=args.capacity,
-        detour_factor=args.detour_factor,
-        method=args.method,
+        maximum_detour=args.maximum_detour,
         granularity=args.granularity,
         demand_file=demand_file,
         results_dir=run_dir,
