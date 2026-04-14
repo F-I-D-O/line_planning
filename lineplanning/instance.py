@@ -80,14 +80,15 @@ class TripOption(NamedTuple):
 
 
 def preprocessing_csv_path(
-    results_dir: Path,
+    preprocessing_dir: Path,
     demand_file: Optional[Path],
     candidate_lines_file: Path,
     maximum_detour: Optional[int],
 ) -> Path:
     """
-    Path to the preprocessing CSV cache ``line_instance`` uses for the given
-    demand file, candidate lines file, maximum detour (see README), and results directory.
+    Path to the preprocessing CSV cache for the given demand file, candidate lines file,
+    maximum detour, and ``preprocessing_dir`` (directory that will hold ``*.csv`` caches,
+    typically ``<instance_folder>/preprocessing``).
     """
     demand_file_path = Path(demand_file).resolve() if demand_file is not None else None
     candidate_line_file_path = Path(candidate_lines_file).resolve()
@@ -103,7 +104,7 @@ def preprocessing_csv_path(
     candidate_line_name = candidate_line_file_path.stem
     detour_suffix = maximum_detour if maximum_detour is not None else "none"
 
-    cache_dir = Path(results_dir) / "preprocessing"
+    cache_dir = Path(preprocessing_dir)
     filename = f"{demand_name}_{candidate_line_name}_detour_{detour_suffix}_{cache_hash}.csv"
     return cache_dir / filename
 
@@ -122,7 +123,7 @@ class line_instance:
         capacity,
         maximum_detour=None,
         demand_file=None,
-        results_dir=None,
+        preprocessing_dir=None,
         dm_file=None
     ):
         self.B = None
@@ -133,7 +134,12 @@ class line_instance:
         self.optimal_trip_options: List[List[TripOption]] = []
         self.dm: Optional[np.ndarray] = None  # dm.
         self.edge_to_passengers: Optional[List[List[List[int]]]] = None
-        self.results_dir = Path(results_dir) if results_dir is not None else Path("Results")
+        if preprocessing_dir is not None:
+            self.preprocessing_dir = Path(preprocessing_dir)
+        elif demand_file is not None:
+            self.preprocessing_dir = Path(demand_file).parent / "preprocessing"
+        else:
+            self.preprocessing_dir = Path(candidate_lines_file).parent / "preprocessing"
         self.dm_file = Path(dm_file) if dm_file is not None else Path("dm.h5")
         self.nb_pass: Optional[int] = None
 
@@ -243,7 +249,7 @@ class line_instance:
         Uses hash of file paths to ensure uniqueness.
         """
         return preprocessing_csv_path(
-            self.results_dir,
+            self.preprocessing_dir,
             Path(self.demand_file) if self.demand_file is not None else None,
             self.candidate_line_file,
             maximum_detour,

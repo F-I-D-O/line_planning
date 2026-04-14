@@ -30,6 +30,8 @@ LINE_PLANNING = Path(
 )
 GOOGLE_INSTANCES = LINE_PLANNING / "Instances" / "original-generated"
 GOOGLE_EXPERIMENTS = LINE_PLANNING / "Results" / "original-generated"
+# Shared distance matrix for generated ``original-generated`` instances (sibling of ``original-generated``).
+CANONICAL_DM_H5 = LINE_PLANNING / "Instances" / "original" / "dm.h5"
 
 REPO_BUNDLE_ROOT = REPO_ROOT / "experiments" / "original-generated"
 REPO_INSTANCES = REPO_BUNDLE_ROOT / "Instances"
@@ -57,8 +59,12 @@ INSTANCE_SPECS: List[Tuple[str, str, str]] = [
     ("april_fhv_1_percent", "OD_matrix_april_fhv_1_percent.txt", "all_lines_nodes_10_c5.txt"),
 ]
 
-# dm: shared area matrix next to ``original-generated`` (not copied — large file)
-DM_REL_TO_INSTANCE = "../original/dm.h5"
+def _dm_filepath_relative_to_instance_dir(inst_dir: Path, dm_file: Path) -> str:
+    """Relative path from ``inst_dir`` to ``dm_file`` (or absolute if on another drive)."""
+    try:
+        return Path(os.path.relpath(dm_file.resolve(), start=inst_dir.resolve())).as_posix()
+    except ValueError:
+        return str(dm_file.resolve())
 
 
 def _dump(path: Path, data: Dict[str, Any]) -> None:
@@ -67,12 +73,18 @@ def _dump(path: Path, data: Dict[str, Any]) -> None:
         yaml.dump(data, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
 
 
-def write_instance_bundle(instances_root: Path, stem: str, demand_name: str, lines_name: str) -> Path:
+def write_instance_bundle(
+    instances_root: Path,
+    stem: str,
+    demand_name: str,
+    lines_name: str,
+    dm_file: Path = CANONICAL_DM_H5,
+) -> Path:
     """
     Create ``instances_root/<stem>/`` with only the demand and candidate-lines
     files referenced by ``config.yaml`` (copied from repo ``test_data/``), plus
-    ``config.yaml`` itself. The distance matrix stays at ``dm_filepath`` outside
-    this folder (see ``DM_REL_TO_INSTANCE``).
+    ``config.yaml`` itself. ``dm_filepath`` is written relative to this folder
+    (typically ``../../original/dm.h5`` under ``Instances/original-generated/``).
     Returns path to config.yaml.
     """
     inst_dir = instances_root / stem
@@ -91,7 +103,7 @@ def write_instance_bundle(instances_root: Path, stem: str, demand_name: str, lin
     config = {
         "demand": {"filepath": f"./{demand_name}"},
         "lines": f"./{lines_name}",
-        "dm_filepath": DM_REL_TO_INSTANCE,
+        "dm_filepath": _dm_filepath_relative_to_instance_dir(inst_dir, dm_file),
     }
     config_path = inst_dir / "config.yaml"
     _dump(config_path, config)

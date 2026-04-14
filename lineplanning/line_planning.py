@@ -1294,6 +1294,7 @@ def run_experiment(experiment_config_path: Path) -> None:
     Run one line-planning experiment from a YAML file.
 
     The YAML must define ``instance`` (path to instance ``config.yaml``).
+    Preprocessing caches are written under ``<instance_config_directory>/preprocessing/``.
     Optional ``results_dir`` is the output directory for logs, exports, and metrics;
     if omitted, outputs go next to the experiment YAML. Optional ``mass_transport`` /
     ``solver`` blocks and optional ``budget`` (omit for an unconstrained ILP budget).
@@ -1324,12 +1325,13 @@ def run_experiment(experiment_config_path: Path) -> None:
     cost_coefficient = float(mt.get("cost_coefficient", 1))
     max_frequency = int(mt.get("max_frequency", 1))
 
+    preprocessing_dir = inst.config_path.parent / "preprocessing"
     line_inst = line_instance(
         candidate_lines_file=inst.lines_file,
         capacity=int(mt.get("capacity", 30)),
         maximum_detour=mt.get("maximum_detour", 3),
         demand_file=inst.demand_file,
-        results_dir=base_results_directory,
+        preprocessing_dir=preprocessing_dir,
         dm_file=inst.dm_file,
     )
 

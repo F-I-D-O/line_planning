@@ -482,7 +482,7 @@ line_inst = lineplanning.instance.line_instance(
     capacity=30,
     maximum_detour=3,
     demand_file=demand_file,
-    results_dir=results_dir_path,
+    preprocessing_dir=instance_dir / "preprocessing",
     dm_file=dm_file,
 )
 

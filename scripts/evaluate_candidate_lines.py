@@ -9,12 +9,13 @@ and histogram under a single run folder.
   (highest ``N`` among ``v_*`` children) already has this label, that folder is **reused**;
   otherwise ``N`` is one more than the max of folder indices and ``metrics.csv`` hints.
   Subfolders contain ``lines.txt``,
-  optional ``candidate_lines.gpkg``, ``preprocessing/*.csv`` (trip options cache),
-  histogram HTML, and ``.line_eval_complete`` when finished.
+  optional ``candidate_lines.gpkg``, histogram HTML, and ``.line_eval_complete`` when finished.
+  Trip-option preprocessing CSV caches live under **instance dir** ``preprocessing/`` (shared
+  across runs when demand, lines path, and detour match).
 
 **Idempotent behavior (no extra flags):**
-- If ``.line_eval_complete`` exists (or legacy: histogram plus preprocessing CSV or old
-  ``trip_options_preprocessing.csv``), exit without doing work.
+- If ``.line_eval_complete`` exists (or legacy: histogram plus preprocessing CSV for this run
+  under the instance ``preprocessing/`` folder, or old ``trip_options_preprocessing.csv``), exit without doing work.
 - If ``lines.txt`` exists, skip candidate line generation.
 - If a valid preprocessing CSV already exists for this demand / lines path / maximum detour,
   ``line_instance`` loads it (no recomputation).
@@ -201,14 +202,12 @@ def _parse_version_from_run_dir_name(name: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
-def _has_preprocessing_csv_in_run(run_dir: Path) -> bool:
-    pre = run_dir / "preprocessing"
-    if not pre.is_dir():
-        return False
-    return any(pre.glob("*.csv"))
-
-
-def _evaluation_complete(run_dir: Path) -> bool:
+def _evaluation_complete(
+    run_dir: Path,
+    instance_dir: Path,
+    demand_file: Path,
+    maximum_detour: int,
+) -> bool:
     if (run_dir / _EVAL_COMPLETE).is_file():
         return True
     hist = run_dir / "mt_vs_direct_histogram.html"
@@ -216,7 +215,14 @@ def _evaluation_complete(run_dir: Path) -> bool:
         return False
     if (run_dir / "trip_options_preprocessing.csv").is_file():
         return True
-    return _has_preprocessing_csv_in_run(run_dir)
+    candidate_lines = run_dir / "lines.txt"
+    cache_csv = preprocessing_csv_path(
+        instance_dir / "preprocessing",
+        demand_file,
+        candidate_lines,
+        maximum_detour,
+    )
+    return cache_csv.is_file()
 
 
 def _is_valid_mt_option(opt: TripOption) -> bool:
@@ -462,7 +468,7 @@ def main() -> None:
     run_dir, version_index = _resolve_run_dir_and_version(work_root, safe)
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    if _evaluation_complete(run_dir):
+    if _evaluation_complete(run_dir, instance_dir, demand_file, args.maximum_detour):
         logging.info(
             "Evaluation already complete for %s; skipping (delete histogram, preprocessing "
             "CSV under preprocessing/, and %s to redo).",
@@ -498,7 +504,10 @@ def main() -> None:
         logging.info("lines.txt exists at %s; skipping candidate line generation.", candidate_lines_file)
 
     cache_csv = preprocessing_csv_path(
-        run_dir, demand_file, candidate_lines_file, args.maximum_detour
+        instance_dir / "preprocessing",
+        demand_file,
+        candidate_lines_file,
+        args.maximum_detour,
     )
     if cache_csv.is_file():
         logging.info("Preprocessing cache present at %s; line_instance will load it if valid.", cache_csv)
@@ -510,7 +519,7 @@ def main() -> None:
         capacity=args.capacity,
         maximum_detour=args.maximum_detour,
         demand_file=demand_file,
-        results_dir=run_dir,
+        preprocessing_dir=instance_dir / "preprocessing",
         dm_file=dm_file,
     )
 

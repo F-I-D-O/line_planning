@@ -1,7 +1,7 @@
 """Jupyter-style script: Run Cell on each `# %%` region (VS Code / Cursor).
 
 Loads a ``line_instance`` (``lineplanning.instance``), which reads preprocessing
-from ``<results_dir>/preprocessing/*.csv`` when the cache exists (same as a normal
+from ``<instance_dir>/preprocessing/*.csv`` when the cache exists (same as a normal
 solve). For each request, compares total travel time of the **best** mass-transit
 option (min over candidate lines of first-mile + on-line + last-mile) to the
 **non-MT** option (direct O--D time stored on the synthetic last ``TripOption``).
@@ -32,10 +32,6 @@ INSTANCE_DIR = Path(
 )
 CANDIDATE_LINES_FILE = INSTANCE_DIR / "lines.txt"
 
-# Must match the preprocessing cache (same as line_planning / MoD-aware scripts)
-RESULTS_DIR = Path(
-    r"C:\Google Drive AIC\My Drive\AIC Experiment Data\Line Planning\Results\manhattan-2_h-10_percent\instance_01\mod-aware"
-)
 MAXIMUM_DETOUR = 3
 
 # If set, write interactive HTML; if None, skip
@@ -93,7 +89,7 @@ def _load_demand_and_dm_from_instance_config(instance_dir_path: Path) -> Tuple[P
     return demand_path, dm_path
 
 
-# %% Build instance (loads preprocessing cache under RESULTS_DIR / preprocessing)
+# %% Build instance (loads preprocessing cache under INSTANCE_DIR / preprocessing)
 
 
 demand_file, dm_file = _load_demand_and_dm_from_instance_config(INSTANCE_DIR)
@@ -103,7 +99,7 @@ line_inst = lineplanning.instance.line_instance(
     capacity=30,
     maximum_detour=MAXIMUM_DETOUR,
     demand_file=demand_file,
-    results_dir=RESULTS_DIR,
+    preprocessing_dir=INSTANCE_DIR / "preprocessing",
     dm_file=dm_file,
 )
 
