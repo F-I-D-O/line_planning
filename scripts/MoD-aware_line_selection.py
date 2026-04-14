@@ -486,7 +486,12 @@ line_inst = lineplanning.instance.line_instance(
     dm_file=dm_file,
 )
 
-solver = lineplanning.line_planning.LinePlanningSolver(line_inst)
+solver = lineplanning.line_planning.LinePlanningSolver(
+    line_inst,
+    time_limit=3600 * 24,
+    cost_coefficient=1.0,
+    max_frequency=max_frequency,
+)
 
 instance_size_label = lineplanning.line_planning.get_instance_size_label(demand_file)
 

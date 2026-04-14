@@ -4,7 +4,7 @@ Write self-contained instance directories + per-experiment directories.
 Instances (copied demand + lines from repo ``test_data/``, local config.yaml):
   C:\\...\\Line Planning\\Instances\\original-generated\\<instance_stem>\\
 
-Experiments (one folder each, ``experiment.yaml`` with ``mass_transport`` / ``solver`` and optional ``line_instance``, results_dir ``.``):
+Experiments (one folder each, ``experiment.yaml`` with ``mass_transport`` and ``solver``; ``results_dir`` omitted so outputs stay in that folder):
   C:\\...\\Line Planning\\Results\\original-generated\\<experiment_stem>\\
 
 If the Google Drive tree cannot be created, the same structure is written under
@@ -38,15 +38,13 @@ REPO_EXPERIMENTS = REPO_BUNDLE_ROOT / "Results"
 DEFAULT_MASS_TRANSPORT: Dict[str, Any] = {
     "capacity": 30,
     "maximum_detour": 3,
+    "cost_coefficient": 1,
+    "max_frequency": 1,
 }
-
-DEFAULT_LINE_INSTANCE: Dict[str, Any] = {}
 
 DEFAULT_SOLVER: Dict[str, Any] = {
     "method": "ilp",
-    "allowed_time": 86400,
-    "fixed_cost": 1,
-    "max_frequency": 1,
+    "time_limit": 86400,
 }
 
 # (directory name under original-generated, demand filename, lines filename)
@@ -104,35 +102,28 @@ def _experiment_yaml(
     *,
     instance_relpath: str,
     mass_transport: Optional[Dict[str, Any]] = None,
-    line_instance: Optional[Dict[str, Any]] = None,
     solver: Optional[Dict[str, Any]] = None,
     budget: Any = None,
 ) -> Dict[str, Any]:
-    li_merged = dict(
-        DEFAULT_LINE_INSTANCE if line_instance is None else {**DEFAULT_LINE_INSTANCE, **line_instance}
-    )
     out: Dict[str, Any] = {
         "instance": instance_relpath,
-        "results_dir": ".",
         "mass_transport": dict(
             DEFAULT_MASS_TRANSPORT if mass_transport is None else {**DEFAULT_MASS_TRANSPORT, **mass_transport}
         ),
         "solver": dict(DEFAULT_SOLVER if solver is None else {**DEFAULT_SOLVER, **solver}),
     }
-    if li_merged:
-        out["line_instance"] = li_merged
     if budget is not None:
         out["budget"] = budget
     return out
 
 
-def _clean_legacy_google_results_flat_layout(results_original_generated: Path) -> None:
-    """Remove previous single-folder layout (root *.yaml and ``instances/``)."""
+def _clean_stale_flat_results_layout(results_original_generated: Path) -> None:
+    """Remove obsolete flat layout under results (root *.yaml and ``instances/`` subfolder)."""
     if not results_original_generated.is_dir():
         return
-    legacy_inst = results_original_generated / "instances"
-    if legacy_inst.is_dir():
-        shutil.rmtree(legacy_inst, ignore_errors=True)
+    stale_inst = results_original_generated / "instances"
+    if stale_inst.is_dir():
+        shutil.rmtree(stale_inst, ignore_errors=True)
     for p in results_original_generated.glob("*.yaml"):
         try:
             p.unlink()
@@ -203,7 +194,7 @@ def main() -> int:
     try:
         GOOGLE_INSTANCES.mkdir(parents=True, exist_ok=True)
         GOOGLE_EXPERIMENTS.mkdir(parents=True, exist_ok=True)
-        _clean_legacy_google_results_flat_layout(GOOGLE_EXPERIMENTS)
+        _clean_stale_flat_results_layout(GOOGLE_EXPERIMENTS)
         write_bundle(GOOGLE_INSTANCES, GOOGLE_EXPERIMENTS)
         print(f"Wrote instances under {GOOGLE_INSTANCES}")
         print(f"Wrote experiments under {GOOGLE_EXPERIMENTS}")
@@ -211,7 +202,7 @@ def main() -> int:
         print(f"{GOOGLE_INSTANCES} / {GOOGLE_EXPERIMENTS}: {exc}", file=sys.stderr)
         REPO_INSTANCES.mkdir(parents=True, exist_ok=True)
         REPO_EXPERIMENTS.mkdir(parents=True, exist_ok=True)
-        _clean_legacy_google_results_flat_layout(REPO_EXPERIMENTS)
+        _clean_stale_flat_results_layout(REPO_EXPERIMENTS)
         write_bundle(REPO_INSTANCES, REPO_EXPERIMENTS)
         print(f"Wrote bundle under {REPO_BUNDLE_ROOT}", file=sys.stderr)
 

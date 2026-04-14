@@ -27,15 +27,7 @@ from lineplanning.instance_config import (
 )
 import lineplanning.log
 
-# Time limit for the Gurobi solver (overridden per run from experiment YAML)
-allowed_time = 3600 * 24
-
 EPS = 1.e-5
-
-fixed_cost = 1
-# Upper bound on per-route frequency y_ρ in the MoD-aware (route-aggregated) ILP (manuscript §4.1.1).
-# Legacy ILPs still replicate each route this many times as separate binary line variables.
-max_frequency = 1
 
 def get_instance_size_label(demand_file_path: Optional[str]) -> str:
     if demand_file_path:
@@ -59,34 +51,19 @@ VALID_SOLVER_METHODS = frozenset(
 
 
 def _resolve_solver_method(solver_cfg: Dict[str, Any]) -> str:
-    """
-    Return the canonical solver method string.
-
-    Supports legacy boolean flags (``run_proposed_method``, ``use_model_with_mod_costs``,
-    ``use_model_with_empty_trips``) when ``method`` is absent or null.
-    """
-    if "method" in solver_cfg:
-        raw = solver_cfg["method"]
-        if raw is None:
-            pass
-        elif isinstance(raw, str):
-            if raw in VALID_SOLVER_METHODS:
-                return raw
-            raise ValueError(
-                f"Unknown solver.method {raw!r}; expected one of {sorted(VALID_SOLVER_METHODS)}"
-            )
-        else:
-            raise ValueError(
-                f"solver.method must be a string (one of {sorted(VALID_SOLVER_METHODS)}), "
-                f"got {type(raw).__name__}: {raw!r}"
-            )
-    if solver_cfg.get("run_proposed_method"):
-        return "approximation"
-    if solver_cfg.get("use_model_with_mod_costs"):
-        return "ilp_with_mod_costs"
-    if solver_cfg.get("use_model_with_empty_trips"):
-        return "ilp_with_empty_trips"
-    return "ilp"
+    """Return ``solver.method``; must be a non-empty string in ``VALID_SOLVER_METHODS``."""
+    raw = solver_cfg.get("method")
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError(
+            f"solver.method is required and must be a non-empty string; "
+            f"expected one of {sorted(VALID_SOLVER_METHODS)}"
+        )
+    method = raw.strip()
+    if method not in VALID_SOLVER_METHODS:
+        raise ValueError(
+            f"Unknown solver.method {method!r}; expected one of {sorted(VALID_SOLVER_METHODS)}"
+        )
+    return method
 
 
 def _configure_run_logging(log_path: Path) -> logging.Handler:
@@ -101,9 +78,18 @@ def _configure_run_logging(log_path: Path) -> logging.Handler:
 
 class LinePlanningSolver:
 
-    def __init__(self, line_instance):
+    def __init__(
+        self,
+        line_instance,
+        time_limit: float = 3600 * 24,
+        cost_coefficient: float = 1.0,
+        max_frequency: int = 1,
+    ):
         self.line_instance = line_instance
-        self.line_count_total = self.line_instance.nb_lines * max_frequency
+        self.time_limit = float(time_limit)
+        self.cost_coefficient = float(cost_coefficient)
+        self.max_frequency = int(max_frequency)
+        self.line_count_total = self.line_instance.nb_lines * self.max_frequency
 
     def _export_used_lines(
         self,
@@ -120,7 +106,7 @@ class LinePlanningSolver:
                     activation = var.X
                     if activation > 0:
                         csv_file.write(
-                            f"{l // max_frequency},{(l % max_frequency) + 1},{line_costs[l]}\n"
+                            f"{l // self.max_frequency},{(l % self.max_frequency) + 1},{line_costs[l]}\n"
                         )
             logging.info("Exported used lines to %s", csv_path)
         except OSError as exc:
@@ -218,7 +204,7 @@ class LinePlanningSolver:
                     route_index = (
                         int(line_idx)
                         if line_var_is_route_index
-                        else line_idx // max_frequency
+                        else line_idx // self.max_frequency
                     )
                     line_repr = route_index
                     trip_option: TripOption = self.line_instance.optimal_trip_options[passenger_idx][route_index]
@@ -395,17 +381,17 @@ class LinePlanningSolver:
 
         sets = [] #set[j] stores the indices of passengers present in the set of index j
         lines_to_sets = []	# contains, for each line l', the indices of the active sets of passengers
-        for j in range(nb_lines * max_frequency):
+        for j in range(nb_lines * self.max_frequency):
             lines_to_sets.append([])
 
         # cost proportional to travel time on line
-        lines_cost = [fixed_cost * self.line_instance.lengths_travel_times[l//max_frequency] + l % max_frequency * self.line_instance.lengths_travel_times[l//max_frequency] for l in range(nb_lines * max_frequency)]
+        lines_cost = [self.cost_coefficient * self.line_instance.lengths_travel_times[l//self.max_frequency] + l % self.max_frequency * self.line_instance.lengths_travel_times[l//self.max_frequency] for l in range(nb_lines * self.max_frequency)]
 
-        passengers_to_sets = [[[] for l in range(nb_lines * max_frequency)] for p in range(nb_pass)] #for passenger index p and line l, contains the list of indices of sets including passenger p
+        passengers_to_sets = [[[] for l in range(nb_lines * self.max_frequency)] for p in range(nb_pass)] #for passenger index p and line l, contains the list of indices of sets including passenger p
 
         # generate initial sets with one passenger covered per line (if no passenger covered, add empty set)
         for l in range(len(lines_to_sets)):
-            route = l // max_frequency
+            route = l // self.max_frequency
             if len(self.line_instance.set_of_lines[route][1]) != 0:
                 p = self.line_instance.set_of_lines[route][1][0][0]
                 sets.append([p])
@@ -417,7 +403,7 @@ class LinePlanningSolver:
 
         lines_to_passengers = []
         for l in range(len(lines_to_sets)):
-            lines_to_passengers.append(self.line_instance.lines_to_passengers[l//max_frequency])
+            lines_to_passengers.append(self.line_instance.lines_to_passengers[l//self.max_frequency])
 
         covered_average = 0
         iter = 0
@@ -430,7 +416,7 @@ class LinePlanningSolver:
         x = {}
         for l in range(len(lines_to_sets)):
             for s in lines_to_sets[l]:
-                total_set_value = sum([self.line_instance.optimal_trip_options[p][l // max_frequency].value for p in sets[s]])
+                total_set_value = sum([self.line_instance.optimal_trip_options[p][l // self.max_frequency].value for p in sets[s]])
                 x[l,s] = master.addVar(lb=0.0, ub=GRB.INFINITY, vtype=GRB.CONTINUOUS, obj = total_set_value, name="x[%d][%d]"%(l,s))
         master.update()
 
@@ -479,7 +465,7 @@ class LinePlanningSolver:
 
         print('card L', len(lines_to_sets))
 
-        master.Params.timeLimit = allowed_time
+        master.Params.timeLimit = self.time_limit
 
         master.optimize()
 
@@ -493,7 +479,7 @@ class LinePlanningSolver:
         obj_temp = master.ObjVal
         lines_to_sets_temp = deepcopy(lines_to_sets)
 
-        while t_4 - t_2 <= allowed_time:
+        while t_4 - t_2 <= self.time_limit:
             t_0 = time.time()
             print('iteration', iter)
             iter += 1
@@ -515,8 +501,8 @@ class LinePlanningSolver:
             for l in range(len(lines_to_sets)):
                 if nb_new_lines <= max_nb_new_lines:
                     t_temp = time.time()
-                    f_l = l%max_frequency + 1
-                    length = self.line_instance.set_of_lines[l//max_frequency][0]
+                    f_l = l%self.max_frequency + 1
+                    length = self.line_instance.set_of_lines[l//self.max_frequency][0]
 
                     single_line = Model("SLP") #single line sub-problem
                     single_line.ModelSense = -1 #maximize
@@ -527,13 +513,13 @@ class LinePlanningSolver:
 
                     y = {}
                     for p in lines_to_passengers[l]:
-                        y[p] = single_line.addVar(obj=self.line_instance.optimal_trip_options[p][l // max_frequency].value - lamb[p], ub=1, vtype=GRB.BINARY, name="y[%d]" % p)
+                        y[p] = single_line.addVar(obj=self.line_instance.optimal_trip_options[p][l // self.max_frequency].value - lamb[p], ub=1, vtype=GRB.BINARY, name="y[%d]" % p)
                     single_line.update()
                     var = [y[p] for p in lines_to_passengers[l]]
 
                     for k in range(length):
                         coef = []
-                        edges_to_pass = self.line_instance.edge_to_passengers[l//max_frequency][k]
+                        edges_to_pass = self.line_instance.edge_to_passengers[l//self.max_frequency][k]
                         index = 0
                         for p in lines_to_passengers[l]:
                             if index < len(edges_to_pass) and edges_to_pass[index] == p:
@@ -568,7 +554,7 @@ class LinePlanningSolver:
                         col.addTerms(1, one_set_per_line[l])
                         col.addTerms(lines_cost[l], budget_constraint)
 
-                        total_set_value = sum([self.line_instance.optimal_trip_options[p][l // max_frequency].value for p in sets[s]])
+                        total_set_value = sum([self.line_instance.optimal_trip_options[p][l // self.max_frequency].value for p in sets[s]])
                         x[l,s] = master.addVar(lb=0.0, ub=GRB.INFINITY, vtype=GRB.CONTINUOUS, obj = total_set_value, name="x[%d][%d]"%(l,s), column = col)
                         t_update = time.time()
 
@@ -577,8 +563,8 @@ class LinePlanningSolver:
             master.update()
             t_3= time.time()
 
-            if t_3 - t_2 <= allowed_time:
-                master.Params.timeLimit = allowed_time - t_3 + t_2
+            if t_3 - t_2 <= self.time_limit:
+                master.Params.timeLimit = self.time_limit - t_3 + t_2
                 master.optimize()
                 if master.ObjVal > obj_temp:
                     for l in range(len(lines_to_sets)):
@@ -624,17 +610,17 @@ class LinePlanningSolver:
         bus_capacity = self.line_instance.capacity
 
         lines_cost = [
-            fixed_cost * self.line_instance.lengths_travel_times[l // max_frequency]
+            self.cost_coefficient * self.line_instance.lengths_travel_times[l // self.max_frequency]
             + l
-            % max_frequency
-            * self.line_instance.lengths_travel_times[l // max_frequency]
-            for l in range(line_count * max_frequency)
+            % self.max_frequency
+            * self.line_instance.lengths_travel_times[l // self.max_frequency]
+            for l in range(line_count * self.max_frequency)
         ]
 
         master = Model("LP") # master LP problem
         master.ModelSense = -1 # maximize the objective function
 
-        master.Params.timeLimit = allowed_time
+        master.Params.timeLimit = self.time_limit
 
         # Line variables
         y = {} # binary variable indicating if line l is opened
@@ -646,7 +632,7 @@ class LinePlanningSolver:
         x = {}
         for l in range(self.line_count_total):
             for p in range(request_count):
-                val = self.line_instance.optimal_trip_options[p][l // max_frequency].value
+                val = self.line_instance.optimal_trip_options[p][l // self.max_frequency].value
                 if val > 0:
                     x[l,p] = master.addVar(lb=0.0, ub=GRB.INFINITY, vtype=GRB.BINARY, obj = val, name="x[%d][%d]"%(l,p))
         master.update()
@@ -656,7 +642,7 @@ class LinePlanningSolver:
         for p in range(request_count):
             var = []
             for l in range(self.line_count_total):
-                val = self.line_instance.optimal_trip_options[p][l // max_frequency].value
+                val = self.line_instance.optimal_trip_options[p][l // self.max_frequency].value
                 if val > 0:
                     var.append(x[l,p])
             coef = [1 for j in range(len(var))]
@@ -666,12 +652,12 @@ class LinePlanningSolver:
         # Bus capacity constraints
         capacity_constraints = {}
         for l in range(self.line_count_total):
-            f_l = l%max_frequency + 1
-            length = self.line_instance.set_of_lines[l//max_frequency][0]
+            f_l = l%self.max_frequency + 1
+            length = self.line_instance.set_of_lines[l//self.max_frequency][0]
             for k in range(length):
                 var = []
                 coef = []
-                for p in self.line_instance.edge_to_passengers[l//max_frequency][k]:
+                for p in self.line_instance.edge_to_passengers[l//self.max_frequency][k]:
                     var.append(x[l,p])
                     coef.append(1)
                 capacity_constraints[l,k] = master.addConstr(LinExpr(coef,var) <= bus_capacity * f_l * y[l], name="capacity_constraints[%d][%d]"%(l,k))
@@ -737,7 +723,7 @@ class LinePlanningSolver:
         master = Model("Modified ILP") # master LP problem
         master.ModelSense = -1 # maximize the objective function
 
-        master.Params.timeLimit = allowed_time
+        master.Params.timeLimit = self.time_limit
 
         # binary variables indicating if line l is opened
         line_vars = master.addVars(self.line_count_total, vtype=GRB.BINARY, name="y")
@@ -746,7 +732,7 @@ class LinePlanningSolver:
         # higher than the no_MT MoD cost, the line-passenger combination is not considered at all
         potential_line_passenger_combinations = [
             (l, p) for l in range(self.line_count_total) for p in range(request_count)
-            if self.line_instance.optimal_trip_options[p][l // max_frequency].value > 0
+            if self.line_instance.optimal_trip_options[p][l // self.max_frequency].value > 0
         ]
         passenger_vars = master.addVars(potential_line_passenger_combinations, vtype=GRB.BINARY, obj=1, name="x")
         # add no MT variables for each passenger
@@ -762,29 +748,29 @@ class LinePlanningSolver:
         # Bus capacity constraints
         capacity_constraints = {}
         for l in range(self.line_count_total):
-            f_l = l%max_frequency + 1
-            length = self.line_instance.set_of_lines[l//max_frequency][0]
+            f_l = l%self.max_frequency + 1
+            length = self.line_instance.set_of_lines[l//self.max_frequency][0]
             for k in range(length):
                 vars = []
                 coefs = []
-                for p in self.line_instance.edge_to_passengers[l//max_frequency][k]:
+                for p in self.line_instance.edge_to_passengers[l//self.max_frequency][k]:
                     vars.append(passenger_vars[l,p])
                     coefs.append(1)
                 capacity_constraints[l,k] = master.addConstr(LinExpr(coefs,vars) <= bus_capacity * f_l * line_vars[l], name="capacity_constraints[%d][%d]"%(l,k))
 
         # Budget constraint
         line_costs = [
-            fixed_cost * self.line_instance.lengths_travel_times[l // max_frequency]
+            self.cost_coefficient * self.line_instance.lengths_travel_times[l // self.max_frequency]
             + l
-            % max_frequency
-            * self.line_instance.lengths_travel_times[l // max_frequency]
+            % self.max_frequency
+            * self.line_instance.lengths_travel_times[l // self.max_frequency]
             for l in range(self.line_count_total)
         ]
         line_costs_expression = line_vars.prod(line_costs)
         mod_costs = {}
         for p in range(request_count):
             for l in range(self.line_count_total + 1):
-                optimal_trip_option: TripOption = self.line_instance.optimal_trip_options[p][l // max_frequency]
+                optimal_trip_option: TripOption = self.line_instance.optimal_trip_options[p][l // self.max_frequency]
                 mod_costs[l,p] = optimal_trip_option.first_mile_cost + optimal_trip_option.last_mile_cost
         mod_cost_expression = passenger_vars.prod(mod_costs)
         master.addConstr(line_costs_expression + mod_cost_expression <= self.line_instance.B, name="budget_constraint")
@@ -842,17 +828,17 @@ class LinePlanningSolver:
 
         Objective: min sum_r f̃tc(τ^MoD_r) x^MoD_r + sum_{ρ,r} f̃tc(τ*_{ρr}) x_{ρr}
                     + sum_ρ (∑_{e∈ρ} c_e) y_ρ
-        with ∑_{e∈ρ} c_e approximated by fixed_cost · lengths_travel_times[ρ].
+        with ∑_{e∈ρ} c_e approximated by cost_coefficient · lengths_travel_times[ρ].
 
         Constraints: one option per request; edge capacity sum_{r: e∈ρ_{ρr}} x_{ρr} ≤ C_MT y_ρ;
-        0 ≤ y_ρ ≤ max_route_frequency (defaults to module ``line_planning.max_frequency``).
+        0 ≤ y_ρ ≤ max_route_frequency (when omitted, the solver's route-frequency cap applies).
 
         Returns:
             objective value, wall-clock seconds, selected route indices, request assignments,
-            line objective term (sum_ρ fixed_cost·length·y_ρ), MoD objective term (passenger mod costs).
+            line objective term (sum_ρ cost_coefficient·length·y_ρ), MoD objective term (passenger mod costs).
             The last two entries are None if the objective could not be decomposed from the solution.
         """
-        freq_ub = max_route_frequency if max_route_frequency is not None else max_frequency
+        freq_ub = max_route_frequency if max_route_frequency is not None else self.max_frequency
 
         nb_lines = self.line_instance.nb_lines
         request_count = self.line_instance.nb_pass
@@ -862,10 +848,10 @@ class LinePlanningSolver:
         master = Model("MoD-aware ILP")
         master.ModelSense = GRB.MINIMIZE
 
-        master.Params.timeLimit = allowed_time
+        master.Params.timeLimit = self.time_limit
 
         per_route_mt_cost_coeff = [
-            fixed_cost * self.line_instance.lengths_travel_times[rho] for rho in range(nb_lines)
+            self.cost_coefficient * self.line_instance.lengths_travel_times[rho] for rho in range(nb_lines)
         ]
 
         frequency_vars = master.addVars(
@@ -1016,7 +1002,7 @@ class LinePlanningSolver:
         master = Model("ILP with empty trips") # master LP problem
         master.ModelSense = -1 # maximize the objective function
 
-        master.Params.timeLimit = allowed_time
+        master.Params.timeLimit = self.time_limit
 
         # VARIABLES
         # binary variables indicating if line l is opened
@@ -1026,7 +1012,7 @@ class LinePlanningSolver:
         # higher than the no_MT MoD cost, the line-passenger combination is not considered at all
         potential_line_passenger_combinations = [
             (l, p) for l in range(self.line_count_total) for p in range(request_count)
-            if self.line_instance.optimal_trip_options[p][l // max_frequency].value > 0
+            if self.line_instance.optimal_trip_options[p][l // self.max_frequency].value > 0
         ]
         passenger_vars = master.addVars(potential_line_passenger_combinations, vtype=GRB.BINARY, obj=1, name="x")
         # add no MT variables for each passenger
@@ -1050,7 +1036,7 @@ class LinePlanningSolver:
             used_nodes.add(request_to)
             for l in range(self.line_count_total):
                 if (l, p) in passenger_vars:
-                    optimal_trip_option: TripOption = self.line_instance.optimal_trip_options[p][l // max_frequency]
+                    optimal_trip_option: TripOption = self.line_instance.optimal_trip_options[p][l // self.max_frequency]
                     mt_pickup_node = optimal_trip_option.mt_pickup_node
                     mt_drop_off_node = optimal_trip_option.mt_drop_off_node
                     used_nodes.add(mt_pickup_node)
@@ -1092,12 +1078,12 @@ class LinePlanningSolver:
         logging.info("Building capacity constraints")
         capacity_constraints = {}
         for l in range(self.line_count_total):
-            f_l = l%max_frequency + 1
-            length = self.line_instance.set_of_lines[l//max_frequency][0]
+            f_l = l%self.max_frequency + 1
+            length = self.line_instance.set_of_lines[l//self.max_frequency][0]
             for k in range(length):
                 vars = []
                 coefs = []
-                for p in self.line_instance.edge_to_passengers[l//max_frequency][k]:
+                for p in self.line_instance.edge_to_passengers[l//self.max_frequency][k]:
                     vars.append(passenger_vars[l,p])
                     coefs.append(1)
                 capacity_constraints[l,k] = master.addConstr(LinExpr(coefs,vars) <= bus_capacity * f_l * line_vars[l], name="capacity_constraints[%d][%d]"%(l,k))
@@ -1105,10 +1091,10 @@ class LinePlanningSolver:
         # Budget constraint
         logging.info("Building budget constraint")
         line_costs = [
-            fixed_cost * self.line_instance.lengths_travel_times[l // max_frequency]
+            self.cost_coefficient * self.line_instance.lengths_travel_times[l // self.max_frequency]
             + l
-            % max_frequency
-            * self.line_instance.lengths_travel_times[l // max_frequency]
+            % self.max_frequency
+            * self.line_instance.lengths_travel_times[l // self.max_frequency]
             for l in range(self.line_count_total)
         ]
         line_costs_expression = line_vars.prod(line_costs)
@@ -1189,7 +1175,7 @@ class LinePlanningSolver:
         nb_lines = self.line_instance.nb_lines
         capacity = self.line_instance.capacity
 
-        lines_cost = [fixed_cost * self.line_instance.lengths_travel_times[l//max_frequency] + l % max_frequency * self.line_instance.lengths_travel_times[l//max_frequency] for l in range(nb_lines * max_frequency)]
+        lines_cost = [self.cost_coefficient * self.line_instance.lengths_travel_times[l//self.max_frequency] + l % self.max_frequency * self.line_instance.lengths_travel_times[l//self.max_frequency] for l in range(nb_lines * self.max_frequency)]
 
         values = [0 for p in range(self.line_instance.nb_pass)] #store the value we will get of passengers after the aggregation step
 
@@ -1210,8 +1196,8 @@ class LinePlanningSolver:
             if final_set_index: #if final_set_index is false, the line is not opened
                 passenger_assignment.append([])
                 for p in sets[final_set_index]: #for the passengers in the set of index final_set_index
-                    if optimal_trip_options[p][l//max_frequency].value > values[p]: #if I could get more value by reassigning passenger p to line l
-                        values[p] = optimal_trip_options[p][l//max_frequency].value
+                    if optimal_trip_options[p][l//self.max_frequency].value > values[p]: #if I could get more value by reassigning passenger p to line l
+                        values[p] = optimal_trip_options[p][l//self.max_frequency].value
                         passenger_assignment[len(passenger_assignment)-1].append([p,values[p]])
 
                 used_budget += lines_cost[l] #Add costs if line is opened
@@ -1265,8 +1251,8 @@ class LinePlanningSolver:
                     pass_ass = passenger_assignment
                     op = [
                         [
-                            opened_lines[l] // max_frequency,
-                            opened_lines[l] % max_frequency,
+                            opened_lines[l] // self.max_frequency,
+                            opened_lines[l] % self.max_frequency,
                         ]
                         for l in range(len(opened_lines))
                     ]  # contains [l,f_l] for the lines l opened with frequency f_l
@@ -1307,14 +1293,18 @@ def run_experiment(experiment_config_path: Path) -> None:
     """
     Run one line-planning experiment from a YAML file.
 
-    The YAML must define ``instance`` (path to instance ``config.yaml``),
-    ``results_dir``, optional ``mass_transport`` / ``line_instance`` / ``solver`` blocks, and
-    optional ``budget`` (omit for an unconstrained ILP budget).
+    The YAML must define ``instance`` (path to instance ``config.yaml``).
+    Optional ``results_dir`` is the output directory for logs, exports, and metrics;
+    if omitted, outputs go next to the experiment YAML. Optional ``mass_transport`` /
+    ``solver`` blocks and optional ``budget`` (omit for an unconstrained ILP budget).
+
+    ``mass_transport.cost_coefficient`` scales line operating cost in the ILP (default ``1``).
+    ``mass_transport.max_frequency`` is the per-route replication / frequency cap (default ``1``).
 
     The ``solver`` block must set ``method`` to exactly one of:
     ``approximation``, ``ilp``, ``ilp_with_mod_costs``, ``ilp_with_empty_trips``, ``non_budget_ilp``.
-    Legacy boolean flags (``run_proposed_method``, ``use_model_with_mod_costs``,
-    ``use_model_with_empty_trips``) are still accepted when ``method`` is omitted.
+    Optional ``solver.time_limit`` (seconds) is passed to ``LinePlanningSolver`` (Gurobi time limit;
+    default ``86400``).
 
     For ``method: approximation``, optional ``solver.approximation_subproblem_method`` (int)
     sets Gurobi ``Method`` on each column-generation sub-MIP (omit or ``0`` for default).
@@ -1325,19 +1315,14 @@ def run_experiment(experiment_config_path: Path) -> None:
     inst = load_line_planning_instance_config(inst_path)
     base_results_directory = resolve_results_dir(experiment_config_path, exp)
 
-    global allowed_time, fixed_cost, max_frequency
-
     solver_cfg = exp.get("solver") or {}
-    allowed_time = float(solver_cfg.get("allowed_time", 3600 * 24))
-    fixed_cost = int(solver_cfg.get("fixed_cost", 1))
-    max_frequency = int(solver_cfg.get("max_frequency", 1))
+    time_limit = float(solver_cfg.get("time_limit", 3600 * 24))
 
     solver_method = _resolve_solver_method(solver_cfg)
 
     mt = dict(exp.get("mass_transport") or {})
-    li = dict(exp.get("line_instance") or {})
-    li.pop("granularity", None)
-    legacy_sub_mip_method = li.pop("method", None)
+    cost_coefficient = float(mt.get("cost_coefficient", 1))
+    max_frequency = int(mt.get("max_frequency", 1))
 
     line_inst = line_instance(
         candidate_lines_file=inst.lines_file,
@@ -1351,24 +1336,24 @@ def run_experiment(experiment_config_path: Path) -> None:
     budget = _parse_optional_budget(exp.get("budget"))
 
     instance_size_label = get_instance_size_label(str(inst.demand_file))
-    method_slug = solver_method
     base_results_directory.mkdir(parents=True, exist_ok=True)
 
     if budget is not None:
-        budget_slug = int(budget) if float(budget).is_integer() else budget
-        method_directory = base_results_directory / f"budget_{budget_slug}" / method_slug
         line_inst.B = budget * 0.95
     else:
-        method_directory = base_results_directory / method_slug
         line_inst.B = GRB.INFINITY
 
     candidate_set_of_lines = line_inst.candidate_set_of_lines
     logging.info("Loaded %d candidate routes.", len(candidate_set_of_lines))
-    solver = LinePlanningSolver(line_inst)
+    solver = LinePlanningSolver(
+        line_inst,
+        time_limit=time_limit,
+        cost_coefficient=cost_coefficient,
+        max_frequency=max_frequency,
+    )
 
-    method_directory.mkdir(parents=True, exist_ok=True)
-    run_log_path = method_directory / "run.log"
-    gurobi_log_path = method_directory / "gurobi.log"
+    run_log_path = base_results_directory / "run.log"
+    gurobi_log_path = base_results_directory / "gurobi.log"
     log_handler = _configure_run_logging(run_log_path)
     obj_val: Union[float, int] = 0.0
     run_time_sec = 0.0
@@ -1377,7 +1362,7 @@ def run_experiment(experiment_config_path: Path) -> None:
     try:
         if solver_method == "approximation":
             prop_budget = float("inf") if budget is None else float(budget)
-            raw_sub_mip = solver_cfg.get("approximation_subproblem_method", legacy_sub_mip_method)
+            raw_sub_mip = solver_cfg.get("approximation_subproblem_method")
             gurobi_subproblem_method = int(raw_sub_mip) if raw_sub_mip is not None else None
             logging.info("Running solver.method=approximation (budget cap for rounding=%s)", prop_budget)
             best_value, budg, op, v, nb_respect, mean, execution_time = solver.execute_proposed_method(
@@ -1401,21 +1386,21 @@ def run_experiment(experiment_config_path: Path) -> None:
                 obj_val, run_time_sec = solver.solve_modified_ILP(
                     export_model=True,
                     export_solution=True,
-                    output_dir=method_directory,
+                    output_dir=base_results_directory,
                     gurobi_log_file=gurobi_log_path,
                 )
             elif solver_method == "ilp_with_empty_trips":
                 obj_val, run_time_sec = solver.solve_ILP_with_empty_trips(
                     export_model=True,
                     export_solution=True,
-                    output_dir=method_directory,
+                    output_dir=base_results_directory,
                     gurobi_log_file=gurobi_log_path,
                 )
             else:
                 obj_val, run_time_sec = solver.solve_ILP(
                     export_model=True,
                     export_solution=True,
-                    output_dir=method_directory,
+                    output_dir=base_results_directory,
                     gurobi_log_file=gurobi_log_path,
                 )
         elif solver_method == "non_budget_ilp":
@@ -1430,7 +1415,7 @@ def run_experiment(experiment_config_path: Path) -> None:
             ) = solver.solve_MoD_aware_ILP(
                 export_model=True,
                 export_solution=True,
-                output_dir=method_directory,
+                output_dir=base_results_directory,
                 gurobi_log_file=gurobi_log_path,
             )
         else:
@@ -1455,7 +1440,7 @@ def run_experiment(experiment_config_path: Path) -> None:
         results_payload["mod_objective_component"] = mod_obj_component
     if budget is not None:
         results_payload["budget"] = budget
-    results_file = method_directory / "metrics.json"
+    results_file = base_results_directory / "metrics.json"
     results_file.write_text(json.dumps(results_payload, indent=2))
 
 
@@ -1466,7 +1451,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "experiment_config",
         type=Path,
-        help="Path to experiment YAML (must set 'instance' and 'results_dir').",
+        help="Path to experiment YAML (must set 'instance'; optional 'results_dir').",
     )
     args = parser.parse_args()
     run_experiment(args.experiment_config)

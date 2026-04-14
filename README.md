@@ -1,4 +1,4 @@
-This repository contains line planning code for the MoD-aware line selection problem. Some of the code for candidate line generation and line planning is based on the paper: 'Real-Time Approximate Routing for Smart Transit Systems' URL: https://arxiv.org/abs/2103.06212
+This repository contains line planning code for the MoD-aware line selection problem. Some of the code for candidate line generation and line planning is based on the paper: 'Real-Time Approximate Routing for Smart Transit Systems' URL: <https://arxiv.org/abs/2103.06212>
 
 
 
@@ -12,7 +12,7 @@ Both results and instance configurations are `yaml` files, with same structure a
 
 ## Instance Files
 
-### New cofiguration fields
+### New configuration fields
 
 - `lines`: path to the candidate-lines file.
 
@@ -23,20 +23,25 @@ Candidate lines files are text files where each line represents a single candida
 
 ## Experiment Files
 
-### New cofiguration fields
+### New configuration fields
 
-- `mass_transport`: object collecting mass transport configuration.
-    - `capacity`: the capacity of the MT vehicle.
-    - `maximum_detour`: the maximum detour for a passenger of the MT vehicle over the shortest path. Trip options with a detour greater than this value are not considered. It is a relative value greater than 1, i.e. a value of 1.5 means that the passenger is allowed to be 50% longer than the shortest path.
+- `mass_transport`: mass transit model parameters.
+    - `capacity`: capacity of the MT vehicle.
+    - `maximum_detour`: maximum detour for a passenger on MT over the shortest path. Trip options with a detour greater than this value are not considered. It is a relative value greater than 1, i.e. a value of 1.5 means that the passenger is allowed to be 50% longer than the shortest path.
+    - `cost_coefficient`: scales line operating cost in the ILP (default `1`). Line cost terms use this coefficient times route length (and frequency where applicable).
+    - `max_frequency`: maximum per-route frequency / replication cap for the budgeted ILP formulations (default `1`).
 
-- `solver`: object with at least ``method`` (exactly one of the following strings; only that solver path runs):
-    - ``approximation``: column-generation + randomized rounding (optional ``approximation_subproblem_method``: Gurobi ``Method`` for each sub-MIP, omit or ``0`` for default).
-    - ``ilp``: budgeted line-planning ILP (baseline).
-    - ``ilp_with_mod_costs``: ILP with MoD cost model (stage 1).
-    - ``ilp_with_empty_trips``: ILP with empty-vehicle trips (stage 2).
-    - ``non_budget_ilp``: MoD-aware route-aggregated ILP without a line budget (same formulation as in ``scripts/MoD-aware_line_selection.py``).
+- `solver`: solver driver configuration.
+    - `method` (required): one of `approximation`, `ilp`, `ilp_with_mod_costs`, `ilp_with_empty_trips`, `non_budget_ilp`.
+    - `time_limit` (seconds): Gurobi time limit (default `86400`).
+    - `approximation_subproblem_method` (optional int): Gurobi `Method` for each column-generation sub-MIP when `method` is `approximation`; omit or `0` for default.
 
+- `budget` (optional): budget for the line-planning ILP. Depending on the solution method, MT only or both MT and MoD are restricted by this budget.
 
+Supported `solver.method` values:
 
-
-
+- `approximation`: column-generation + randomized rounding.
+- `ilp`: budgeted line-planning ILP (baseline).
+- `ilp_with_mod_costs`: ILP with MoD cost model (stage 1).
+- `ilp_with_empty_trips`: ILP with empty-vehicle trips (stage 2).
+- `non_budget_ilp`: MoD-aware route-aggregated ILP without a line budget (same formulation as in `scripts/MoD-aware_line_selection.py`).

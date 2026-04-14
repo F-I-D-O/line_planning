@@ -42,7 +42,7 @@ def load_line_planning_instance_config(config_path: Path) -> LinePlanningInstanc
     Parse ``config_path`` (YAML) and return resolved paths.
 
     Required / expected keys:
-    - ``demand`` mapping with ``filepath`` (DARP style), or a string ``demand`` path (legacy).
+    - ``demand`` mapping with ``filepath`` (DARP style), or a string path as ``demand``.
     - ``lines``: path to the candidate-lines text file.
     - ``dm_filepath`` and/or ``area_dir`` so a distance matrix can be resolved.
     """
@@ -143,10 +143,17 @@ def resolve_instance_config_path(experiment_path: Path, experiment: Mapping[str,
 
 
 def resolve_results_dir(experiment_path: Path, experiment: Mapping[str, Any]) -> Path:
+    """
+    Resolve the directory where experiment outputs (logs, exports, metrics) are written.
+
+    If ``results_dir`` is absent or empty, returns the directory containing the
+    experiment YAML file.
+    """
+    experiment_path = experiment_path.resolve()
     rd = experiment.get("results_dir")
-    if not rd:
-        raise ValueError(f"{experiment_path}: missing required key 'results_dir'.")
-    p = Path(str(rd))
+    if rd is None or (isinstance(rd, str) and not rd.strip()):
+        return experiment_path.parent.resolve()
+    p = Path(str(rd).strip())
     if p.is_absolute():
         return p.resolve()
     return (experiment_path.parent / p).resolve()
