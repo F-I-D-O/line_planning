@@ -23,7 +23,7 @@ and histogram under a single run folder.
 **Metrics "best" MT option:** minimizes ``first_mile + last_mile`` (ignores ``mt_cost``).
 
 **Histogram:** same criterion — best MT by minimum ``first_mile + last_mile`` vs direct OD time
-in ``opts[-1].first_mile_cost``.
+in ``direct_trip_options[p].first_mile_cost``.
 """
 
 from __future__ import annotations
@@ -252,14 +252,9 @@ def _compute_metrics_row(
     mean_direct_vals: list[float] = []
 
     for p in range(inst.nb_pass):
-        opts = inst.optimal_trip_options[p]
-        if len(opts) < 2:
-            raise ValueError(f"Passenger {p}: expected MT rows and synthetic no-MT row")
+        direct = float(inst.direct_trip_options[p].first_mile_cost)
 
-        direct = float(opts[-1].first_mile_cost)
-
-        mt_rows = opts[:-1]
-        valid = [o for o in mt_rows if _is_valid_mt_option(o)]
+        valid = [o for o in inst.optimal_trip_options[p].values() if _is_valid_mt_option(o)]
         if not valid:
             n_no_valid_mt += 1
             continue
@@ -332,12 +327,8 @@ def _histogram_percent_diffs(inst: line_instance) -> list[float]:
     """Same selection as plot_mt_vs_direct_cost_histogram.py (min FM+LM among valid MT)."""
     percent_diffs: list[float] = []
     for p in range(inst.nb_pass):
-        opts = inst.optimal_trip_options[p]
-        if len(opts) < 2:
-            raise ValueError(f"Passenger {p}: expected at least one MT row and one no-MT row")
-        direct = float(opts[-1].first_mile_cost)
-        mt_rows = opts[:-1]
-        valid = [o for o in mt_rows if _is_valid_mt_option(o)]
+        direct = float(inst.direct_trip_options[p].first_mile_cost)
+        valid = [o for o in inst.optimal_trip_options[p].values() if _is_valid_mt_option(o)]
         if not valid:
             continue
         best_mt = min(_mod_cost(o) for o in valid)

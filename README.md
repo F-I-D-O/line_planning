@@ -38,6 +38,8 @@ Computed trip-option preprocessing (CSV) is stored under a ``preprocessing`` fol
     - `method` (required): one of `approximation`, `ilp`, `ilp_with_mod_costs`, `ilp_with_empty_trips`, `non_budget_ilp`.
     - `time_limit` (seconds): Gurobi time limit (default `86400`).
     - `approximation_subproblem_method` (optional int): Gurobi `Method` for each column-generation sub-MIP when `method` is `approximation`; omit or `0` for default.
+    - `rejection_cost`: cost of rejecting a passenger. Applicable only when `method` is `non_budget_ilp`. Default is 0, which means that all passengers must be served.
+    - `use_request_line_valid_inequalities`: if true, add valid linking inequalities `x_{\rho r} \leq y_\rho` for each route ρ and request r (only when `method` is `non_budget_ilp`). Default is false.
 
 - `budget` (optional): budget for the line-planning ILP. Depending on the solution method, MT only or both MT and MoD are restricted by this budget.
 

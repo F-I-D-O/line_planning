@@ -5,11 +5,10 @@ import re
 import hashlib
 from copy import deepcopy
 from pathlib import Path
-from typing import NamedTuple, Optional, List, Tuple
+from typing import Dict, NamedTuple, Optional, List, Tuple
 
 import numpy as np
 import pandas as pd
-from pandas.io.sas.sas_constants import dataset_length
 
 from tqdm import tqdm
 
@@ -109,6 +108,76 @@ def preprocessing_csv_path(
     return cache_dir / filename
 
 
+def line_mod_aggregate_prune_csv_path(
+    base_preprocessing_csv: Path,
+    cost_coefficient: float,
+    rejection_cost: Optional[float] = None,
+) -> Path:
+    """
+    Path to the trip-options CSV after ``line mod aggregate`` pruning (see
+    :func:`prune_trip_options_line_mod_aggregate`). The hash includes the base cache path
+    and cost coefficient so changing either selects a distinct cache file.
+    """
+    base = Path(base_preprocessing_csv).resolve()
+    rej_key = "none" if rejection_cost is None else repr(float(rejection_cost))
+    key = f"{base}|line_mod_agg_prune_v2|cc={cost_coefficient!r}|rej={rej_key}"
+    short_hash = hashlib.md5(key.encode()).hexdigest()[:12]
+    return base.with_name(f"{base.stem}_modagg_pruned_{short_hash}.csv")
+
+
+def prune_trip_options_line_mod_aggregate(
+    optimal_trip_options: List[Dict[int, TripOption]],
+    direct_trip_options: List[TripOption],
+    nb_lines: int,
+    line_opening_costs: List[float],
+    rejection_cost: Optional[float] = None,
+) -> Tuple[List[Dict[int, TripOption]], List[int]]:
+    """
+    For each line ρ, let P_ρ be passengers with a trip option on ρ. If
+    ``sum_{p in P_ρ} (fm + lm) + line_cost[ρ] > sum_{p in P_ρ} baseline[p]``,
+    remove all trip options on ρ.
+
+    ``line_opening_costs[ρ]`` should match ILP line cost at frequency 1, e.g.
+    ``cost_coefficient * lengths_travel_times[ρ]``.
+
+    If ``rejection_cost`` is set and positive, baseline[p] is
+    ``min(direct_cost[p], rejection_cost)``; otherwise baseline[p] is direct_cost[p].
+    """
+    rej = None
+    if rejection_cost is not None:
+        try:
+            rej_val = float(rejection_cost)
+        except (TypeError, ValueError):
+            rej_val = 0.0
+        if rej_val > 0:
+            rej = rej_val
+
+    removed_routes: List[int] = []
+    for rho in range(nb_lines):
+        ps = [p for p in range(len(optimal_trip_options)) if rho in optimal_trip_options[p]]
+        if not ps:
+            continue
+        sum_mod = sum(
+            float(optimal_trip_options[p][rho].first_mile_cost)
+            + float(optimal_trip_options[p][rho].last_mile_cost)
+            for p in ps
+        )
+        if rej is None:
+            sum_direct = sum(float(direct_trip_options[p].first_mile_cost) for p in ps)
+        else:
+            sum_direct = sum(min(float(direct_trip_options[p].first_mile_cost), rej) for p in ps)
+        lc = float(line_opening_costs[rho])
+        if sum_mod + lc > sum_direct:
+            removed_routes.append(rho)
+
+    remove_set = set(removed_routes)
+    pruned: List[Dict[int, TripOption]] = [
+        {rho: opt for rho, opt in by_line.items() if rho not in remove_set}
+        for by_line in optimal_trip_options
+    ]
+    return pruned, removed_routes
+
+
 class line_instance:
 
     # This class represents abstract instance of the line planning problem, which do not require to know the geometry of the underlying network.
@@ -124,14 +193,18 @@ class line_instance:
         maximum_detour=None,
         demand_file=None,
         preprocessing_dir=None,
-        dm_file=None
+        dm_file=None,
+        line_mod_aggregate_prune: bool = False,
+        line_mod_aggregate_prune_cost_coefficient: float = 1.0,
+        line_mod_aggregate_prune_rejection_cost: Optional[float] = None,
     ):
         self.B = None
         self.candidate_set_of_lines = None  # candidate_set_of_lines[l] contains the nodes served by line l (only useful when building instance from real network)
         self.lengths_travel_times = None  # used only for the manhattan instance
         self.capacity = capacity
         self.demand_file = demand_file
-        self.optimal_trip_options: List[List[TripOption]] = []
+        self.optimal_trip_options: List[Dict[int, TripOption]] = []
+        self.direct_trip_options: List[TripOption] = []
         self.dm: Optional[np.ndarray] = None  # dm.
         self.edge_to_passengers: Optional[List[List[List[int]]]] = None
         if preprocessing_dir is not None:
@@ -142,6 +215,13 @@ class line_instance:
             self.preprocessing_dir = Path(candidate_lines_file).parent / "preprocessing"
         self.dm_file = Path(dm_file) if dm_file is not None else Path("dm.h5")
         self.nb_pass: Optional[int] = None
+        self._line_mod_aggregate_prune = bool(line_mod_aggregate_prune)
+        self._line_mod_aggregate_prune_cost_coefficient = float(line_mod_aggregate_prune_cost_coefficient)
+        self._line_mod_aggregate_prune_rejection_cost = (
+            None
+            if line_mod_aggregate_prune_rejection_cost is None
+            else float(line_mod_aggregate_prune_rejection_cost)
+        )
 
         # Store candidate line file path
         self.candidate_line_file = Path(candidate_lines_file)
@@ -159,6 +239,7 @@ class line_instance:
             self.set_of_lines,
             self.pass_to_lines,
             self.optimal_trip_options,
+            self.direct_trip_options,
             self.lines_to_passengers,
             self.edge_to_passengers,
             self.candidate_set_of_lines,
@@ -201,27 +282,43 @@ class line_instance:
         "mt_cost",
     ]
 
+    def trip_option_on_line(self, passenger_idx: int, line_idx: int) -> Optional[TripOption]:
+        """Feasible mass-transit option for (passenger, candidate line), or None if infeasible."""
+        return self.optimal_trip_options[passenger_idx].get(line_idx)
+
+    def trip_value_on_line(self, passenger_idx: int, line_idx: int) -> float:
+        opt = self.trip_option_on_line(passenger_idx, line_idx)
+        return float(opt.value) if opt is not None else 0.0
+
     def _aggregates_from_line_trip_options(
         self,
-        optimal_trip_options_per_line: List[List[TripOption]],
+        optimal_trip_options_per_line: List[Dict[int, TripOption]],
         candidate_set_of_lines,
         nb_pass: int,
         nb_lines: int,
     ) -> Tuple[list, list, list, List[List[List[int]]]]:
         """
         Build set_of_lines, pass_to_lines, lines_to_passengers, edge_to_passengers from
-        per-line trip options only (no synthetic no-MT row), matching preprocessing().
+        feasible per-line trip options only (no direct / no-MT row).
         """
-        pass_to_lines = [list(range(nb_lines)) for _ in range(nb_pass)]
-        lines_to_passengers = [list(range(nb_pass)) for _ in range(nb_lines)]
+        pass_to_lines = [sorted(optimal_trip_options_per_line[p].keys()) for p in range(nb_pass)]
+        lines_to_passengers: List[List[int]] = [[] for _ in range(nb_lines)]
+        for p in range(nb_pass):
+            for rho in optimal_trip_options_per_line[p]:
+                lines_to_passengers[rho].append(p)
+        for rho in range(nb_lines):
+            lines_to_passengers[rho].sort()
+
         set_of_lines = []
         edge_to_passengers: List[List[List[int]]] = []
-        for line in range(nb_lines):
+        for line in tqdm(range(nb_lines), desc="Building line instance data structures"):
             line_length = len(candidate_set_of_lines[line]) - 1
             pass_covered = []
             edge_to_passengers.append([[] for _ in range(line_length)])
             for p in range(nb_pass):
-                optimal_trip_option = optimal_trip_options_per_line[p][line]
+                optimal_trip_option = optimal_trip_options_per_line[p].get(line)
+                if optimal_trip_option is None:
+                    continue
                 pass_covered.append(
                     [
                         p,
@@ -255,7 +352,13 @@ class line_instance:
             maximum_detour,
         )
 
-    def _load_preprocessing_cache_legacy_json(self, json_path: Path):
+    def _load_preprocessing_cache_legacy_json(
+        self,
+        json_path: Path,
+        candidate_set_of_lines,
+        nb_pass: int,
+        nb_lines: int,
+    ):
         try:
             with json_path.open("r", encoding="utf-8") as cache_file:
                 data = json.load(cache_file)
@@ -264,24 +367,53 @@ class line_instance:
             return None
 
         try:
-            set_of_lines = data["set_of_lines"]
-            pass_to_lines = data["pass_to_lines"]
             optimal_trip_options_raw = data["optimal_trip_options"]
-            optimal_trip_options = [
-                [self._deserialize_trip_option(opt) for opt in options]
-                for options in optimal_trip_options_raw
-            ]
-            lines_to_passengers = data["lines_to_passengers"]
-            edge_to_passengers = data["edge_to_passengers"]
         except KeyError as exc:
             logging.warning("Missing key in preprocessing cache %s: %s", json_path, exc)
             return None
+
+        optimal_trip_options: List[Dict[int, TripOption]] = []
+        direct_trip_options: List[TripOption] = []
+        try:
+            for options in optimal_trip_options_raw:
+                if len(options) < 2:
+                    logging.warning("Invalid passenger entry in legacy cache %s", json_path)
+                    return None
+                row_list = [self._deserialize_trip_option(opt) for opt in options]
+                direct_trip_options.append(row_list[-1])
+                by_line: Dict[int, TripOption] = {}
+                for rho, opt in enumerate(row_list[:-1]):
+                    if opt.mt_pickup_node != -1:
+                        by_line[rho] = opt
+                optimal_trip_options.append(by_line)
+        except (KeyError, TypeError, ValueError) as exc:
+            logging.warning("Invalid trip option in legacy cache %s: %s", json_path, exc)
+            return None
+
+        if len(optimal_trip_options) != nb_pass:
+            logging.warning(
+                "Legacy cache %s: expected %d passengers, got %d",
+                json_path,
+                nb_pass,
+                len(optimal_trip_options),
+            )
+            return None
+
+        (
+            set_of_lines,
+            pass_to_lines,
+            lines_to_passengers,
+            edge_to_passengers,
+        ) = self._aggregates_from_line_trip_options(
+            optimal_trip_options, candidate_set_of_lines, nb_pass, nb_lines
+        )
 
         logging.info("Loaded preprocessing data from legacy JSON cache %s", json_path)
         return (
             set_of_lines,
             pass_to_lines,
             optimal_trip_options,
+            direct_trip_options,
             lines_to_passengers,
             edge_to_passengers,
         )
@@ -310,10 +442,11 @@ class line_instance:
                 return None
 
             df = df.sort_values(["passenger_idx", "line_idx"])
-            optimal_trip_options: List[List[TripOption]] = [[] for _ in range(nb_pass)]
+            optimal_trip_options: List[Dict[int, TripOption]] = [{} for _ in range(nb_pass)]
             try:
                 col_zip = zip(
                     df["passenger_idx"].to_numpy(copy=False),
+                    df["line_idx"].to_numpy(copy=False),
                     df["value"].to_numpy(copy=False),
                     df["mt_pickup_node"].to_numpy(copy=False),
                     df["mt_drop_off_node"].to_numpy(copy=False),
@@ -325,6 +458,7 @@ class line_instance:
                 )
                 for (
                     p,
+                    line_idx,
                     value,
                     mt_pickup_node,
                     mt_drop_off_node,
@@ -334,32 +468,33 @@ class line_instance:
                     last_mile_cost,
                     mt_cost,
                 ) in tqdm(col_zip, total=len(df), desc="Loading preprocessing cache"):
-                    optimal_trip_options[int(p)].append(
-                        TripOption(
-                            float(value),
-                            int(mt_pickup_node),
-                            int(mt_drop_off_node),
-                            int(mt_pickup_line_edge_index),
-                            int(mt_drop_off_line_edge_index),
-                            float(first_mile_cost),
-                            float(last_mile_cost),
-                            float(mt_cost),
-                        )
+                    p_i = int(p)
+                    rho = int(line_idx)
+                    if rho < 0 or rho >= nb_lines or p_i < 0 or p_i >= nb_pass:
+                        raise ValueError(f"out-of-range passenger_idx={p_i} or line_idx={rho}")
+                    if int(mt_pickup_node) == -1:
+                        continue
+                    opt = TripOption(
+                        float(value),
+                        int(mt_pickup_node),
+                        int(mt_drop_off_node),
+                        int(mt_pickup_line_edge_index),
+                        int(mt_drop_off_line_edge_index),
+                        float(first_mile_cost),
+                        float(last_mile_cost),
+                        float(mt_cost),
                     )
+                    if rho in optimal_trip_options[p_i]:
+                        logging.warning(
+                            "Duplicate (passenger_idx=%d, line_idx=%d) in %s; keeping last row",
+                            p_i,
+                            rho,
+                            cache_path,
+                        )
+                    optimal_trip_options[p_i][rho] = opt
             except (ValueError, TypeError, KeyError) as exc:
                 logging.warning("Invalid row in preprocessing cache %s: %s", cache_path, exc)
                 return None
-
-            for p in range(nb_pass):
-                if len(optimal_trip_options[p]) != nb_lines:
-                    logging.warning(
-                        "Preprocessing cache %s: expected %d rows per passenger, got %d for p=%d",
-                        cache_path,
-                        nb_lines,
-                        len(optimal_trip_options[p]),
-                        p,
-                    )
-                    return None
 
             (
                 set_of_lines,
@@ -369,36 +504,48 @@ class line_instance:
             ) = self._aggregates_from_line_trip_options(
                 optimal_trip_options, candidate_set_of_lines, nb_pass, nb_lines
             )
-            for p in range(nb_pass):
-                travel_time = distances[passengers[p][0]][passengers[p][1]]
-                optimal_trip_options[p].append(
-                    TripOption(0, -1, -1, -1, -1, travel_time, 0, 0)
+            direct_trip_options = [
+                TripOption(
+                    0,
+                    -1,
+                    -1,
+                    -1,
+                    -1,
+                    float(distances[passengers[p][0]][passengers[p][1]]),
+                    0.0,
+                    0.0,
                 )
+                for p in range(nb_pass)
+            ]
 
             logging.info("Loaded preprocessing data from cache %s", cache_path)
             return (
                 set_of_lines,
                 pass_to_lines,
                 optimal_trip_options,
+                direct_trip_options,
                 lines_to_passengers,
                 edge_to_passengers,
             )
 
         legacy_json = cache_path.with_suffix(".json")
         if legacy_json.exists():
-            return self._load_preprocessing_cache_legacy_json(legacy_json)
+            return self._load_preprocessing_cache_legacy_json(
+                legacy_json, candidate_set_of_lines, nb_pass, nb_lines
+            )
 
         return None
 
     def _save_preprocessing_cache(
         self,
         cache_path: Path,
-        optimal_trip_options: List[List[TripOption]],
+        optimal_trip_options: List[Dict[int, TripOption]],
     ) -> None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         rows = []
-        for p, options in enumerate(optimal_trip_options):
-            for line_idx, opt in enumerate(options[:-1]):
+        for p, by_line in enumerate(optimal_trip_options):
+            for line_idx in sorted(by_line.keys()):
+                opt = by_line[line_idx]
                 rows.append(
                     {
                         "passenger_idx": p,
@@ -428,7 +575,17 @@ class line_instance:
         logging.info("Stored preprocessing data to cache %s", cache_path)
 
     def manhattan_instance(self, maximum_detour) -> Tuple[
-        list, list, List[List[TripOption]], list, List[List[List[int]]], list, list, np.ndarray, List[List[int]]]:
+        list,
+        list,
+        List[Dict[int, TripOption]],
+        List[TripOption],
+        list,
+        List[List[List[int]]],
+        list,
+        list,
+        np.ndarray,
+        List[List[int]],
+    ]:
         # TODO handle the case where remaining stops pop in skeleton method
 
         logging.info('Loading distance matrix from %s', self.dm_file)
@@ -481,6 +638,7 @@ class line_instance:
                 set_of_lines,
                 pass_to_lines,
                 optimal_trip_options,
+                direct_trip_options,
                 lines_to_passengers,
                 edge_to_passengers,
             ) = cached_preprocessing
@@ -489,6 +647,7 @@ class line_instance:
                 set_of_lines,
                 pass_to_lines,
                 optimal_trip_options,
+                direct_trip_options,
                 lines_to_passengers,
                 edge_to_passengers,
             ) = self.preprocessing(
@@ -506,10 +665,72 @@ class line_instance:
             for l in range(len(candidate_set_of_lines))
         ]
 
+        if self._line_mod_aggregate_prune:
+            prune_path = line_mod_aggregate_prune_csv_path(
+                cache_path,
+                self._line_mod_aggregate_prune_cost_coefficient,
+                rejection_cost=self._line_mod_aggregate_prune_rejection_cost,
+            )
+            if prune_path.exists():
+                pruned_bundle = self._load_preprocessing_cache(
+                    prune_path,
+                    candidate_set_of_lines,
+                    passengers,
+                    distances,
+                    nb_pass,
+                    nb_lines,
+                )
+                if pruned_bundle is None:
+                    logging.warning(
+                        "Failed to load line-mod-aggregate pruned cache %s; using unpruned trip options",
+                        prune_path,
+                    )
+                else:
+                    (
+                        set_of_lines,
+                        pass_to_lines,
+                        optimal_trip_options,
+                        direct_trip_options,
+                        lines_to_passengers,
+                        edge_to_passengers,
+                    ) = pruned_bundle
+                    logging.info(
+                        "Loaded line-mod-aggregate pruned trip options from %s",
+                        prune_path,
+                    )
+            else:
+                line_opening_costs = [
+                    self._line_mod_aggregate_prune_cost_coefficient * float(lengths_travel_times[l])
+                    for l in range(nb_lines)
+                ]
+                optimal_trip_options, removed_routes = prune_trip_options_line_mod_aggregate(
+                    optimal_trip_options,
+                    direct_trip_options,
+                    nb_lines,
+                    line_opening_costs,
+                    rejection_cost=self._line_mod_aggregate_prune_rejection_cost,
+                )
+                if removed_routes:
+                    logging.info(
+                        "Line-mod-aggregate prune discarded routes %s (saving %s)",
+                        removed_routes,
+                        prune_path,
+                    )
+                self._save_preprocessing_cache(prune_path, optimal_trip_options)
+                (
+                    set_of_lines,
+                    pass_to_lines,
+                    lines_to_passengers,
+                    edge_to_passengers,
+                ) = self._aggregates_from_line_trip_options(
+                    optimal_trip_options, candidate_set_of_lines, nb_pass, nb_lines
+                )
+
         return (
             set_of_lines,
             pass_to_lines,
             optimal_trip_options,
+            direct_trip_options,
             lines_to_passengers,
             edge_to_passengers,
             candidate_set_of_lines,
@@ -520,18 +741,19 @@ class line_instance:
 
     def preprocessing(
         self, candidate_set_of_lines, passengers: List[List[int]], travel_times_on_lines, distances, maximum_detour, nb_pass
-    ) -> Tuple[list, list, List[List[TripOption]], list, List[List[List[int]]]]:
+    ) -> Tuple[list, list, List[Dict[int, TripOption]], List[TripOption], list, List[List[List[int]]]]:
         logging.info('Preprocessing optimal trip options')
         nb_lines = len(candidate_set_of_lines)
 
-        optimal_trip_options: List[List[TripOption]] = [[] for _ in range(nb_pass)]
+        optimal_trip_options: List[Dict[int, TripOption]] = [{} for _ in range(nb_pass)]
 
         for line in tqdm(range(nb_lines), desc='Processing lines'):
             for p in range(nb_pass):
                 optimal_trip_option = self.get_optimal_trip(
                     passengers[p], candidate_set_of_lines[line], travel_times_on_lines[line], distances, maximum_detour
                 )
-                optimal_trip_options[p].append(optimal_trip_option)
+                if optimal_trip_option.mt_pickup_node != -1:
+                    optimal_trip_options[p][line] = optimal_trip_option
 
         (
             set_of_lines,
@@ -542,14 +764,30 @@ class line_instance:
             optimal_trip_options, candidate_set_of_lines, nb_pass, nb_lines
         )
 
-        # add the no MT option for each request. The MoD cost is stored in the first_mile_cost field of TripOption.
-        for p in range(nb_pass):
-            travel_time = distances[passengers[p][0]][passengers[p][1]]
-            optimal_trip_options[p].append(TripOption(0, -1, -1, -1, -1, travel_time, 0, 0))
+        direct_trip_options = [
+            TripOption(
+                0,
+                -1,
+                -1,
+                -1,
+                -1,
+                float(distances[passengers[p][0]][passengers[p][1]]),
+                0.0,
+                0.0,
+            )
+            for p in range(nb_pass)
+        ]
 
         logging.info('Preprocessing finished')
 
-        return set_of_lines, pass_to_lines, optimal_trip_options, lines_to_passengers, edge_to_passengers
+        return (
+            set_of_lines,
+            pass_to_lines,
+            optimal_trip_options,
+            direct_trip_options,
+            lines_to_passengers,
+            edge_to_passengers,
+        )
 
     def get_optimal_trip(self, passenger: List[int], line, travel_times_on_line, distances, maximum_detour) -> TripOption:
         """
@@ -570,13 +808,27 @@ class line_instance:
 
         # compute the optimal trip option, consider all possible pairs of enter and exit nodes for MT
         for pickup_index in range(line_length - 1):
+            first_mile_travel_time = distances[origin][line[pickup_index]]
+
+            # If the first mile travel time is greater than the direct travel time, there is no reason to consider this trip option
+            # The same is true for the case where the value is lower than the current optimal value, since we keep only the best trip
+            # option for each passenger-line pair.
+            if int(shortest_travel_time) - int(first_mile_travel_time) < optimal_trip_option.value:
+                continue
+
             for drop_off_index in range(pickup_index + 1, line_length):
-                first_mile_travel_time = distances[origin][line[pickup_index]]
                 last_mile_travel_time = distances[line[drop_off_index]][destination]
                 mod_travel_time = first_mile_travel_time + last_mile_travel_time
+                value = int(shortest_travel_time) - int(mod_travel_time)
+
+                # if first mile + last mile travel time is greater than the direct travel time, there is no reason to consider this trip option
+                # The same is true for the case where the value is lower than the current optimal value, since we keep only the best trip
+                # option for each passenger-line pair.
+                if value < optimal_trip_option.value:
+                    continue
+
                 mt_travel_time = travel_times_on_line[pickup_index][drop_off_index]
                 total_travel_time = mod_travel_time + mt_travel_time
-                value = int(shortest_travel_time) - int(mod_travel_time)
                 if ((
                     value > optimal_trip_option.value and total_travel_time <= maximum_detour * shortest_travel_time) or (
                     value == optimal_trip_option.value and mt_travel_time < optimal_trip_option.mt_cost)):

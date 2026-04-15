@@ -64,6 +64,8 @@ def _load_request_assignments_csv(path: Path) -> List[Tuple[str, Optional[int]]]
         line_value = row["line"]
         if line_value == "no_MT":
             request_assignments.append(("no_MT", None))
+        elif line_value == "rejected":
+            request_assignments.append(("rejected", None))
         else:
             request_assignments.append(("line", int(line_value)))
     return request_assignments
@@ -94,6 +96,8 @@ def _aggregate_mod_costs_for_original_requests(
     original_request_costs: dict = {}
     for original_id in range(len(request_assignments)):
         kind, line_idx = request_assignments[original_id]
+        if kind == "rejected":
+            continue
         darp_ids_for_original = [
             req["id"] for req in darp_requests if req["original_request_id"] == original_id
         ]

@@ -4,7 +4,7 @@ Loads a ``line_instance`` (``lineplanning.instance``), which reads preprocessing
 from ``<instance_dir>/preprocessing/*.csv`` when the cache exists (same as a normal
 solve). For each request, compares total travel time of the **best** mass-transit
 option (min over candidate lines of first-mile + on-line + last-mile) to the
-**non-MT** option (direct O--D time stored on the synthetic last ``TripOption``).
+**non-MT** option (direct O--D time on ``direct_trip_options[p]``).
 
 Histogram: x = percent cost difference ``(best_MT - direct) / direct * 100`` (negative
 means MT is faster), y = number of requests; bins are 10 percentage points wide.
@@ -119,17 +119,12 @@ skipped_no_direct = 0
 skipped_no_mt = 0
 
 for p in range(line_inst.nb_pass):
-    opts = line_inst.optimal_trip_options[p]
-    if len(opts) < 2:
-        raise ValueError(f"Passenger {p}: expected at least one MT row and one no-MT row")
-
-    direct = float(opts[-1].first_mile_cost)
+    direct = float(line_inst.direct_trip_options[p].first_mile_cost)
     if direct <= 0:
         skipped_no_direct += 1
         continue
 
-    mt_rows = opts[:-1]
-    valid = [o for o in mt_rows if _is_valid_mt_option(o)]
+    valid = [o for o in line_inst.optimal_trip_options[p].values() if _is_valid_mt_option(o)]
     if not valid:
         skipped_no_mt += 1
         continue

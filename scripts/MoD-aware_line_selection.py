@@ -147,6 +147,7 @@ def solution_to_darp_requests(
     For each original request r:
     - If assigned to MoD-only: one request (o_r, d_r, t_r).
     - If assigned to line ℓ: first-mile (o_r, s^b_ℓr, t_r) and last-mile (s^u_ℓr, d_r, t_unboard_r).
+    - If rejected (ILP §4.1.2): omitted from R_MoD (no DARP rows).
 
     Boarding time is estimated as t_board = t_r + ftt(o_r, s^b_ℓr) + δ_transfer (using dm as travel time).
     Unboarding time: t_unboard = t_board + segment_travel_time on MT (approximated from line travel time).
@@ -175,6 +176,8 @@ def solution_to_darp_requests(
         t_r = float(request_times[r])
 
         kind, line_idx = request_assignments[r]
+        if kind == "rejected":
+            continue
         if kind == "no_MT" or line_idx is None:
             # Direct MoD trip: (o_r, d_r, t_r)
             darp_requests.append({
@@ -189,7 +192,9 @@ def solution_to_darp_requests(
 
         # Assigned to route ρ (candidate line index); MoD-aware ILP uses route-aggregated variables (§4.1.1)
         route = line_idx
-        opt = line_instance.optimal_trip_options[r][route]
+        opt = line_instance.trip_option_on_line(r, route)
+        if opt is None:
+            raise ValueError(f"Request {r} has no feasible trip data for route {route}")
         sb = opt.mt_pickup_node
         su = opt.mt_drop_off_node
 
@@ -260,9 +265,10 @@ def load_request_assignments_csv(
     where `line` is either:
     - an integer (route index ρ) if assigned to a line
     - "no_MT" if assigned to MoD-only
+    - "rejected" if not served (§4.1.2)
     - "Dropped" if dropped (treated as no_MT here)
 
-    Returns a list of (kind, route_index) tuples where kind is "no_MT" or "line";
+    Returns a list of (kind, route_index) tuples where kind is "no_MT", "line", or "rejected";
     for "line", the second entry is the route index ρ (0 .. nb_lines-1).
     """
     import pandas as pd
@@ -275,6 +281,8 @@ def load_request_assignments_csv(
         line_value = row["line"]
         if line_value == "no_MT":
             request_assignments.append(("no_MT", None))
+        elif line_value == "rejected":
+            request_assignments.append(("rejected", None))
         else:
             route_index = int(line_value)
             request_assignments.append(("line", route_index))
@@ -445,6 +453,8 @@ def aggregate_mod_costs_for_original_requests(
 
     for original_id in range(len(request_assignments)):
         kind, line_idx = request_assignments[original_id]
+        if kind == "rejected":
+            continue
 
         darp_ids_for_original = [
             req["id"] for req in darp_requests if req["original_request_id"] == original_id

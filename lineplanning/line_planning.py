@@ -157,23 +157,29 @@ class LinePlanningSolver:
             new_costs: Dict mapping original_request_id -> (first_mile_cost, last_mile_cost).
                        For MoD-only requests, last_mile_cost should be 0.
             request_assignments: List of (kind, line_idx) tuples from solve_MoD_aware_ILP.
-                                 kind is "no_MT" or "line"; for "line", line_idx is the route index ρ.
+                                 kind is "no_MT", "line", or "rejected"; for "line", line_idx is the route index ρ.
         """
-        nb_lines = self.line_instance.nb_lines
         for original_request_id, (first_mile_cost, last_mile_cost) in new_costs.items():
             kind, line_idx = request_assignments[original_request_id]
 
+            if kind == "rejected":
+                continue
+
             if kind == "no_MT" or line_idx is None:
-                route_index = nb_lines
+                old_option = self.line_instance.direct_trip_options[original_request_id]
+                new_option = old_option._replace(
+                    first_mile_cost=first_mile_cost,
+                    last_mile_cost=last_mile_cost,
+                )
+                self.line_instance.direct_trip_options[original_request_id] = new_option
             else:
                 route_index = line_idx
-
-            old_option = self.line_instance.optimal_trip_options[original_request_id][route_index]
-            new_option = old_option._replace(
-                first_mile_cost=first_mile_cost,
-                last_mile_cost=last_mile_cost,
-            )
-            self.line_instance.optimal_trip_options[original_request_id][route_index] = new_option
+                old_option = self.line_instance.optimal_trip_options[original_request_id][route_index]
+                new_option = old_option._replace(
+                    first_mile_cost=first_mile_cost,
+                    last_mile_cost=last_mile_cost,
+                )
+                self.line_instance.optimal_trip_options[original_request_id][route_index] = new_option
 
         logging.info("Updated MoD costs for %d requests", len(new_costs))
 
@@ -184,6 +190,8 @@ class LinePlanningSolver:
         no_assignment_means_no_mt_option: bool = False,
         no_mt_line_key: Optional[int] = None,
         line_var_is_route_index: bool = False,
+        rejection_vars: Optional[Dict[int, Any]] = None,
+        rejection_unit_cost: Optional[float] = None,
     ) -> pd.DataFrame:
         output_dir.mkdir(parents=True, exist_ok=True)
         csv_path = output_dir / "passenger_assignments.csv"
@@ -207,7 +215,7 @@ class LinePlanningSolver:
                         else line_idx // self.max_frequency
                     )
                     line_repr = route_index
-                    trip_option: TripOption = self.line_instance.optimal_trip_options[passenger_idx][route_index]
+                    trip_option = self.line_instance.trip_option_on_line(passenger_idx, route_index)
                     mod_cost = trip_option.first_mile_cost + trip_option.last_mile_cost
                 rows.append(
                     {
@@ -223,6 +231,23 @@ class LinePlanningSolver:
 
         for passenger_idx in range(self.line_instance.nb_pass):
             if passenger_idx in assigned_passengers:
+                continue
+            if (
+                rejection_vars is not None
+                and passenger_idx in rejection_vars
+                and rejection_vars[passenger_idx].X > EPS
+            ):
+                rows.append(
+                    {
+                        "passenger": passenger_idx,
+                        "line_index": -2,
+                        "route_index": np.nan,
+                        "line_repr": "rejected",
+                        "mod_cost": float(rejection_unit_cost) if rejection_unit_cost is not None else 0.0,
+                        "is_no_mt": False,
+                    }
+                )
+                assigned_passengers.add(passenger_idx)
                 continue
             if no_assignment_means_no_mt_option:
                 rows.append(
@@ -292,7 +317,9 @@ class LinePlanningSolver:
                 if pd.isna(route_index):
                     continue
                 route_index = int(route_index)
-                trip_option: TripOption = self.line_instance.optimal_trip_options[passenger_idx][route_index]
+                trip_option = self.line_instance.trip_option_on_line(passenger_idx, route_index)
+                if trip_option is None:
+                    continue
                 pickup = trip_option.mt_pickup_node
                 drop_off = trip_option.mt_drop_off_node
                 required_flow[(origin, pickup)] += 1
@@ -416,7 +443,9 @@ class LinePlanningSolver:
         x = {}
         for l in range(len(lines_to_sets)):
             for s in lines_to_sets[l]:
-                total_set_value = sum([self.line_instance.optimal_trip_options[p][l // self.max_frequency].value for p in sets[s]])
+                total_set_value = sum(
+                    [self.line_instance.trip_value_on_line(p, l // self.max_frequency) for p in sets[s]]
+                )
                 x[l,s] = master.addVar(lb=0.0, ub=GRB.INFINITY, vtype=GRB.CONTINUOUS, obj = total_set_value, name="x[%d][%d]"%(l,s))
         master.update()
 
@@ -513,20 +542,15 @@ class LinePlanningSolver:
 
                     y = {}
                     for p in lines_to_passengers[l]:
-                        y[p] = single_line.addVar(obj=self.line_instance.optimal_trip_options[p][l // self.max_frequency].value - lamb[p], ub=1, vtype=GRB.BINARY, name="y[%d]" % p)
+                        y[p] = single_line.addVar(obj=self.line_instance.trip_value_on_line(p, l // self.max_frequency) - lamb[p], ub=1, vtype=GRB.BINARY, name="y[%d]" % p)
                     single_line.update()
                     var = [y[p] for p in lines_to_passengers[l]]
 
                     for k in range(length):
                         coef = []
-                        edges_to_pass = self.line_instance.edge_to_passengers[l//self.max_frequency][k]
-                        index = 0
+                        edge_ps = set(self.line_instance.edge_to_passengers[l // self.max_frequency][k])
                         for p in lines_to_passengers[l]:
-                            if index < len(edges_to_pass) and edges_to_pass[index] == p:
-                                coef.append(1)
-                                index += 1
-                            else:
-                                coef.append(0)
+                            coef.append(1 if p in edge_ps else 0)
                         single_line.addConstr(LinExpr(coef,var) <= capacity * f_l, name="one_set_per_line[%d]"%l)
 
                     single_line.update()
@@ -554,7 +578,9 @@ class LinePlanningSolver:
                         col.addTerms(1, one_set_per_line[l])
                         col.addTerms(lines_cost[l], budget_constraint)
 
-                        total_set_value = sum([self.line_instance.optimal_trip_options[p][l // self.max_frequency].value for p in sets[s]])
+                        total_set_value = sum(
+                    [self.line_instance.trip_value_on_line(p, l // self.max_frequency) for p in sets[s]]
+                )
                         x[l,s] = master.addVar(lb=0.0, ub=GRB.INFINITY, vtype=GRB.CONTINUOUS, obj = total_set_value, name="x[%d][%d]"%(l,s), column = col)
                         t_update = time.time()
 
@@ -632,7 +658,7 @@ class LinePlanningSolver:
         x = {}
         for l in range(self.line_count_total):
             for p in range(request_count):
-                val = self.line_instance.optimal_trip_options[p][l // self.max_frequency].value
+                val = self.line_instance.trip_value_on_line(p, l // self.max_frequency)
                 if val > 0:
                     x[l,p] = master.addVar(lb=0.0, ub=GRB.INFINITY, vtype=GRB.BINARY, obj = val, name="x[%d][%d]"%(l,p))
         master.update()
@@ -642,7 +668,7 @@ class LinePlanningSolver:
         for p in range(request_count):
             var = []
             for l in range(self.line_count_total):
-                val = self.line_instance.optimal_trip_options[p][l // self.max_frequency].value
+                val = self.line_instance.trip_value_on_line(p, l // self.max_frequency)
                 if val > 0:
                     var.append(x[l,p])
             coef = [1 for j in range(len(var))]
@@ -732,7 +758,7 @@ class LinePlanningSolver:
         # higher than the no_MT MoD cost, the line-passenger combination is not considered at all
         potential_line_passenger_combinations = [
             (l, p) for l in range(self.line_count_total) for p in range(request_count)
-            if self.line_instance.optimal_trip_options[p][l // self.max_frequency].value > 0
+            if self.line_instance.trip_value_on_line(p, l // self.max_frequency) > 0
         ]
         passenger_vars = master.addVars(potential_line_passenger_combinations, vtype=GRB.BINARY, obj=1, name="x")
         # add no MT variables for each passenger
@@ -770,8 +796,12 @@ class LinePlanningSolver:
         mod_costs = {}
         for p in range(request_count):
             for l in range(self.line_count_total + 1):
-                optimal_trip_option: TripOption = self.line_instance.optimal_trip_options[p][l // self.max_frequency]
-                mod_costs[l,p] = optimal_trip_option.first_mile_cost + optimal_trip_option.last_mile_cost
+                if l == self.line_count_total:
+                    opt = self.line_instance.direct_trip_options[p]
+                else:
+                    rho = l // self.max_frequency
+                    opt = self.line_instance.optimal_trip_options[p].get(rho)
+                mod_costs[l, p] = opt.first_mile_cost + opt.last_mile_cost
         mod_cost_expression = passenger_vars.prod(mod_costs)
         master.addConstr(line_costs_expression + mod_cost_expression <= self.line_instance.B, name="budget_constraint")
 
@@ -821,6 +851,8 @@ class LinePlanningSolver:
         output_dir: Union[Path, str] = Path("."),
         gurobi_log_file: Union[Path, str, None] = None,
         max_route_frequency: Optional[int] = None,
+        rejection_cost: float = 0.0,
+        use_request_line_valid_inequalities: bool = False,
     ):
         """
         Solve the MoD-aware line selection ILP (manuscript §4.1) using the route-aggregated
@@ -829,6 +861,14 @@ class LinePlanningSolver:
         Objective: min sum_r f̃tc(τ^MoD_r) x^MoD_r + sum_{ρ,r} f̃tc(τ*_{ρr}) x_{ρr}
                     + sum_ρ (∑_{e∈ρ} c_e) y_ρ
         with ∑_{e∈ρ} c_e approximated by cost_coefficient · lengths_travel_times[ρ].
+
+        When ``rejection_cost`` > 0, §4.1.2 applies: binary x^rej_r per request, objective term
+        ``rejection_cost`` · x^rej_r, and x^MoD_r + sum_ρ x_{ρr} + x^rej_r = 1 for each request.
+        For ``rejection_cost`` == 0 (default), rejection variables are omitted (all requests served).
+
+        If ``use_request_line_valid_inequalities`` is True, add valid linking inequalities
+        x_{ρr} ≤ y_ρ for every route ρ and request r with a line-assignment variable (strengthens
+        the LP relaxation; optional).
 
         Constraints: one option per request; edge capacity sum_{r: e∈ρ_{ρr}} x_{ρr} ≤ C_MT y_ρ;
         0 ≤ y_ρ ≤ max_route_frequency (when omitted, the solver's route-frequency cap applies).
@@ -844,6 +884,8 @@ class LinePlanningSolver:
         request_count = self.line_instance.nb_pass
         bus_capacity = self.line_instance.capacity
         no_mt_key = nb_lines
+        rej_penalty = float(rejection_cost) if rejection_cost is not None else 0.0
+        allow_rejection = rej_penalty > 0.0
 
         master = Model("MoD-aware ILP")
         master.ModelSense = GRB.MINIMIZE
@@ -866,7 +908,7 @@ class LinePlanningSolver:
             (rho, p)
             for rho in range(nb_lines)
             for p in range(request_count)
-            if self.line_instance.optimal_trip_options[p][rho].value > 0
+            if self.line_instance.trip_value_on_line(p, rho) > 0
         ]
         mod_costs_line = {
             (rho, p): (
@@ -894,12 +936,26 @@ class LinePlanningSolver:
         for p in range(request_count):
             mod_costs_for_obj[no_mt_key, p] = self._compute_direct_mod_cost(p)
         mod_cost_expression = passenger_vars.prod(mod_costs_for_obj)
-        master.setObjective(line_costs_expression + mod_cost_expression, GRB.MINIMIZE)
+        rej_vars = None
+        rejection_expr = None
+        if allow_rejection:
+            rej_vars = master.addVars(request_count, vtype=GRB.BINARY, name="xrej")
+            rejection_expr = rej_penalty * quicksum(rej_vars[p] for p in range(request_count))
+            master.setObjective(line_costs_expression + mod_cost_expression + rejection_expr, GRB.MINIMIZE)
+        else:
+            master.setObjective(line_costs_expression + mod_cost_expression, GRB.MINIMIZE)
 
-        master.addConstrs(
-            (passenger_vars.sum("*", p) == 1 for p in range(request_count)),
-            name="one_option_per_passenger",
-        )
+        if allow_rejection:
+            assert rej_vars is not None
+            master.addConstrs(
+                (passenger_vars.sum("*", p) + rej_vars[p] == 1 for p in range(request_count)),
+                name="one_option_or_reject_per_passenger",
+            )
+        else:
+            master.addConstrs(
+                (passenger_vars.sum("*", p) == 1 for p in range(request_count)),
+                name="one_option_per_passenger",
+            )
 
         for rho in range(nb_lines):
             length = self.line_instance.set_of_lines[rho][0]
@@ -915,6 +971,14 @@ class LinePlanningSolver:
                         LinExpr(coefs_list, vars_list) <= bus_capacity * frequency_vars[rho],
                         name="capacity[%d][%d]" % (rho, k),
                     )
+        if use_request_line_valid_inequalities:
+            master.addConstrs(
+                (
+                    passenger_vars[rho, p] <= frequency_vars[rho]
+                    for rho, p in potential_line_passenger_combinations
+                ),
+                name="x_le_y",
+            )
         master.update()
 
         output_dir_path = Path(output_dir)
@@ -928,7 +992,11 @@ class LinePlanningSolver:
         if export_model:
             master.write(str(output_dir_path / "MoD_aware_ILP.lp"))
 
-        logging.info("Solving MoD-aware ILP (section 4.1, route-aggregated §4.1.1)")
+        logging.info(
+            "Solving MoD-aware ILP (section 4.1, route-aggregated §4.1.1, "
+            "use_request_line_valid_inequalities=%s)",
+            use_request_line_valid_inequalities,
+        )
         t0 = time.time()
         master.optimize()
         t1 = time.time()
@@ -949,6 +1017,13 @@ class LinePlanningSolver:
         except GurobiError:
             pass
 
+        if allow_rejection and rejection_expr is not None:
+            try:
+                rej_val = float(rejection_expr.getValue())
+                logging.info("MoD-aware ILP rejection-cost component: %s", rej_val)
+            except GurobiError:
+                pass
+
         if export_solution:
             master.write(str(output_dir_path / "MoD_aware_ILP.sol"))
 
@@ -958,11 +1033,14 @@ class LinePlanningSolver:
             per_route_mt_cost_coeff=per_route_mt_cost_coeff,
         )
 
+        rej_vars_map = {p: rej_vars[p] for p in range(request_count)} if rej_vars is not None else None
         assignments = self._export_passenger_assignments(
             output_dir=output_dir_path,
             passenger_vars=passenger_vars,
             no_mt_line_key=no_mt_key,
             line_var_is_route_index=True,
+            rejection_vars=rej_vars_map,
+            rejection_unit_cost=rej_penalty if allow_rejection else None,
         )
 
         # self._solve_and_export_flows(
@@ -975,7 +1053,9 @@ class LinePlanningSolver:
         ]
         request_assignments = []
         for p in range(request_count):
-            if passenger_vars[no_mt_key, p].X > EPS:
+            if allow_rejection and rej_vars is not None and rej_vars[p].X > EPS:
+                request_assignments.append(("rejected", None))
+            elif passenger_vars[no_mt_key, p].X > EPS:
                 request_assignments.append(("no_MT", None))
             else:
                 assigned_route = None
@@ -1012,7 +1092,7 @@ class LinePlanningSolver:
         # higher than the no_MT MoD cost, the line-passenger combination is not considered at all
         potential_line_passenger_combinations = [
             (l, p) for l in range(self.line_count_total) for p in range(request_count)
-            if self.line_instance.optimal_trip_options[p][l // self.max_frequency].value > 0
+            if self.line_instance.trip_value_on_line(p, l // self.max_frequency) > 0
         ]
         passenger_vars = master.addVars(potential_line_passenger_combinations, vtype=GRB.BINARY, obj=1, name="x")
         # add no MT variables for each passenger
@@ -1036,7 +1116,8 @@ class LinePlanningSolver:
             used_nodes.add(request_to)
             for l in range(self.line_count_total):
                 if (l, p) in passenger_vars:
-                    optimal_trip_option: TripOption = self.line_instance.optimal_trip_options[p][l // self.max_frequency]
+                    optimal_trip_option = self.line_instance.trip_option_on_line(p, l // self.max_frequency)
+                    assert optimal_trip_option is not None
                     mt_pickup_node = optimal_trip_option.mt_pickup_node
                     mt_drop_off_node = optimal_trip_option.mt_drop_off_node
                     used_nodes.add(mt_pickup_node)
@@ -1170,7 +1251,6 @@ class LinePlanningSolver:
         return master.ObjVal, t1-t0
 
     def rounding(self, solution, active_sets, sets):
-        optimal_trip_options: List[List[TripOption]] = self.line_instance.optimal_trip_options
         nb_pass = self.line_instance.nb_pass
         nb_lines = self.line_instance.nb_lines
         capacity = self.line_instance.capacity
@@ -1196,8 +1276,10 @@ class LinePlanningSolver:
             if final_set_index: #if final_set_index is false, the line is not opened
                 passenger_assignment.append([])
                 for p in sets[final_set_index]: #for the passengers in the set of index final_set_index
-                    if optimal_trip_options[p][l//self.max_frequency].value > values[p]: #if I could get more value by reassigning passenger p to line l
-                        values[p] = optimal_trip_options[p][l//self.max_frequency].value
+                    rho = l // self.max_frequency
+                    trip_val = self.line_instance.trip_value_on_line(p, rho)
+                    if trip_val > values[p]: #if I could get more value by reassigning passenger p to line l
+                        values[p] = trip_val
                         passenger_assignment[len(passenger_assignment)-1].append([p,values[p]])
 
                 used_budget += lines_cost[l] #Add costs if line is opened
@@ -1275,6 +1357,22 @@ class LinePlanningSolver:
         return best_value, budg, op, v, nb_respect, mean, execution_time
 
 
+def _parse_yaml_bool(raw: object, default: bool = False) -> bool:
+    """Coerce experiment YAML values to bool (handles native bool and common string forms)."""
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return raw != 0
+    s = str(raw).strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off", ""):
+        return False
+    return default
+
+
 def _parse_optional_budget(raw: object) -> Optional[float]:
     if raw is None:
         return None
@@ -1301,6 +1399,11 @@ def run_experiment(experiment_config_path: Path) -> None:
 
     ``mass_transport.cost_coefficient`` scales line operating cost in the ILP (default ``1``).
     ``mass_transport.max_frequency`` is the per-route replication / frequency cap (default ``1``).
+    Optional ``mass_transport.line_mod_aggregate_prune`` (default ``false``): after base trip-option
+    preprocessing, drop any route ρ where the sum of first+last mile costs over passengers with an
+    option on ρ plus ``cost_coefficient * line_length`` exceeds the sum of direct OD costs for those
+    passengers; pruned trip options are cached next to the base preprocessing CSV (separate file;
+    skipped if that file already exists).
 
     The ``solver`` block must set ``method`` to exactly one of:
     ``approximation``, ``ilp``, ``ilp_with_mod_costs``, ``ilp_with_empty_trips``, ``non_budget_ilp``.
@@ -1309,6 +1412,11 @@ def run_experiment(experiment_config_path: Path) -> None:
 
     For ``method: approximation``, optional ``solver.approximation_subproblem_method`` (int)
     sets Gurobi ``Method`` on each column-generation sub-MIP (omit or ``0`` for default).
+
+    For ``method: non_budget_ilp``, optional ``solver.rejection_cost`` (default ``0``) enables
+    request rejection in the ILP (§4.1.2); see experiment README.
+    Optional ``solver.use_request_line_valid_inequalities`` (default ``false``) adds inequalities
+    ``x_{ρr} ≤ y_ρ`` to that ILP only.
     """
     experiment_config_path = experiment_config_path.resolve()
     exp = load_experiment_yaml(experiment_config_path)
@@ -1318,12 +1426,19 @@ def run_experiment(experiment_config_path: Path) -> None:
 
     solver_cfg = exp.get("solver") or {}
     time_limit = float(solver_cfg.get("time_limit", 3600 * 24))
+    rejection_cost_cfg = float(solver_cfg.get("rejection_cost", 0) or 0)
+    use_request_line_valid_inequalities = _parse_yaml_bool(
+        solver_cfg.get("use_request_line_valid_inequalities"), default=False
+    )
 
     solver_method = _resolve_solver_method(solver_cfg)
 
     mt = dict(exp.get("mass_transport") or {})
     cost_coefficient = float(mt.get("cost_coefficient", 1))
     max_frequency = int(mt.get("max_frequency", 1))
+    line_mod_aggregate_prune = _parse_yaml_bool(
+        mt.get("line_mod_aggregate_prune"), default=False
+    )
 
     preprocessing_dir = inst.config_path.parent / "preprocessing"
     line_inst = line_instance(
@@ -1333,6 +1448,9 @@ def run_experiment(experiment_config_path: Path) -> None:
         demand_file=inst.demand_file,
         preprocessing_dir=preprocessing_dir,
         dm_file=inst.dm_file,
+        line_mod_aggregate_prune=line_mod_aggregate_prune,
+        line_mod_aggregate_prune_cost_coefficient=cost_coefficient,
+        line_mod_aggregate_prune_rejection_cost=rejection_cost_cfg if rejection_cost_cfg > 0 else None,
     )
 
     budget = _parse_optional_budget(exp.get("budget"))
@@ -1406,7 +1524,12 @@ def run_experiment(experiment_config_path: Path) -> None:
                     gurobi_log_file=gurobi_log_path,
                 )
         elif solver_method == "non_budget_ilp":
-            logging.info("Running solver.method=non_budget_ilp (MoD-aware route-aggregated ILP)")
+            logging.info(
+                "Running solver.method=non_budget_ilp (MoD-aware route-aggregated ILP, "
+                "rejection_cost=%s, use_request_line_valid_inequalities=%s)",
+                rejection_cost_cfg,
+                use_request_line_valid_inequalities,
+            )
             (
                 obj_val,
                 run_time_sec,
@@ -1419,6 +1542,8 @@ def run_experiment(experiment_config_path: Path) -> None:
                 export_solution=True,
                 output_dir=base_results_directory,
                 gurobi_log_file=gurobi_log_path,
+                rejection_cost=rejection_cost_cfg,
+                use_request_line_valid_inequalities=use_request_line_valid_inequalities,
             )
         else:
             raise AssertionError("unreachable solver_method")
@@ -1440,6 +1565,11 @@ def run_experiment(experiment_config_path: Path) -> None:
         results_payload["line_objective_component"] = line_obj_component
     if mod_obj_component is not None:
         results_payload["mod_objective_component"] = mod_obj_component
+    if solver_method == "non_budget_ilp":
+        if rejection_cost_cfg > 0:
+            results_payload["rejection_cost"] = rejection_cost_cfg
+        if use_request_line_valid_inequalities:
+            results_payload["use_request_line_valid_inequalities"] = True
     if budget is not None:
         results_payload["budget"] = budget
     results_file = base_results_directory / "metrics.json"
