@@ -90,6 +90,7 @@ class LinePlanningSolver:
         self.cost_coefficient = float(cost_coefficient)
         self.max_frequency = int(max_frequency)
         self.line_count_total = self.line_instance.nb_lines * self.max_frequency
+        self._mod_aware_mip_state: Optional[Dict[str, Any]] = None
 
     def _export_used_lines(
         self,
@@ -137,10 +138,14 @@ class LinePlanningSolver:
         except OSError as exc:
             logging.warning("Unable to write used lines CSV %s: %s", csv_path, exc)
 
-    def _compute_direct_mod_cost(self, passenger_idx: int) -> float:
-        origin = self.line_instance.requests[passenger_idx][0]
-        destination = self.line_instance.requests[passenger_idx][1]
-        return float(self.line_instance.dm[origin][destination])
+    def _direct_trip_mod_cost(self, passenger_idx: int) -> float:
+        """
+        MoD cost for the pure-MoD (no_MT) option as stored in ``direct_trip_options``.
+        This is what the MoD-aware ILP and exports should use so DARP recomputation can
+        change direct costs without rewriting ``dm``.
+        """
+        opt = self.line_instance.direct_trip_options[passenger_idx]
+        return float(opt.first_mile_cost) + float(opt.last_mile_cost)
 
     def update_mod_costs(
         self,
@@ -206,7 +211,7 @@ class LinePlanningSolver:
                 is_no_mt = line_idx == no_mt_key
                 if is_no_mt:
                     line_repr: Union[int, str] = "no_MT"
-                    mod_cost = self._compute_direct_mod_cost(passenger_idx)
+                    mod_cost = self._direct_trip_mod_cost(passenger_idx)
                     route_index: Optional[int] = None
                 else:
                     route_index = (
@@ -256,7 +261,7 @@ class LinePlanningSolver:
                         "line_index": no_mt_key,
                         "route_index": np.nan,
                         "line_repr": "no_MT",
-                        "mod_cost": self._compute_direct_mod_cost(passenger_idx),
+                        "mod_cost": self._direct_trip_mod_cost(passenger_idx),
                         "is_no_mt": True,
                     }
                 )
@@ -844,42 +849,62 @@ class LinePlanningSolver:
 
         return master.ObjVal, t1-t0
 
-    def solve_MoD_aware_ILP(
+    def _dispose_mod_aware_mip_state(self) -> None:
+        if self._mod_aware_mip_state is None:
+            return
+        try:
+            self._mod_aware_mip_state["model"].dispose()
+        except Exception as exc:
+            logging.warning("Error disposing MoD-aware MIP model: %s", exc)
+        self._mod_aware_mip_state = None
+
+    @staticmethod
+    def _mod_aware_ilp_fingerprint(
+        freq_ub: int,
+        allow_rejection: bool,
+        use_request_line_valid_inequalities: bool,
+        nb_lines: int,
+        request_count: int,
+        bus_capacity: int,
+    ) -> Tuple[Any, ...]:
+        return (
+            freq_ub,
+            allow_rejection,
+            use_request_line_valid_inequalities,
+            nb_lines,
+            request_count,
+            bus_capacity,
+        )
+
+    def _update_mod_aware_mip_objective(self, state: Dict[str, Any]) -> None:
+        """Re-set objective with fresh passenger MoD coefficients; constraints unchanged."""
+        master: Model = state["model"]
+        passenger_vars = state["passenger_vars"]
+        no_mt_key: int = state["no_mt_key"]
+        request_count: int = state["request_count"]
+        mod_costs_for_obj: Dict[Any, float] = {}
+        for rho, p in state["potential_line_passenger_combinations"]:
+            opt = self.line_instance.optimal_trip_options[p][rho]
+            mod_costs_for_obj[(rho, p)] = float(opt.first_mile_cost + opt.last_mile_cost)
+        for p in range(request_count):
+            mod_costs_for_obj[no_mt_key, p] = float(self._direct_trip_mod_cost(p))
+        mod_cost_expression = passenger_vars.prod(mod_costs_for_obj)
+        if state["allow_rejection"]:
+            master.setObjective(
+                state["line_costs_expression"] + mod_cost_expression + state["rejection_expr"],
+                GRB.MINIMIZE,
+            )
+        else:
+            master.setObjective(state["line_costs_expression"] + mod_cost_expression, GRB.MINIMIZE)
+        master.update()
+
+    def _create_mod_aware_mip_state(
         self,
-        export_model: bool = False,
-        export_solution: bool = False,
-        output_dir: Union[Path, str] = Path("."),
-        gurobi_log_file: Union[Path, str, None] = None,
-        max_route_frequency: Optional[int] = None,
-        rejection_cost: float = 0.0,
-        use_request_line_valid_inequalities: bool = False,
-    ):
-        """
-        Solve the MoD-aware line selection ILP (manuscript §4.1) using the route-aggregated
-        formulation from §4.1.1: integer frequency y_ρ per route ρ, binary assignment x_ρr.
-
-        Objective: min sum_r f̃tc(τ^MoD_r) x^MoD_r + sum_{ρ,r} f̃tc(τ*_{ρr}) x_{ρr}
-                    + sum_ρ (∑_{e∈ρ} c_e) y_ρ
-        with ∑_{e∈ρ} c_e approximated by cost_coefficient · lengths_travel_times[ρ].
-
-        When ``rejection_cost`` > 0, §4.1.2 applies: binary x^rej_r per request, objective term
-        ``rejection_cost`` · x^rej_r, and x^MoD_r + sum_ρ x_{ρr} + x^rej_r = 1 for each request.
-        For ``rejection_cost`` == 0 (default), rejection variables are omitted (all requests served).
-
-        If ``use_request_line_valid_inequalities`` is True, add valid linking inequalities
-        x_{ρr} ≤ y_ρ for every route ρ and request r with a line-assignment variable (strengthens
-        the LP relaxation; optional).
-
-        Constraints: one option per request; edge capacity sum_{r: e∈ρ_{ρr}} x_{ρr} ≤ C_MT y_ρ;
-        0 ≤ y_ρ ≤ max_route_frequency (when omitted, the solver's route-frequency cap applies).
-
-        Returns:
-            objective value, wall-clock seconds, selected route indices, request assignments,
-            line objective term (sum_ρ cost_coefficient·length·y_ρ), MoD objective term (passenger mod costs).
-            The last two entries are None if the objective could not be decomposed from the solution.
-        """
-        freq_ub = max_route_frequency if max_route_frequency is not None else self.max_frequency
-
+        fingerprint: Tuple[Any, ...],
+        freq_ub: int,
+        rejection_cost: float,
+        use_request_line_valid_inequalities: bool,
+    ) -> Dict[str, Any]:
         nb_lines = self.line_instance.nb_lines
         request_count = self.line_instance.nb_pass
         bus_capacity = self.line_instance.capacity
@@ -934,7 +959,7 @@ class LinePlanningSolver:
         line_costs_expression = frequency_vars.prod(per_route_mt_cost_coeff)
         mod_costs_for_obj = dict(mod_costs_line)
         for p in range(request_count):
-            mod_costs_for_obj[no_mt_key, p] = self._compute_direct_mod_cost(p)
+            mod_costs_for_obj[no_mt_key, p] = self._direct_trip_mod_cost(p)
         mod_cost_expression = passenger_vars.prod(mod_costs_for_obj)
         rej_vars = None
         rejection_expr = None
@@ -972,6 +997,7 @@ class LinePlanningSolver:
                         name="capacity[%d][%d]" % (rho, k),
                     )
         if use_request_line_valid_inequalities:
+            logging.info("Adding request-line valid inequalities")
             master.addConstrs(
                 (
                     passenger_vars[rho, p] <= frequency_vars[rho]
@@ -980,6 +1006,113 @@ class LinePlanningSolver:
                 name="x_le_y",
             )
         master.update()
+
+        return {
+            "fingerprint": fingerprint,
+            "model": master,
+            "frequency_vars": frequency_vars,
+            "passenger_vars": passenger_vars,
+            "rej_vars": rej_vars,
+            "allow_rejection": allow_rejection,
+            "rejection_expr": rejection_expr,
+            "rej_penalty": rej_penalty,
+            "no_mt_key": no_mt_key,
+            "nb_lines": nb_lines,
+            "request_count": request_count,
+            "per_route_mt_cost_coeff": per_route_mt_cost_coeff,
+            "line_costs_expression": line_costs_expression,
+            "potential_line_passenger_combinations": potential_line_passenger_combinations,
+        }
+
+    def solve_MoD_aware_ILP(
+        self,
+        export_model: bool = False,
+        export_solution: bool = False,
+        output_dir: Union[Path, str] = Path("."),
+        gurobi_log_file: Union[Path, str, None] = None,
+        max_route_frequency: Optional[int] = None,
+        rejection_cost: float = 0.0,
+        use_request_line_valid_inequalities: bool = False,
+        reuse_model: bool = False,
+    ):
+        """
+        Solve the MoD-aware line selection ILP (manuscript §4.1) using the route-aggregated
+        formulation from §4.1.1: integer frequency y_ρ per route ρ, binary assignment x_ρr.
+
+        Objective: min sum_r f̃tc(τ^MoD_r) x^MoD_r + sum_{ρ,r} f̃tc(τ*_{ρr}) x_{ρr}
+                    + sum_ρ (∑_{e∈ρ} c_e) y_ρ
+        with ∑_{e∈ρ} c_e approximated by cost_coefficient · lengths_travel_times[ρ].
+
+        When ``rejection_cost`` > 0, §4.1.2 applies: binary x^rej_r per request, objective term
+        ``rejection_cost`` · x^rej_r, and x^MoD_r + sum_ρ x_{ρr} + x^rej_r = 1 for each request.
+        For ``rejection_cost`` == 0 (default), rejection variables are omitted (all requests served).
+
+        If ``use_request_line_valid_inequalities`` is True, add valid linking inequalities
+        x_{ρr} ≤ y_ρ for every route ρ and request r with a line-assignment variable (strengthens
+        the LP relaxation; optional).
+
+        Constraints: one option per request; edge capacity sum_{r: e∈ρ_{ρr}} x_{ρr} ≤ C_MT y_ρ;
+        0 ≤ y_ρ ≤ max_route_frequency (when omitted, the solver's route-frequency cap applies).
+
+        If ``reuse_model`` is True, keep one Gurobi model on this solver and only refresh the
+        passenger MoD terms in the objective between solves. The previous solution stays feasible
+        when only objective coefficients change; we do not call ``Model.reset()`` or set
+        parameters that discard MIP starts (e.g. ``IgnoreStart``).
+
+        Returns:
+            objective value, wall-clock seconds, selected route indices, request assignments,
+            line objective term (sum_ρ cost_coefficient·length·y_ρ), MoD objective term (passenger mod costs).
+            The last two entries are None if the objective could not be decomposed from the solution.
+        """
+        freq_ub = max_route_frequency if max_route_frequency is not None else self.max_frequency
+
+        nb_lines = self.line_instance.nb_lines
+        request_count = self.line_instance.nb_pass
+        bus_capacity = self.line_instance.capacity
+        no_mt_key = nb_lines
+        rej_penalty = float(rejection_cost) if rejection_cost is not None else 0.0
+        allow_rejection = rej_penalty > 0.0
+
+        fingerprint = self._mod_aware_ilp_fingerprint(
+            freq_ub,
+            allow_rejection,
+            use_request_line_valid_inequalities,
+            nb_lines,
+            request_count,
+            bus_capacity,
+        )
+
+        if not reuse_model:
+            self._dispose_mod_aware_mip_state()
+
+        if reuse_model and self._mod_aware_mip_state is not None:
+            if self._mod_aware_mip_state["fingerprint"] != fingerprint:
+                logging.info("MoD-aware ILP fingerprint changed; rebuilding Gurobi model")
+                self._dispose_mod_aware_mip_state()
+
+        if self._mod_aware_mip_state is None:
+            self._mod_aware_mip_state = self._create_mod_aware_mip_state(
+                fingerprint,
+                freq_ub,
+                rejection_cost,
+                use_request_line_valid_inequalities,
+            )
+            logging.info("Built MoD-aware ILP model (reuse_model=%s)", reuse_model)
+        else:
+            self._update_mod_aware_mip_objective(self._mod_aware_mip_state)
+            logging.info(
+                "Reusing MoD-aware ILP model; updated passenger MoD objective coefficients only",
+            )
+
+        state = self._mod_aware_mip_state
+        master: Model = state["model"]
+        frequency_vars = state["frequency_vars"]
+        passenger_vars = state["passenger_vars"]
+        rej_vars = state["rej_vars"]
+        allow_rejection = state["allow_rejection"]
+        rejection_expr = state["rejection_expr"]
+        per_route_mt_cost_coeff = state["per_route_mt_cost_coeff"]
+        line_costs_expression = state["line_costs_expression"]
 
         output_dir_path = Path(output_dir)
         output_dir_path.mkdir(parents=True, exist_ok=True)
@@ -1008,7 +1141,18 @@ class LinePlanningSolver:
         mod_obj_val = None
         try:
             line_obj_val = float(line_costs_expression.getValue())
-            mod_obj_val = float(mod_cost_expression.getValue())
+            mod_costs_post: Dict[Any, float] = {}
+            for rho, p in state["potential_line_passenger_combinations"]:
+                opt = self.line_instance.optimal_trip_options[p][rho]
+                mod_costs_post[(rho, p)] = float(opt.first_mile_cost + opt.last_mile_cost)
+            for p in range(request_count):
+                mod_costs_post[no_mt_key, p] = float(self._direct_trip_mod_cost(p))
+            mod_obj_val = float(
+                sum(
+                    float(passenger_vars[k].X) * mod_costs_post[k]
+                    for k in mod_costs_post
+                )
+            )
             logging.info(
                 "MoD-aware ILP objective breakdown: line=%s, mod=%s",
                 line_obj_val,
@@ -1064,6 +1208,9 @@ class LinePlanningSolver:
                         assigned_route = rho
                         break
                 request_assignments.append(("line", assigned_route))
+
+        if not reuse_model:
+            self._dispose_mod_aware_mip_state()
 
         return master.ObjVal, t1 - t0, selected_lines, request_assignments, line_obj_val, mod_obj_val
 

@@ -71,25 +71,106 @@ def _load_request_assignments_csv(path: Path) -> List[Tuple[str, Optional[int]]]
     return request_assignments
 
 
-def _compute_per_darp_request_costs(solution: dict) -> Dict[int, float]:
-    darp_request_costs: Dict[int, float] = {}
+def _darp_id_to_line_planning_leg(
+    darp_requests: List[dict],
+    request_assignments: List[Tuple[str, Optional[int]]],
+) -> Dict[int, str]:
+    """Match ``_darp_id_to_line_planning_leg`` in MoD-aware_line_selection.py."""
+    by_original: Dict[int, List[int]] = {}
+    for row in darp_requests:
+        oid = int(row["original_request_id"])
+        by_original.setdefault(oid, []).append(int(row["id"]))
+
+    out: Dict[int, str] = {}
+    for oid, ids in by_original.items():
+        ids_sorted = sorted(ids)
+        kind, line_idx = request_assignments[oid]
+        assert kind != "rejected", f"DARP row(s) for original {oid} but assignment is rejected"
+        if kind == "no_MT" or line_idx is None:
+            assert len(ids_sorted) == 1, (
+                f"original {oid} no_MT: expected 1 DARP id, got {ids_sorted}"
+            )
+            out[ids_sorted[0]] = "no_mt"
+        else:
+            assert len(ids_sorted) == 2, (
+                f"original {oid} line assignment: expected 2 DARP ids, got {ids_sorted}"
+            )
+            out[ids_sorted[0]] = "first_mile"
+            out[ids_sorted[1]] = "last_mile"
+    return out
+
+
+def _compute_per_darp_request_costs(
+    solution: dict,
+    darp_requests: List[dict],
+    request_assignments: List[Tuple[str, Optional[int]]],
+) -> Dict[int, Tuple[float, float]]:
+    """Match ``compute_per_darp_request_costs`` in MoD-aware_line_selection.py."""
+    plan_share: Dict[int, float] = {}
+
     for plan in solution["plans"]:
-        if len(plan["actions"]) == 0:
+        actions = plan["actions"]
+        if not actions:
             continue
-        plan_cost = plan["cost"]
-        num_requests = len(plan["actions"]) // 2
-        if num_requests == 0:
-            continue
+
+        plan_cost = float(plan["cost"])
+        assert len(actions) % 2 == 0, "each DARP request in a plan must have pickup and drop_off"
+        num_requests = len(actions) // 2
+        assert num_requests > 0
+
         cost_per_request = plan_cost / num_requests
-        for action in plan["actions"]:
-            request_id = action["action"]["request_index"]
-            if request_id not in darp_request_costs:
-                darp_request_costs[request_id] = cost_per_request
-    return darp_request_costs
+
+        pickups: Dict[int, None] = {}
+        dropoffs: Dict[int, None] = {}
+        for action in actions:
+            a = action["action"]
+            rid = int(a["request_index"])
+            typ = a["type"]
+            if typ == "pickup":
+                assert rid not in pickups, f"DARP request {rid}: duplicate pickup in plan"
+                pickups[rid] = None
+            elif typ == "drop_off":
+                assert rid not in dropoffs, f"DARP request {rid}: duplicate drop_off in plan"
+                dropoffs[rid] = None
+            else:
+                raise AssertionError(f"unexpected action type {typ!r} for request {rid}")
+
+        assert pickups.keys() == dropoffs.keys(), (
+            f"pickup/drop_off mismatch: pickups={sorted(pickups)} dropoffs={sorted(dropoffs)}"
+        )
+        assert len(pickups) == num_requests, (
+            f"expected {num_requests} requests in plan, got {len(pickups)} distinct indices"
+        )
+
+        for rid in pickups:
+            assert rid not in plan_share, f"DARP request {rid} appears in more than one plan"
+            plan_share[rid] = cost_per_request
+
+    expected = {int(r["id"]) for r in darp_requests}
+    assert plan_share.keys() == expected, (
+        f"DARP cost extraction: ids in solution {sorted(plan_share.keys())} != "
+        f"ids in requests.csv {sorted(expected)}"
+    )
+
+    leg_kind = _darp_id_to_line_planning_leg(darp_requests, request_assignments)
+    assert leg_kind.keys() == expected, "leg map must cover every DARP id"
+
+    result: Dict[int, Tuple[float, float]] = {}
+    for rid, share in plan_share.items():
+        kind = leg_kind[rid]
+        if kind == "first_mile":
+            result[rid] = (share, 0.0)
+        elif kind == "last_mile":
+            result[rid] = (0.0, share)
+        else:
+            assert kind == "no_mt"
+            result[rid] = (share, 0.0)
+
+    return result
 
 
 def _aggregate_mod_costs_for_original_requests(
-    darp_request_costs: dict,
+    darp_request_leg_costs: Dict[int, Tuple[float, float]],
     darp_requests: List[dict],
     request_assignments: List[Tuple[str, Optional[int]]],
 ) -> dict:
@@ -102,25 +183,26 @@ def _aggregate_mod_costs_for_original_requests(
             req["id"] for req in darp_requests if req["original_request_id"] == original_id
         ]
         if kind == "no_MT" or line_idx is None:
-            if len(darp_ids_for_original) != 1:
-                raise ValueError(
-                    f"MoD-only original request {original_id} expected 1 DARP request, "
-                    f"found {len(darp_ids_for_original)}"
-                )
+            assert len(darp_ids_for_original) == 1, (
+                f"MoD-only original request {original_id} expected 1 DARP request, "
+                f"found {len(darp_ids_for_original)}"
+            )
             darp_id = darp_ids_for_original[0]
-            cost = darp_request_costs.get(darp_id, 0.0)
-            original_request_costs[original_id] = (cost, 0.0)
+            fm_dl, lm_dl = darp_request_leg_costs[darp_id]
+            original_request_costs[original_id] = (float(fm_dl), float(lm_dl))
         else:
-            if len(darp_ids_for_original) != 2:
-                raise ValueError(
-                    f"Line-assigned original request {original_id} expected 2 DARP requests, "
-                    f"found {len(darp_ids_for_original)}"
-                )
+            assert len(darp_ids_for_original) == 2, (
+                f"Line-assigned original request {original_id} expected 2 DARP requests, "
+                f"found {len(darp_ids_for_original)}"
+            )
             first_mile_darp_id = darp_ids_for_original[0]
             last_mile_darp_id = darp_ids_for_original[1]
-            first_mile_cost = darp_request_costs.get(first_mile_darp_id, 0.0)
-            last_mile_cost = darp_request_costs.get(last_mile_darp_id, 0.0)
-            original_request_costs[original_id] = (first_mile_cost, last_mile_cost)
+            f1, l1 = darp_request_leg_costs[first_mile_darp_id]
+            f2, l2 = darp_request_leg_costs[last_mile_darp_id]
+            original_request_costs[original_id] = (
+                float(f1) + float(l1),
+                float(f2) + float(l2),
+            )
     return original_request_costs
 
 
@@ -133,9 +215,11 @@ def _sum_mod_real_from_darp_iteration(iter_dir: Path) -> Optional[float]:
     solution = darpinstances.inout.load_json(solution_path)
     darp_requests = _load_darp_requests_csv(requests_path)
     request_assignments = _load_request_assignments_csv(assignments_path)
-    darp_request_costs = _compute_per_darp_request_costs(solution)
+    darp_request_leg_costs = _compute_per_darp_request_costs(
+        solution, darp_requests, request_assignments
+    )
     agg = _aggregate_mod_costs_for_original_requests(
-        darp_request_costs, darp_requests, request_assignments
+        darp_request_leg_costs, darp_requests, request_assignments
     )
     return sum(fm + lm for fm, lm in agg.values())
 
