@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import darpinstances.inout
 import plotly.graph_objects as go
+import plotly.io as pio
 from pathlib import Path
 
 # MoD-aware results folder containing iteration_1, iteration_2, ...
@@ -355,6 +356,9 @@ if OUTPUT_HTML is not None:
     print(f"Wrote {out_path}")
 
 if SHOW_IN_BROWSER:
+    # Plain scripts (VS Code "Run Python File", terminal) may otherwise pick a
+    # notebook/VS Code renderer and dump HTML to stdout instead of opening a browser.
+    pio.renderers.default = "browser"
     fig.show()
 
 # %%

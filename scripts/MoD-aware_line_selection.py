@@ -26,7 +26,7 @@ import lineplanning.line_planning
 experiment_data_path = Path(r"C:\Google Drive AIC\My Drive\AIC Experiment Data")
 
 
-iteration_count = 10
+iteration_count = 30
 line_planning_ILP_time_limit = 1500 # seconds
 rejection_cost = 1000 # in the travel time units, i.e. seconds of travel time
 
