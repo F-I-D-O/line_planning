@@ -1209,9 +1209,6 @@ class LinePlanningSolver:
                         break
                 request_assignments.append(("line", assigned_route))
 
-        if not reuse_model:
-            self._dispose_mod_aware_mip_state()
-
         return master.ObjVal, t1 - t0, selected_lines, request_assignments, line_obj_val, mod_obj_val
 
     def solve_ILP_with_empty_trips(

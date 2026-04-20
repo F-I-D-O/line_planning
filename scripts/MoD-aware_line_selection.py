@@ -11,7 +11,7 @@ import sys
 import time
 import json
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import yaml
 
@@ -25,35 +25,15 @@ import lineplanning.line_planning
 
 experiment_data_path = Path(r"C:\Google Drive AIC\My Drive\AIC Experiment Data")
 
-
 iteration_count = 30
-line_planning_ILP_time_limit = 1500 # seconds
-rejection_cost = 1000 # in the travel time units, i.e. seconds of travel time
+line_planning_ILP_time_limit = 1500  # seconds
+rejection_cost = 1000  # in the travel time units, i.e. seconds of travel time
 
 # Upper bound on per-route frequency y_ρ in the MoD-aware ILP (manuscript §4.1.1).
 max_frequency = 20
 
 line_planning_path = experiment_data_path / "Line Planning"
-demand_file = None
-dm_file = None
 
-# instance_dir = experiment_data_path / "DARP/Instances/Manhattan"
-# candidate_lines_file = instance_dir / "lines.txt"
-# dm_file = instance_dir / "dm.h5"
-# demand_file = instance_dir / "instances/start_18-00/duration_02_h/max_delay_05_min/requests.csv"
-# results_dir_path = line_planning_path / "Results/manhattan_test/mod-aware"
-
-# Chyse
-# instance_dir = experiment_data_path / "Line Planning/Instances/Chyse"
-# candidate_lines_file = instance_dir / "lines.txt"
-# dm_file = instance_dir / "dm.csv"
-# demand_file = instance_dir / "requests.csv"
-# results_dir_path = line_planning_path / "Results/chyse_test/mod-aware"
-
-# Manhattan 10% demand
-instance_dir = experiment_data_path / "Line Planning/Instances/manhattan-2_h-10_percent/instance_01"
-candidate_lines_file = instance_dir / "lines.txt"
-results_dir_path = line_planning_path / "Results/manhattan-2_h-10_percent/instance_01/mod-aware"
 
 def setup_file_logging(results_dir: Path) -> Path:
     """
@@ -151,30 +131,6 @@ def _load_demand_and_dm_from_instance_config(instance_dir_path: Path) -> Tuple[P
         dm_path = (config_dir / dm_path).resolve()
 
     return demand_path, dm_path
-
-
-if demand_file is None or dm_file is None:
-    inferred_demand_file, inferred_dm_file = _load_demand_and_dm_from_instance_config(instance_dir)
-    if demand_file is None:
-        demand_file = inferred_demand_file
-    if dm_file is None:
-        dm_file = inferred_dm_file
-
-if demand_file is None or dm_file is None:
-    raise ValueError(
-        "demand_file and dm_file must be set either directly in the script or via instance_dir/config.yaml."
-    )
-
-# Initialize debug file logging in the (top-level) results directory.
-_log_path = setup_file_logging(results_dir_path)
-
-# Perivier instance - broken triangle inequality
-# test_data_path = Path(__file__).parent.parent / "test_data"
-# candidate_lines_file = test_data_path / "all_lines_nodes_100_c5.txt"
-# # Distance matrix file
-# dm_file = line_planning_path / "Instances/original/dm.h5"
-# demand_file = test_data_path / "OD_matrix_april_fhv_10_percent.txt"
-# results_dir_path = line_planning_path / "Results/original_instances/10_percent/budget_200000/mod-aware"
 
 
 DARP_BENCHMARK_PATH = Path(r"C:/Workspaces/AIC/DARP-Benchmark/cmake-build-release/DARP-benchmark")
@@ -810,133 +766,207 @@ MOD_COST_RECOMPUTE_STRATEGIES: Dict[str, ModCostRecomputeStrategy] = {
 # Configure which strategy to use for MoD cost recomputation.
 MOD_COST_RECOMPUTE_STRATEGY = "rescale_avg_cost_per_traveltime_and_request"
 
+MOD_COST_SNAPSHOT_FILENAME = "mod_cost_snapshot.json"
+MOD_COST_INITIAL_FILENAME = "mod_costs_initial.json"
 
 
-# Loads candidate lines file and similar: once per the whole script
-line_inst = lineplanning.instance.line_instance(
-    candidate_lines_file=candidate_lines_file,
-    capacity=30,
-    maximum_detour=3,
-    demand_file=demand_file,
-    preprocessing_dir=instance_dir / "preprocessing",
-    dm_file=dm_file,
-)
+def export_mod_cost_snapshot(
+    line_inst: "lineplanning.instance.line_instance",
+    path: Path,
+) -> None:
+    """
+    Serialize full ``TripOption`` data for direct and optimal trip options (all fields).
+    Written after each iteration's MoD cost update for offline calibration / validation.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    direct: List[Dict[str, Any]] = []
+    for opt in line_inst.direct_trip_options:
+        direct.append(opt._asdict())
+    optimal: List[Dict[str, Dict[str, Any]]] = []
+    for by_route in line_inst.optimal_trip_options:
+        optimal.append({str(k): v._asdict() for k, v in by_route.items()})
+    payload = {
+        "format_version": 1,
+        "nb_pass": line_inst.nb_pass,
+        "nb_lines": line_inst.nb_lines,
+        "direct_trip_options": direct,
+        "optimal_trip_options": optimal,
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    logging.info("Wrote MoD cost snapshot %s", path)
 
-solver = lineplanning.line_planning.LinePlanningSolver(
-    line_inst,
-    time_limit=line_planning_ILP_time_limit,
-    cost_coefficient=1.0,
-    max_frequency=max_frequency
-)
 
-instance_size_label = lineplanning.line_planning.get_instance_size_label(demand_file)
+def main() -> None:
+    demand_file = None
+    dm_file = None
 
-try:
-    for i in range(iteration_count):
-        logging.info("Iteration %s of %s", i + 1, iteration_count)
+    # instance_dir = experiment_data_path / "DARP/Instances/Manhattan"
+    # candidate_lines_file = instance_dir / "lines.txt"
+    # dm_file = instance_dir / "dm.h5"
+    # demand_file = instance_dir / "instances/start_18-00/duration_02_h/max_delay_05_min/requests.csv"
+    # results_dir_path = line_planning_path / "Results/manhattan_test/mod-aware"
 
-        results_dir_path_per_iteration = results_dir_path / f"iteration_{i+1}"
-        results_dir_path_per_iteration.mkdir(parents=True, exist_ok=True)
+    # Chyse
+    # instance_dir = experiment_data_path / "Line Planning/Instances/Chyse"
+    # candidate_lines_file = instance_dir / "lines.txt"
+    # dm_file = instance_dir / "dm.csv"
+    # demand_file = instance_dir / "requests.csv"
+    # results_dir_path = line_planning_path / "Results/chyse_test/mod-aware"
 
-        # Check if DARP input files already exist; if so, skip to step 2.2
-        requests_csv_path = results_dir_path_per_iteration / "requests.csv"
-        passenger_assignments_csv_path = results_dir_path_per_iteration / "passenger_assignments.csv"
-        experiment_config_path = results_dir_path_per_iteration / "experiment_ih.yaml"
+    # Manhattan 10% demand
+    instance_dir = experiment_data_path / "Line Planning/Instances/manhattan-2_h-10_percent/instance_01"
+    candidate_lines_file = instance_dir / "lines.txt"
+    results_dir_path = line_planning_path / "Results/manhattan-2_h-10_percent/instance_01/mod-aware"
 
-        if requests_csv_path.exists() and passenger_assignments_csv_path.exists() and experiment_config_path.exists():
-            logging.info(
-                "Iteration %s: DARP input files exist, skipping ILP and loading from files",
-                i + 1,
-            )
-            darp_requests = load_darp_requests_csv(requests_csv_path)
-            request_assignments = load_request_assignments_csv(
-                passenger_assignments_csv_path,
-            )
-        else:
-            # 1. Solve the line selection ILP (section 4.1); get selected lines and request-line assignments
-            # Same formulation as experiment ``solver.method: non_budget_ilp`` in ``run_experiment``.
-            obj_val, run_time_ILP, selected_lines, request_assignments, line_cost, mod_cost = (
-                solver.solve_MoD_aware_ILP(
-                    export_model=True,
-                    export_solution=True,
-                    output_dir=results_dir_path_per_iteration,
-                    gurobi_log_file=results_dir_path_per_iteration / "gurobi.log",
-                    max_route_frequency=max_frequency,
-                    rejection_cost=rejection_cost,
-                    use_request_line_valid_inequalities=True,
-                    reuse_model=True,
+    if demand_file is None or dm_file is None:
+        inferred_demand_file, inferred_dm_file = _load_demand_and_dm_from_instance_config(instance_dir)
+        if demand_file is None:
+            demand_file = inferred_demand_file
+        if dm_file is None:
+            dm_file = inferred_dm_file
+
+    if demand_file is None or dm_file is None:
+        raise ValueError(
+            "demand_file and dm_file must be set either directly in the script or via instance_dir/config.yaml."
+        )
+
+    setup_file_logging(results_dir_path)
+
+    line_inst = lineplanning.instance.line_instance(
+        candidate_lines_file=candidate_lines_file,
+        capacity=30,
+        maximum_detour=3,
+        demand_file=demand_file,
+        preprocessing_dir=instance_dir / "preprocessing",
+        dm_file=dm_file,
+    )
+
+    solver = lineplanning.line_planning.LinePlanningSolver(
+        line_inst,
+        time_limit=line_planning_ILP_time_limit,
+        cost_coefficient=1.0,
+        max_frequency=max_frequency,
+    )
+
+    instance_size_label = lineplanning.line_planning.get_instance_size_label(demand_file)
+
+    export_mod_cost_snapshot(line_inst, results_dir_path / MOD_COST_INITIAL_FILENAME)
+
+    try:
+        for i in range(iteration_count):
+            logging.info("Iteration %s of %s", i + 1, iteration_count)
+
+            results_dir_path_per_iteration = results_dir_path / f"iteration_{i+1}"
+            results_dir_path_per_iteration.mkdir(parents=True, exist_ok=True)
+
+            # Check if DARP input files already exist; if so, skip to step 2.2
+            requests_csv_path = results_dir_path_per_iteration / "requests.csv"
+            passenger_assignments_csv_path = results_dir_path_per_iteration / "passenger_assignments.csv"
+            experiment_config_path = results_dir_path_per_iteration / "experiment_ih.yaml"
+
+            if requests_csv_path.exists() and passenger_assignments_csv_path.exists() and experiment_config_path.exists():
+                logging.info(
+                    "Iteration %s: DARP input files exist, skipping ILP and loading from files",
+                    i + 1,
                 )
-            )
-            # 1.2 Write metrics.json
-            results_payload = {
-                "iteration": i + 1,
-                "objective_value": obj_val,
-                "line_cost": line_cost,
-                "mod_cost": mod_cost,
-                "run_time_seconds": run_time_ILP,
-                "instance_size": instance_size_label,
-                "demand_file": str(demand_file),
-                "max_route_frequency": max_frequency,
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            }
-            results_file = results_dir_path_per_iteration / "metrics.json"
-            results_file.write_text(json.dumps(results_payload, indent=2))
+                darp_requests = load_darp_requests_csv(requests_csv_path)
+                request_assignments = load_request_assignments_csv(
+                    passenger_assignments_csv_path,
+                )
+            else:
+                # 1. Solve the line selection ILP (section 4.1); get selected lines and request-line assignments
+                # Same formulation as experiment ``solver.method: non_budget_ilp`` in ``run_experiment``.
+                obj_val, run_time_ILP, selected_lines, request_assignments, line_cost, mod_cost = (
+                    solver.solve_MoD_aware_ILP(
+                        export_model=True,
+                        export_solution=True,
+                        output_dir=results_dir_path_per_iteration,
+                        gurobi_log_file=results_dir_path_per_iteration / "gurobi.log",
+                        max_route_frequency=max_frequency,
+                        rejection_cost=rejection_cost,
+                        use_request_line_valid_inequalities=True,
+                        reuse_model=True,
+                    )
+                )
+                # 1.2 Write metrics.json
+                results_payload = {
+                    "iteration": i + 1,
+                    "objective_value": obj_val,
+                    "line_cost": line_cost,
+                    "mod_cost": mod_cost,
+                    "run_time_seconds": run_time_ILP,
+                    "instance_size": instance_size_label,
+                    "demand_file": str(demand_file),
+                    "max_route_frequency": max_frequency,
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                }
+                results_file = results_dir_path_per_iteration / "metrics.json"
+                results_file.write_text(json.dumps(results_payload, indent=2))
 
-            # 2. DARP
-            # Build MoD requests for DARP per section 4.2.1 (Conventional model) and write requests.csv
-            darp_requests = solution_to_darp_requests(
-                line_inst,
-                request_assignments,
-                request_times=None,
-                delta_transfer_seconds=0,
+                # 2. DARP
+                # Build MoD requests for DARP per section 4.2.1 (Conventional model) and write requests.csv
+                darp_requests = solution_to_darp_requests(
+                    line_inst,
+                    request_assignments,
+                    request_times=None,
+                    delta_transfer_seconds=0,
+                )
+                write_darp_requests_csv(darp_requests, requests_csv_path, time_format="seconds")
+                write_darp_vehicles_csv(
+                    darp_requests,
+                    results_dir_path_per_iteration / "vehicles.csv",
+                    capacity=5,
+                    time_format="seconds",
+                )
+                write_darp_config_yaml(
+                    output_dir=results_dir_path_per_iteration,
+                    dm_filepath=dm_file,
+                    max_travel_time_delay_seconds=300,
+                    vehicle_capacity=5,
+                )
+
+            # 2.2 call DARP solver
+            darpbenchmark.experiments.run_experiment_using_config(
+                experiment_config_path,
+                executable_path=DARP_BENCHMARK_PATH,
             )
-            write_darp_requests_csv(darp_requests, requests_csv_path, time_format="seconds")
-            write_darp_vehicles_csv(
+
+            # 3. Recompute the MoD cost estimates (section 4.3.2)
+            solution_path = results_dir_path_per_iteration / "config.yaml-solution.json"
+            darp_solution = darpinstances.inout.load_json(solution_path)
+
+            darp_request_leg_costs = compute_per_darp_request_costs(
+                darp_solution,
                 darp_requests,
-                results_dir_path_per_iteration / "vehicles.csv",
-                capacity=5,
-                time_format="seconds",
-            )
-            write_darp_config_yaml(
-                output_dir=results_dir_path_per_iteration,
-                dm_filepath=dm_file,
-                max_travel_time_delay_seconds=300,
-                vehicle_capacity=5,
+                request_assignments,
             )
 
-        # 2.2 call DARP solver
-        darpbenchmark.experiments.run_experiment_using_config(
-            experiment_config_path,
-            executable_path=DARP_BENCHMARK_PATH,
-        )
-
-        # 3. Recompute the MoD cost estimates (section 4.3.2)
-        solution_path = results_dir_path_per_iteration / "config.yaml-solution.json"
-        darp_solution = darpinstances.inout.load_json(solution_path)
-
-        darp_request_leg_costs = compute_per_darp_request_costs(
-            darp_solution,
-            darp_requests,
-            request_assignments,
-        )
-
-        strategy = MOD_COST_RECOMPUTE_STRATEGIES.get(MOD_COST_RECOMPUTE_STRATEGY)
-        if strategy is None:
-            raise KeyError(
-                f"Unknown MOD_COST_RECOMPUTE_STRATEGY={MOD_COST_RECOMPUTE_STRATEGY!r}. "
-                f"Available: {sorted(MOD_COST_RECOMPUTE_STRATEGIES.keys())}"
+            strategy = MOD_COST_RECOMPUTE_STRATEGIES.get(MOD_COST_RECOMPUTE_STRATEGY)
+            if strategy is None:
+                raise KeyError(
+                    f"Unknown MOD_COST_RECOMPUTE_STRATEGY={MOD_COST_RECOMPUTE_STRATEGY!r}. "
+                    f"Available: {sorted(MOD_COST_RECOMPUTE_STRATEGIES.keys())}"
+                )
+            ctx = ModCostRecomputeContext(
+                line_instance=line_inst,
+                request_assignments=request_assignments,
+                darp_request_leg_costs=darp_request_leg_costs,
+                darp_requests=darp_requests,
             )
-        ctx = ModCostRecomputeContext(
-            line_instance=line_inst,
-            request_assignments=request_assignments,
-            darp_request_leg_costs=darp_request_leg_costs,
-            darp_requests=darp_requests,
-        )
-        new_mod_costs = strategy(ctx)
+            new_mod_costs = strategy(ctx)
 
-        solver.update_mod_costs(new_mod_costs, request_assignments)
-        logging.info("Iteration %s: updated MoD costs for %s requests", i + 1, len(new_mod_costs))
-except Exception:
-    logging.exception("Uncaught error in MoD-aware line selection script")
-    raise
+            solver.update_mod_costs(new_mod_costs, request_assignments)
+            logging.info("Iteration %s: updated MoD costs for %s requests", i + 1, len(new_mod_costs))
+            export_mod_cost_snapshot(
+                line_inst,
+                results_dir_path_per_iteration / MOD_COST_SNAPSHOT_FILENAME,
+            )
+    except Exception:
+        logging.exception("Uncaught error in MoD-aware line selection script")
+        raise
+
+
+if __name__ == "__main__":
+    main()
 
