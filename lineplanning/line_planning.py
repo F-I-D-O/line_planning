@@ -905,6 +905,9 @@ class LinePlanningSolver:
         rejection_cost: float,
         use_request_line_valid_inequalities: bool,
     ) -> Dict[str, Any]:
+
+        logging.info("Building MoD-aware ILP model")
+
         nb_lines = self.line_instance.nb_lines
         request_count = self.line_instance.nb_pass
         bus_capacity = self.line_instance.capacity
@@ -935,12 +938,14 @@ class LinePlanningSolver:
             for p in range(request_count)
             if self.line_instance.trip_value_on_line(p, rho) > 0
         ]
+
+        logging.info("Computing total mod costs for each trip option")
         mod_costs_line = {
             (rho, p): (
                 self.line_instance.optimal_trip_options[p][rho].first_mile_cost
                 + self.line_instance.optimal_trip_options[p][rho].last_mile_cost
             )
-            for (rho, p) in potential_line_passenger_combinations
+            for (rho, p) in tqdm(potential_line_passenger_combinations, desc="Computing trip option mod costs")
         }
         passenger_vars = master.addVars(
             potential_line_passenger_combinations,
@@ -958,7 +963,9 @@ class LinePlanningSolver:
 
         line_costs_expression = frequency_vars.prod(per_route_mt_cost_coeff)
         mod_costs_for_obj = dict(mod_costs_line)
-        for p in range(request_count):
+
+        logging.info("Adding direct trip mod costs to the objective")
+        for p in tqdm(range(request_count), desc="Adding direct trip for request"):
             mod_costs_for_obj[no_mt_key, p] = self._direct_trip_mod_cost(p)
         mod_cost_expression = passenger_vars.prod(mod_costs_for_obj)
         rej_vars = None
@@ -998,13 +1005,18 @@ class LinePlanningSolver:
                     )
         if use_request_line_valid_inequalities:
             logging.info("Adding request-line valid inequalities")
-            master.addConstrs(
-                (
-                    passenger_vars[rho, p] <= frequency_vars[rho]
-                    for rho, p in potential_line_passenger_combinations
-                ),
-                name="x_le_y",
-            )
+            for rho, p in tqdm(potential_line_passenger_combinations, desc="Adding request-line valid inequalities"):
+                master.addConstr(
+                    passenger_vars[rho, p] <= frequency_vars[rho],
+                    name=f"x_le_y[{rho},{p}]",
+                )
+            # master.addConstrs(
+            #     (
+            #         passenger_vars[rho, p] <= frequency_vars[rho]
+            #         for rho, p in potential_line_passenger_combinations
+            #     ),
+            #     name="x_le_y",
+            # )
         master.update()
 
         return {
@@ -1083,6 +1095,7 @@ class LinePlanningSolver:
         )
 
         if not reuse_model:
+            logging.info("Disposing old MoD-aware ILP model")
             self._dispose_mod_aware_mip_state()
 
         if reuse_model and self._mod_aware_mip_state is not None:

@@ -5,6 +5,7 @@ per section 4.2.1 (Conventional model) for the Ridesharing_DARP_instances format
 
 import csv
 import logging
+import math
 import os
 from pathlib import Path
 import sys
@@ -72,22 +73,6 @@ def setup_file_logging(results_dir: Path) -> Path:
     return log_path
 
 
-def _resolve_config_path(instance_dir_path: Path) -> Path:
-    config_candidates = [
-        instance_dir_path / "config.yaml",
-        instance_dir_path / "config.yml",
-        instance_dir_path / "instance_config.yaml",
-        instance_dir_path / "instance_config.yml",
-    ]
-    for p in config_candidates:
-        if p.exists():
-            return p
-    raise FileNotFoundError(
-        "Could not find an instance config file to infer demand/dm paths. "
-        f"Tried: {[str(p) for p in config_candidates]}"
-    )
-
-
 def _coerce_path(v: object) -> Path:
     if isinstance(v, Path):
         return v
@@ -96,8 +81,34 @@ def _coerce_path(v: object) -> Path:
     raise TypeError(f"Expected str/Path, got {type(v).__name__}")
 
 
-def _load_demand_and_dm_from_instance_config(instance_dir_path: Path) -> Tuple[Path, Path]:
-    config_path = _resolve_config_path(instance_dir_path)
+def _parse_mod_cost_scale(cfg: dict, config_path: Path) -> float:
+    """
+    Optional ``mod_cost_scale`` in experiment YAML (default 1.0).
+    Multiplies every stored MoD leg cost (direct and line+MoD options) after loading the instance.
+    """
+    raw = cfg.get("mod_cost_scale", 1.0)
+    if raw is None:
+        return 1.0
+    try:
+        s = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid mod_cost_scale in {config_path!s}: expected a number, got {raw!r}."
+        ) from exc
+    if not math.isfinite(s) or s <= 0.0:
+        raise ValueError(
+            f"Invalid mod_cost_scale in {config_path!s}: expected a finite number > 0, got {s!r}."
+        )
+    return s
+
+
+def _load_line_planning_paths_from_instance_dir(
+    config_path: Path,
+) -> Tuple[Path, Path, Path]:
+    """
+    Read the instance folder's config once and resolve demand/dm paths.
+    Returns (demand_path, dm_path, instance_config_path).
+    """
     config_dir = config_path.parent
 
     with config_path.open("r", encoding="utf-8") as f:
@@ -130,6 +141,58 @@ def _load_demand_and_dm_from_instance_config(instance_dir_path: Path) -> Tuple[P
     if not dm_path.is_absolute():
         dm_path = (config_dir / dm_path).resolve()
 
+    return demand_path, dm_path, config_path
+
+
+EXPERIMENT_CONFIG_FILENAME = "experiment.yaml"
+
+
+def _load_experiment_yaml(results_dir_path: Path) -> Tuple[Path, float, Path]:
+    """
+    Load ``results_dir_path / experiment.yaml``.
+
+    Required key ``instance``: path to the line-planning instance directory, relative to the
+    directory containing the experiment file unless absolute.
+
+    Optional key ``mod_cost_scale`` (default 1.0): passed to :func:`_parse_mod_cost_scale`.
+
+    Returns (resolved_instance_dir, mod_cost_scale, experiment_yaml_path).
+    """
+    results_dir_path = Path(results_dir_path)
+    experiment_path = results_dir_path / EXPERIMENT_CONFIG_FILENAME
+    if not experiment_path.is_file():
+        raise FileNotFoundError(
+            f"Experiment config not found: {experiment_path}. "
+            f"Create {EXPERIMENT_CONFIG_FILENAME} under the results directory."
+        )
+    experiment_dir = experiment_path.parent
+
+    with experiment_path.open("r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    if not isinstance(cfg, dict):
+        raise ValueError(
+            f"Expected a mapping at top-level in {experiment_path}, got {type(cfg).__name__}."
+        )
+
+    instance_raw = cfg.get("instance")
+    if instance_raw is None or instance_raw == "":
+        raise KeyError(
+            f"Missing required key 'instance' in {experiment_path} "
+            "(path to instance directory, relative to the experiment file's directory unless absolute)."
+        )
+
+    instance_path = _coerce_path(instance_raw)
+    if not instance_path.is_absolute():
+        instance_dir = (experiment_dir / instance_path).resolve()
+    else:
+        instance_dir = instance_path.resolve()
+
+    mod_cost_scale = _parse_mod_cost_scale(cfg, experiment_path)
+    return instance_dir, mod_cost_scale, experiment_path
+
+
+def _load_demand_and_dm_from_instance_config(instance_dir_path: Path) -> Tuple[Path, Path]:
+    demand_path, dm_path, _cfg = _load_line_planning_paths_from_instance_dir(instance_dir_path)
     return demand_path, dm_path
 
 
@@ -654,6 +717,8 @@ def _scale_all_mod_costs_in_model(
     """
     if factor == 1.0:
         return
+    
+    logging.info("Scaling MoD costs in the model by %s", factor)
 
     # Scale direct trips (no_MT) for every request
     for p, opt in enumerate(line_instance.direct_trip_options):
@@ -764,67 +829,159 @@ MOD_COST_RECOMPUTE_STRATEGIES: Dict[str, ModCostRecomputeStrategy] = {
 }
 
 # Configure which strategy to use for MoD cost recomputation.
-MOD_COST_RECOMPUTE_STRATEGY = "rescale_avg_cost_per_traveltime_and_request"
+# MOD_COST_RECOMPUTE_STRATEGY = "rescale_avg_cost_per_traveltime_and_request"
+MOD_COST_RECOMPUTE_STRATEGY = "aggregate_original_requests"
 
-MOD_COST_SNAPSHOT_FILENAME = "mod_cost_snapshot.json"
-MOD_COST_INITIAL_FILENAME = "mod_costs_initial.json"
+MOD_COST_SNAPSHOT_FILENAME = "mod_cost_snapshot.csv"
+MOD_COST_INITIAL_FILENAME = "mod_costs_initial.csv"
+
+_MOD_COST_CSV_FIELDNAMES = (
+    "passenger_idx",
+    "line_idx",
+    "first_mile_cost",
+    "last_mile_cost",
+    "mt_cost",
+)
 
 
-def export_mod_cost_snapshot(
+def read_mod_costs_csv(path: Path) -> List[Dict[str, Any]]:
+    """Load rows written by :func:`export_mod_costs_csv`."""
+    path = Path(path)
+    with path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            raise ValueError(f"Empty or invalid CSV: {path}")
+        missing = set(_MOD_COST_CSV_FIELDNAMES) - set(reader.fieldnames)
+        if missing:
+            raise ValueError(
+                f"{path} missing columns {sorted(missing)}; "
+                f"expected {list(_MOD_COST_CSV_FIELDNAMES)}"
+            )
+        rows: List[Dict[str, Any]] = []
+        for line_no, row in enumerate(reader, start=2):
+            try:
+                rows.append(
+                    {
+                        "passenger_idx": int(row["passenger_idx"]),
+                        "line_idx": int(row["line_idx"]),
+                        "first_mile_cost": float(row["first_mile_cost"]),
+                        "last_mile_cost": float(row["last_mile_cost"]),
+                        "mt_cost": float(row["mt_cost"]),
+                    }
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{path} line {line_no}: invalid row {row!r}") from exc
+        return rows
+
+
+def apply_mod_cost_rows_to_instance(
+    line_inst: "lineplanning.instance.line_instance",
+    rows: List[Dict[str, Any]],
+) -> None:
+    """
+    Apply per-option MoD cost columns from CSV rows.
+    ``line_idx == -1`` denotes the direct (no line) option for that passenger; otherwise
+    ``line_idx`` is a candidate line index, matching ``preprocessing`` cache rows.
+    """
+    for row in rows:
+        p = int(row["passenger_idx"])
+        rho = int(row["line_idx"])
+        fm = float(row["first_mile_cost"])
+        lm = float(row["last_mile_cost"])
+        mc = float(row["mt_cost"])
+        if rho < 0:
+            if p < 0 or p >= len(line_inst.direct_trip_options):
+                continue
+            t = line_inst.direct_trip_options[p]
+            line_inst.direct_trip_options[p] = t._replace(
+                first_mile_cost=fm,
+                last_mile_cost=lm,
+                mt_cost=mc,
+            )
+        else:
+            if p < 0 or p >= len(line_inst.optimal_trip_options):
+                continue
+            if rho not in line_inst.optimal_trip_options[p]:
+                continue
+            t = line_inst.optimal_trip_options[p][rho]
+            line_inst.optimal_trip_options[p][rho] = t._replace(
+                first_mile_cost=fm,
+                last_mile_cost=lm,
+                mt_cost=mc,
+            )
+
+
+def export_mod_costs_csv(
     line_inst: "lineplanning.instance.line_instance",
     path: Path,
 ) -> None:
     """
-    Serialize full ``TripOption`` data for direct and optimal trip options (all fields).
-    Written after each iteration's MoD cost update for offline calibration / validation.
+    Export only MoD cost coefficients that can change across iterations.
+
+    Rows use the same ``(passenger_idx, line_idx)`` keys as preprocessing trip-option CSVs;
+    direct options use ``line_idx=-1`` (not stored in preprocessing cache). Static trip
+    geometry and ``value`` stay in preprocessing.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    direct: List[Dict[str, Any]] = []
-    for opt in line_inst.direct_trip_options:
-        direct.append(opt._asdict())
-    optimal: List[Dict[str, Dict[str, Any]]] = []
-    for by_route in line_inst.optimal_trip_options:
-        optimal.append({str(k): v._asdict() for k, v in by_route.items()})
-    payload = {
-        "format_version": 1,
-        "nb_pass": line_inst.nb_pass,
-        "nb_lines": line_inst.nb_lines,
-        "direct_trip_options": direct,
-        "optimal_trip_options": optimal,
-    }
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    logging.info("Wrote MoD cost snapshot %s", path)
+    rows: List[Dict[str, Any]] = []
+    for p in range(line_inst.nb_pass):
+        opt = line_inst.direct_trip_options[p]
+        rows.append(
+            {
+                "passenger_idx": p,
+                "line_idx": -1,
+                "first_mile_cost": opt.first_mile_cost,
+                "last_mile_cost": opt.last_mile_cost,
+                "mt_cost": opt.mt_cost,
+            }
+        )
+    for p in range(line_inst.nb_pass):
+        for rho in sorted(line_inst.optimal_trip_options[p].keys()):
+            opt = line_inst.optimal_trip_options[p][rho]
+            rows.append(
+                {
+                    "passenger_idx": p,
+                    "line_idx": rho,
+                    "first_mile_cost": opt.first_mile_cost,
+                    "last_mile_cost": opt.last_mile_cost,
+                    "mt_cost": opt.mt_cost,
+                }
+            )
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=_MOD_COST_CSV_FIELDNAMES,
+            lineterminator="\n",
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+    logging.info("Wrote MoD costs CSV %s (%d rows)", path, len(rows))
 
 
 def main() -> None:
     demand_file = None
     dm_file = None
 
-    # instance_dir = experiment_data_path / "DARP/Instances/Manhattan"
-    # candidate_lines_file = instance_dir / "lines.txt"
-    # dm_file = instance_dir / "dm.h5"
-    # demand_file = instance_dir / "instances/start_18-00/duration_02_h/max_delay_05_min/requests.csv"
-    # results_dir_path = line_planning_path / "Results/manhattan_test/mod-aware"
-
-    # Chyse
-    # instance_dir = experiment_data_path / "Line Planning/Instances/Chyse"
-    # candidate_lines_file = instance_dir / "lines.txt"
-    # dm_file = instance_dir / "dm.csv"
-    # demand_file = instance_dir / "requests.csv"
-    # results_dir_path = line_planning_path / "Results/chyse_test/mod-aware"
-
-    # Manhattan 10% demand
-    instance_dir = experiment_data_path / "Line Planning/Instances/manhattan-2_h-10_percent/instance_01"
-    candidate_lines_file = instance_dir / "lines.txt"
+    # Results folder must contain experiment.yaml with keys:
+    #   instance: path to instance directory (relative to this file unless absolute)
+    #   mod_cost_scale: optional, default 1.0
+    # Example experiment.yaml next to iteration_* subfolders:
+    #   instance: ../../../Instances/manhattan-2_h-10_percent/instance_01
+    #   mod_cost_scale: 1.0
     results_dir_path = line_planning_path / "Results/manhattan-2_h-10_percent/instance_01/mod-aware"
 
-    if demand_file is None or dm_file is None:
-        inferred_demand_file, inferred_dm_file = _load_demand_and_dm_from_instance_config(instance_dir)
-        if demand_file is None:
-            demand_file = inferred_demand_file
-        if dm_file is None:
-            dm_file = inferred_dm_file
+    instance_config_path, mod_cost_scale, experiment_yaml_path = _load_experiment_yaml(results_dir_path)
+    instance_dir = instance_config_path.parent
+    candidate_lines_file = instance_dir / "lines.txt"
+
+    inferred_demand_file, inferred_dm_file, _instance_config_path = _load_line_planning_paths_from_instance_dir(
+        instance_config_path
+    )
+    if demand_file is None:
+        demand_file = inferred_demand_file
+    if dm_file is None:
+        dm_file = inferred_dm_file
 
     if demand_file is None or dm_file is None:
         raise ValueError(
@@ -842,6 +999,14 @@ def main() -> None:
         dm_file=dm_file,
     )
 
+    if mod_cost_scale != 1.0:
+        logging.info(
+            "Applying mod_cost_scale=%s from experiment config %s (direct + all line MoD options)",
+            mod_cost_scale,
+            experiment_yaml_path,
+        )
+        _scale_all_mod_costs_in_model(line_inst, mod_cost_scale)
+
     solver = lineplanning.line_planning.LinePlanningSolver(
         line_inst,
         time_limit=line_planning_ILP_time_limit,
@@ -851,7 +1016,7 @@ def main() -> None:
 
     instance_size_label = lineplanning.line_planning.get_instance_size_label(demand_file)
 
-    export_mod_cost_snapshot(line_inst, results_dir_path / MOD_COST_INITIAL_FILENAME)
+    export_mod_costs_csv(line_inst, results_dir_path / MOD_COST_INITIAL_FILENAME)
 
     try:
         for i in range(iteration_count):
@@ -958,7 +1123,7 @@ def main() -> None:
 
             solver.update_mod_costs(new_mod_costs, request_assignments)
             logging.info("Iteration %s: updated MoD costs for %s requests", i + 1, len(new_mod_costs))
-            export_mod_cost_snapshot(
+            export_mod_costs_csv(
                 line_inst,
                 results_dir_path_per_iteration / MOD_COST_SNAPSHOT_FILENAME,
             )
