@@ -1,7 +1,7 @@
 """
 Load line-planning instance paths from a YAML file compatible with the
 `Ridesharing_DARP_instances` layout (demand.filepath, dm_filepath, area_dir),
-plus a required ``lines`` key for the candidate-lines file.
+plus an optional ``lines`` key for the candidate-lines file (defaults to ``lines.txt`` next to the config).
 """
 
 from __future__ import annotations
@@ -43,8 +43,10 @@ def load_line_planning_instance_config(config_path: Path) -> LinePlanningInstanc
 
     Required / expected keys:
     - ``demand`` mapping with ``filepath`` (DARP style), or a string path as ``demand``.
-    - ``lines``: path to the candidate-lines text file.
     - ``dm_filepath`` and/or ``area_dir`` so a distance matrix can be resolved.
+
+    Optional:
+    - ``lines``: path to the candidate-lines text file (default ``lines.txt`` relative to the config).
     """
     config_path = config_path.resolve()
     if not config_path.is_file():
@@ -60,10 +62,10 @@ def load_line_planning_instance_config(config_path: Path) -> LinePlanningInstanc
     base_dir = config_path.parent
 
     lines_val = data.get("lines")
-    if not lines_val:
-        raise ValueError(
-            f"{config_path}: missing required top-level key 'lines' (path to candidate lines file)."
-        )
+    if lines_val is None or lines_val == "" or (
+        isinstance(lines_val, str) and not str(lines_val).strip()
+    ):
+        lines_val = "lines.txt"
     lines_file = _resolve_path(base_dir, str(lines_val))
 
     demand_block = data.get("demand")

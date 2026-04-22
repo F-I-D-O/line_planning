@@ -1,8 +1,53 @@
 """
 MoD-aware line selection script: solve section 4.1 ILP and produce DARP request files
 per section 4.2.1 (Conventional model) for the Ridesharing_DARP_instances format.
+
+Run::
+
+    python MoD-aware_line_selection.py /path/to/experiment.yaml
+
+Configuration is read entirely from the experiment YAML (same layout as ``lineplanning.line_planning.run_experiment``
+where applicable: ``instance``, ``results_dir``, ``solver``, ``mass_transport``), plus MoD-specific keys.
+
+Example ``experiment.yaml``::
+
+    instance: ../../../Instances/my_case/instance_01/config.yaml
+    results_dir: .
+    initial_mod_cost_scale: 1.0
+    iterations: 30
+
+    solver:
+      time_limit: 1500
+      rejection_cost: 1000
+      use_request_line_valid_inequalities: true
+      reuse_model: true
+
+    mass_transport:
+      cost_coefficient: 1.0
+      max_frequency: 20
+      capacity: 30
+      maximum_detour: 3
+      line_mod_aggregate_prune: false
+
+    darp:
+      benchmark_executable: C:/path/to/DARP-benchmark  # optional; default: DARP_BENCHMARK_PATH / env
+      transfer_delay: 0
+
+    vehicles:
+      vehicle_capacity: 5
+
+    max_travel_time_delay:
+      mode: absolute
+      seconds: 300
+
+    mod_cost_recomputation:
+      strategy: aggregate_original_requests
+      smoothing:
+        strategy: none
+        under_relaxation_alpha: 0.3
 """
 
+import argparse
 import csv
 import logging
 import math
@@ -21,19 +66,21 @@ import darpinstances.inout
 import darpbenchmark.experiments
 
 import lineplanning.instance
+import lineplanning.instance_config
+from lineplanning.instance_config import LinePlanningInstancePaths
 import lineplanning.line_planning
 
 
-experiment_data_path = Path(r"C:\Google Drive AIC\My Drive\AIC Experiment Data")
-
-iteration_count = 30
+# Defaults for code that imports this module without running ``main()`` (e.g. test scripts).
 line_planning_ILP_time_limit = 1500  # seconds
 rejection_cost = 1000  # in the travel time units, i.e. seconds of travel time
-
-# Upper bound on per-route frequency y_ρ in the MoD-aware ILP (manuscript §4.1.1).
-max_frequency = 20
-
-line_planning_path = experiment_data_path / "Line Planning"
+max_frequency = 20  # Upper bound on per-route frequency y_ρ in the MoD-aware ILP (manuscript §4.1.1).
+DARP_BENCHMARK_PATH = Path(
+    os.environ.get(
+        "DARP_BENCHMARK_EXECUTABLE",
+        r"C:/Workspaces/AIC/DARP-Benchmark/cmake-build-release/DARP-benchmark",
+    )
+)
 
 
 def setup_file_logging(results_dir: Path) -> Path:
@@ -81,23 +128,23 @@ def _coerce_path(v: object) -> Path:
     raise TypeError(f"Expected str/Path, got {type(v).__name__}")
 
 
-def _parse_mod_cost_scale(cfg: dict, config_path: Path) -> float:
+def _parse_initial_mod_cost_scale(cfg: dict, config_path: Path) -> float:
     """
-    Optional ``mod_cost_scale`` in experiment YAML (default 1.0).
+    Optional ``initial_mod_cost_scale`` in experiment YAML (default 1.0).
     Multiplies every stored MoD leg cost (direct and line+MoD options) after loading the instance.
     """
-    raw = cfg.get("mod_cost_scale", 1.0)
+    raw = cfg.get("initial_mod_cost_scale", 1.0)
     if raw is None:
         return 1.0
     try:
         s = float(raw)
     except (TypeError, ValueError) as exc:
         raise ValueError(
-            f"Invalid mod_cost_scale in {config_path!s}: expected a number, got {raw!r}."
+            f"Invalid initial_mod_cost_scale in {config_path!s}: expected a number, got {raw!r}."
         ) from exc
     if not math.isfinite(s) or s <= 0.0:
         raise ValueError(
-            f"Invalid mod_cost_scale in {config_path!s}: expected a finite number > 0, got {s!r}."
+            f"Invalid initial_mod_cost_scale in {config_path!s}: expected a finite number > 0, got {s!r}."
         )
     return s
 
@@ -107,8 +154,18 @@ def _load_line_planning_paths_from_instance_dir(
 ) -> Tuple[Path, Path, Path]:
     """
     Read the instance folder's config once and resolve demand/dm paths.
+    ``config_path`` may be the instance ``config.yaml`` file or its parent directory (uses ``config.yaml``).
     Returns (demand_path, dm_path, instance_config_path).
     """
+    config_path = Path(config_path).resolve()
+    if config_path.is_dir():
+        cand = config_path / "config.yaml"
+        if not cand.is_file():
+            raise FileNotFoundError(
+                f"Instance path is a directory but no config file found at {cand}."
+            )
+        config_path = cand
+
     config_dir = config_path.parent
 
     with config_path.open("r", encoding="utf-8") as f:
@@ -147,48 +204,198 @@ def _load_line_planning_paths_from_instance_dir(
 EXPERIMENT_CONFIG_FILENAME = "experiment.yaml"
 
 
-def _load_experiment_yaml(results_dir_path: Path) -> Tuple[Path, float, Path]:
+def _parse_darp_vehicles_and_max_delay(
+    raw: Dict[str, Any],
+    experiment_yaml_path: Path,
+) -> Tuple[int, int]:
     """
-    Load ``results_dir_path / experiment.yaml``.
+    Read DARP instance-style keys from experiment YAML (Ridesharing_DARP_instances layout):
 
-    Required key ``instance``: path to the line-planning instance directory, relative to the
-    directory containing the experiment file unless absolute.
-
-    Optional key ``mod_cost_scale`` (default 1.0): passed to :func:`_parse_mod_cost_scale`.
-
-    Returns (resolved_instance_dir, mod_cost_scale, experiment_yaml_path).
+    - ``vehicles.vehicle_capacity`` (default 5 if the ``vehicles`` mapping is absent or omits the key).
+    - ``max_travel_time_delay`` with ``mode: absolute`` and numeric ``seconds`` (defaults to 300 seconds
+      when the block is absent or empty).
     """
-    results_dir_path = Path(results_dir_path)
-    experiment_path = results_dir_path / EXPERIMENT_CONFIG_FILENAME
-    if not experiment_path.is_file():
-        raise FileNotFoundError(
-            f"Experiment config not found: {experiment_path}. "
-            f"Create {EXPERIMENT_CONFIG_FILENAME} under the results directory."
-        )
-    experiment_dir = experiment_path.parent
+    vehicles = raw.get("vehicles") or {}
+    darp_vehicle_capacity = int(vehicles.get("vehicle_capacity", 5))
 
-    with experiment_path.open("r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
-    if not isinstance(cfg, dict):
-        raise ValueError(
-            f"Expected a mapping at top-level in {experiment_path}, got {type(cfg).__name__}."
-        )
-
-    instance_raw = cfg.get("instance")
-    if instance_raw is None or instance_raw == "":
-        raise KeyError(
-            f"Missing required key 'instance' in {experiment_path} "
-            "(path to instance directory, relative to the experiment file's directory unless absolute)."
-        )
-
-    instance_path = _coerce_path(instance_raw)
-    if not instance_path.is_absolute():
-        instance_dir = (experiment_dir / instance_path).resolve()
+    mtd = raw.get("max_travel_time_delay")
+    if isinstance(mtd, dict) and mtd:
+        mode_raw = mtd.get("mode", "absolute")
+        mode = str(mode_raw).strip().lower()
+        if mode != "absolute":
+            raise ValueError(
+                f"{experiment_yaml_path}: max_travel_time_delay.mode must be 'absolute', got {mode_raw!r}."
+            )
+        sec_raw = mtd.get("seconds")
+        if sec_raw is None:
+            raise ValueError(
+                f"{experiment_yaml_path}: max_travel_time_delay.seconds is required when "
+                "max_travel_time_delay is set."
+            )
+        max_travel_time_delay_seconds = int(sec_raw)
     else:
-        instance_dir = instance_path.resolve()
+        max_travel_time_delay_seconds = 300
 
-    mod_cost_scale = _parse_mod_cost_scale(cfg, experiment_path)
-    return instance_dir, mod_cost_scale, experiment_path
+    return darp_vehicle_capacity, max_travel_time_delay_seconds
+
+
+def _parse_yaml_bool(raw: object, default: bool = False) -> bool:
+    """Coerce YAML values to bool (native bool and common string forms)."""
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return raw != 0
+    s = str(raw).strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off", ""):
+        return False
+    return default
+
+
+@dataclass(frozen=True)
+class ModAwareLineSelectionConfig:
+    """Resolved settings from a MoD-aware ``experiment.yaml``."""
+
+    experiment_yaml_path: Path
+    results_dir: Path
+    instance_paths: LinePlanningInstancePaths
+    initial_mod_cost_scale: float
+    iterations: int
+    solver_time_limit: float
+    rejection_cost: float
+    use_request_line_valid_inequalities: bool
+    reuse_model: bool
+    cost_coefficient: float
+    max_frequency: int
+    capacity: int
+    maximum_detour: Any
+    line_mod_aggregate_prune: bool
+    darp_benchmark_executable: Path
+    transfer_delay: float
+    darp_vehicle_capacity: int
+    max_travel_time_delay_seconds: int
+    mod_cost_recomputation_strategy: str
+    mod_cost_smoothing_strategy: str
+    mod_cost_under_relaxation_alpha: float
+
+
+def load_mod_aware_line_selection_config(experiment_yaml_path: Path) -> ModAwareLineSelectionConfig:
+    """
+    Load MoD-aware line selection settings from an experiment YAML file.
+
+    Required:
+    - ``instance``: path to the line-planning instance ``config.yaml`` (same as ``run_experiment``).
+
+    Optional ``darp.benchmark_executable``: path to the DARP-benchmark binary; if omitted, uses
+    module default :data:`DARP_BENCHMARK_PATH` (from ``DARP_BENCHMARK_EXECUTABLE`` when set).
+
+    Optional ``results_dir``: output root (defaults to the experiment file's directory); see
+    :func:`lineplanning.instance_config.resolve_results_dir`.
+
+    Optional ``initial_mod_cost_scale`` (default 1.0): scales stored MoD costs after load.
+
+    Optional ``darp.transfer_delay`` (seconds, default 0): extra delay δ_transfer when building DARP
+    request times for first/last mile.
+
+    DARP instance fields (same shape as Ridesharing_DARP_instances ``config.yaml``): optional
+    ``vehicles.vehicle_capacity`` and ``max_travel_time_delay`` with ``mode: absolute`` and
+    ``seconds: <int>``.
+
+    MoD cost update: ``mod_cost_recomputation`` with ``strategy`` and optional nested ``smoothing``
+    (``strategy``, ``under_relaxation_alpha``).
+
+    Other keys default to the previous script defaults documented in the module docstring.
+    """
+    experiment_yaml_path = Path(experiment_yaml_path).resolve()
+    raw = lineplanning.instance_config.load_experiment_yaml(experiment_yaml_path)
+    inst_path = lineplanning.instance_config.resolve_instance_config_path(experiment_yaml_path, raw)
+    instance_paths = lineplanning.instance_config.load_line_planning_instance_config(inst_path)
+    results_dir = lineplanning.instance_config.resolve_results_dir(experiment_yaml_path, raw)
+
+    solver = raw.get("solver") or {}
+    mt = raw.get("mass_transport") or {}
+    darp = raw.get("darp") or {}
+    mod_recomputation = raw.get("mod_cost_recomputation") or {}
+
+    initial_mod_cost_scale = _parse_initial_mod_cost_scale(raw, experiment_yaml_path)
+
+    iterations_raw = raw.get("iterations", 30)
+    try:
+        iterations = int(iterations_raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid iterations in {experiment_yaml_path}: expected int, got {iterations_raw!r}."
+        ) from exc
+    if iterations < 1:
+        raise ValueError(f"iterations must be >= 1 in {experiment_yaml_path}, got {iterations}.")
+
+    solver_time_limit = float(solver.get("time_limit", 1500))
+    rejection_cost_cfg = float(solver.get("rejection_cost", 1000) or 0)
+    use_request_line_valid_inequalities = _parse_yaml_bool(
+        solver.get("use_request_line_valid_inequalities"), default=True
+    )
+    reuse_model = _parse_yaml_bool(solver.get("reuse_model"), default=True)
+
+    cost_coefficient = float(mt.get("cost_coefficient", 1.0))
+    max_frequency_cfg = int(mt.get("max_frequency", 20))
+    capacity = int(mt.get("capacity", 30))
+    maximum_detour = mt.get("maximum_detour", 3)
+    line_mod_aggregate_prune = _parse_yaml_bool(mt.get("line_mod_aggregate_prune"), default=False)
+
+    darp_exe = darp.get("benchmark_executable")
+    if darp_exe is None or (isinstance(darp_exe, str) and not str(darp_exe).strip()):
+        # Same default as module-level ``DARP_BENCHMARK_PATH`` (``DARP_BENCHMARK_EXECUTABLE`` env).
+        darp_benchmark_executable = Path(DARP_BENCHMARK_PATH).resolve()
+    else:
+        darp_benchmark_executable = Path(str(darp_exe).strip()).expanduser()
+        if not darp_benchmark_executable.is_absolute():
+            darp_benchmark_executable = (experiment_yaml_path.parent / darp_benchmark_executable).resolve()
+        else:
+            darp_benchmark_executable = darp_benchmark_executable.resolve()
+
+    transfer_delay = float(darp.get("transfer_delay", 0))
+
+    darp_vehicle_capacity, max_travel_time_delay_seconds = _parse_darp_vehicles_and_max_delay(
+        raw,
+        experiment_yaml_path,
+    )
+
+    mod_cost_recomputation_strategy = str(
+        mod_recomputation.get("strategy", "aggregate_original_requests")
+    ).strip()
+
+    smoothing_block = mod_recomputation.get("smoothing")
+    if not isinstance(smoothing_block, dict):
+        smoothing_block = {}
+    mod_cost_smoothing_strategy = str(smoothing_block.get("strategy", "none")).strip()
+    mod_cost_under_relaxation_alpha = float(smoothing_block.get("under_relaxation_alpha", 0.3))
+
+    return ModAwareLineSelectionConfig(
+        experiment_yaml_path=experiment_yaml_path,
+        results_dir=results_dir,
+        instance_paths=instance_paths,
+        initial_mod_cost_scale=initial_mod_cost_scale,
+        iterations=iterations,
+        solver_time_limit=solver_time_limit,
+        rejection_cost=rejection_cost_cfg,
+        use_request_line_valid_inequalities=use_request_line_valid_inequalities,
+        reuse_model=reuse_model,
+        cost_coefficient=cost_coefficient,
+        max_frequency=max_frequency_cfg,
+        capacity=capacity,
+        maximum_detour=maximum_detour,
+        line_mod_aggregate_prune=line_mod_aggregate_prune,
+        darp_benchmark_executable=darp_benchmark_executable,
+        transfer_delay=transfer_delay,
+        darp_vehicle_capacity=darp_vehicle_capacity,
+        max_travel_time_delay_seconds=max_travel_time_delay_seconds,
+        mod_cost_recomputation_strategy=mod_cost_recomputation_strategy,
+        mod_cost_smoothing_strategy=mod_cost_smoothing_strategy,
+        mod_cost_under_relaxation_alpha=mod_cost_under_relaxation_alpha,
+    )
 
 
 def _load_demand_and_dm_from_instance_config(instance_dir_path: Path) -> Tuple[Path, Path]:
@@ -196,14 +403,11 @@ def _load_demand_and_dm_from_instance_config(instance_dir_path: Path) -> Tuple[P
     return demand_path, dm_path
 
 
-DARP_BENCHMARK_PATH = Path(r"C:/Workspaces/AIC/DARP-Benchmark/cmake-build-release/DARP-benchmark")
-
-
 def solution_to_darp_requests(
     line_instance: "lineplanning.instance.line_instance",
     request_assignments: List[Tuple[str, Optional[int]]],
     request_times: Optional[List[Union[int, float]]] = None,
-    delta_transfer_seconds: Union[int, float] = 0,
+    transfer_delay: Union[int, float] = 0,
 ) -> List[dict]:
     """
     Build the set of MoD requests R_MoD for the conventional model (section 4.2.1).
@@ -274,7 +478,7 @@ def solution_to_darp_requests(
 
         # t_board ≈ t_r + ftt(o_r, s^b) + δ_transfer (equation 10; using dm as travel time)
         first_mile_time = float(dm[o_r][sb]) if dm is not None and sb >= 0 else 0.0
-        t_board = t_r + first_mile_time + delta_transfer_seconds
+        t_board = t_r + first_mile_time + transfer_delay
 
         # Segment travel time on line (boarding to unboarding)
         line_length = set_of_lines[route][0]
@@ -752,6 +956,80 @@ class ModCostRecomputeContext:
 ModCostRecomputeStrategy = Callable[[ModCostRecomputeContext], Dict[int, Tuple[float, float]]]
 
 
+@dataclass(frozen=True)
+class ModCostSmoothingContext:
+    """
+    Inputs for MoD cost smoothing applied **after** a recompute strategy and **before**
+    ``update_mod_costs``.
+
+    ``previous`` must reflect coefficients already stored on the instance for the current
+    assignment pattern *after* the recompute strategy returns (e.g. after global rescaling),
+    so that ``previous`` and ``proposed`` live in the same scale.
+
+    Extra fields are available for future smoothing rules without changing call sites.
+    """
+
+    proposed: Dict[int, Tuple[float, float]]
+    previous: Dict[int, Tuple[float, float]]
+    line_instance: "lineplanning.instance.line_instance"
+    request_assignments: List[Tuple[str, Optional[int]]]
+
+
+ModCostSmoothingStrategy = Callable[[ModCostSmoothingContext], Dict[int, Tuple[float, float]]]
+
+
+def smoothing__none(ctx: ModCostSmoothingContext) -> Dict[int, Tuple[float, float]]:
+    """Pass through recompute output unchanged."""
+    return dict(ctx.proposed)
+
+
+def make_smoothing_under_relaxation(alpha: float) -> ModCostSmoothingStrategy:
+    """
+    Under-relaxation on the (first_mile, last_mile) pair per served request::
+
+        c_new = (1 - α) * c_DARP + α * c_old
+
+    with ``c_DARP`` = proposed and ``c_old`` = previous (from context), component-wise.
+    ``alpha`` is read from experiment YAML ``mod_cost_recomputation.smoothing.under_relaxation_alpha``.
+    """
+    alpha_f = float(alpha)
+    if not math.isfinite(alpha_f) or not (0.0 <= alpha_f <= 1.0):
+        raise ValueError(
+            f"mod_cost_recomputation.smoothing.under_relaxation_alpha must be finite and in [0, 1], got {alpha!r}."
+        )
+
+    def smoothing_under_relaxation(ctx: ModCostSmoothingContext) -> Dict[int, Tuple[float, float]]:
+        if ctx.proposed.keys() != ctx.previous.keys():
+            raise ValueError(
+                "Smoothing requires proposed and previous cost dicts with identical keys; "
+                f"proposed={sorted(ctx.proposed.keys())} previous={sorted(ctx.previous.keys())}"
+            )
+        out: Dict[int, Tuple[float, float]] = {}
+        oma = 1.0 - alpha_f
+        for k, (pf, pl) in ctx.proposed.items():
+            of, ol = ctx.previous[k]
+            out[k] = (oma * float(pf) + alpha_f * float(of), oma * float(pl) + alpha_f * float(ol))
+        return out
+
+    return smoothing_under_relaxation
+
+
+def resolve_mod_cost_smoothing_strategy(
+    name: str,
+    *,
+    under_relaxation_alpha: float,
+) -> ModCostSmoothingStrategy:
+    """Build smoothing from experiment YAML ``mod_cost_recomputation.smoothing.strategy``."""
+    key = str(name).strip()
+    if key == "none":
+        return smoothing__none
+    if key == "under_relaxation":
+        return make_smoothing_under_relaxation(under_relaxation_alpha)
+    raise KeyError(
+        f"Unknown mod_cost_recomputation.smoothing.strategy={name!r}. Available: none, under_relaxation"
+    )
+
+
 def recompute_costs__aggregate_original_requests(
     ctx: ModCostRecomputeContext,
 ) -> Dict[int, Tuple[float, float]]:
@@ -819,7 +1097,7 @@ def recompute_costs__rescale_avg_cost_per_traveltime_and_request(
     return _scale_costs(new_costs, factor)
 
 
-MOD_COST_RECOMPUTE_STRATEGIES: Dict[str, ModCostRecomputeStrategy] = {
+MOD_COST_RECOMPUTATION_STRATEGIES: Dict[str, ModCostRecomputeStrategy] = {
     # Baseline / reference implementation (current script behavior)
     "aggregate_original_requests": recompute_costs__aggregate_original_requests,
     # First alternative strategy (requested)
@@ -827,10 +1105,6 @@ MOD_COST_RECOMPUTE_STRATEGIES: Dict[str, ModCostRecomputeStrategy] = {
         recompute_costs__rescale_avg_cost_per_traveltime_and_request
     ),
 }
-
-# Configure which strategy to use for MoD cost recomputation.
-# MOD_COST_RECOMPUTE_STRATEGY = "rescale_avg_cost_per_traveltime_and_request"
-MOD_COST_RECOMPUTE_STRATEGY = "aggregate_original_requests"
 
 MOD_COST_SNAPSHOT_FILENAME = "mod_cost_snapshot.csv"
 MOD_COST_INITIAL_FILENAME = "mod_costs_initial.csv"
@@ -960,67 +1234,75 @@ def export_mod_costs_csv(
 
 
 def main() -> None:
-    demand_file = None
-    dm_file = None
-
-    # Results folder must contain experiment.yaml with keys:
-    #   instance: path to instance directory (relative to this file unless absolute)
-    #   mod_cost_scale: optional, default 1.0
-    # Example experiment.yaml next to iteration_* subfolders:
-    #   instance: ../../../Instances/manhattan-2_h-10_percent/instance_01
-    #   mod_cost_scale: 1.0
-    results_dir_path = line_planning_path / "Results/manhattan-2_h-10_percent/instance_01/mod-aware"
-
-    instance_config_path, mod_cost_scale, experiment_yaml_path = _load_experiment_yaml(results_dir_path)
-    instance_dir = instance_config_path.parent
-    candidate_lines_file = instance_dir / "lines.txt"
-
-    inferred_demand_file, inferred_dm_file, _instance_config_path = _load_line_planning_paths_from_instance_dir(
-        instance_config_path
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "experiment_config",
+        type=Path,
+        help="Path to experiment.yaml (MoD-aware configuration; see module docstring).",
     )
-    if demand_file is None:
-        demand_file = inferred_demand_file
-    if dm_file is None:
-        dm_file = inferred_dm_file
+    args = parser.parse_args()
 
-    if demand_file is None or dm_file is None:
-        raise ValueError(
-            "demand_file and dm_file must be set either directly in the script or via instance_dir/config.yaml."
-        )
+    cfg = load_mod_aware_line_selection_config(args.experiment_config)
+
+    inst = cfg.instance_paths
+    demand_file = inst.demand_file
+    dm_file = inst.dm_file
+    preprocessing_dir = inst.config_path.parent / "preprocessing"
+
+    results_dir_path = cfg.results_dir
+    results_dir_path.mkdir(parents=True, exist_ok=True)
 
     setup_file_logging(results_dir_path)
+    logging.info("Loaded experiment configuration from %s", cfg.experiment_yaml_path)
+    logging.info("Results directory: %s", cfg.results_dir)
+    logging.info("DARP benchmark executable: %s", cfg.darp_benchmark_executable)
 
+    prune_rej = cfg.rejection_cost if cfg.rejection_cost > 0 else None
     line_inst = lineplanning.instance.line_instance(
-        candidate_lines_file=candidate_lines_file,
-        capacity=30,
-        maximum_detour=3,
+        candidate_lines_file=inst.lines_file,
+        capacity=cfg.capacity,
+        maximum_detour=cfg.maximum_detour,
         demand_file=demand_file,
-        preprocessing_dir=instance_dir / "preprocessing",
+        preprocessing_dir=preprocessing_dir,
         dm_file=dm_file,
+        line_mod_aggregate_prune=cfg.line_mod_aggregate_prune,
+        line_mod_aggregate_prune_cost_coefficient=cfg.cost_coefficient,
+        line_mod_aggregate_prune_rejection_cost=prune_rej,
     )
 
-    if mod_cost_scale != 1.0:
+    if cfg.initial_mod_cost_scale != 1.0:
         logging.info(
-            "Applying mod_cost_scale=%s from experiment config %s (direct + all line MoD options)",
-            mod_cost_scale,
-            experiment_yaml_path,
+            "Applying initial_mod_cost_scale=%s from experiment config %s (direct + all line MoD options)",
+            cfg.initial_mod_cost_scale,
+            cfg.experiment_yaml_path,
         )
-        _scale_all_mod_costs_in_model(line_inst, mod_cost_scale)
+        _scale_all_mod_costs_in_model(line_inst, cfg.initial_mod_cost_scale)
 
     solver = lineplanning.line_planning.LinePlanningSolver(
         line_inst,
-        time_limit=line_planning_ILP_time_limit,
-        cost_coefficient=1.0,
-        max_frequency=max_frequency,
+        time_limit=cfg.solver_time_limit,
+        cost_coefficient=cfg.cost_coefficient,
+        max_frequency=cfg.max_frequency,
     )
 
-    instance_size_label = lineplanning.line_planning.get_instance_size_label(demand_file)
+    instance_size_label = lineplanning.line_planning.get_instance_size_label(str(demand_file))
 
     export_mod_costs_csv(line_inst, results_dir_path / MOD_COST_INITIAL_FILENAME)
 
+    recompute_strategy = MOD_COST_RECOMPUTATION_STRATEGIES.get(cfg.mod_cost_recomputation_strategy)
+    if recompute_strategy is None:
+        raise KeyError(
+            f"Unknown mod_cost_recomputation.strategy={cfg.mod_cost_recomputation_strategy!r}. "
+            f"Available: {sorted(MOD_COST_RECOMPUTATION_STRATEGIES.keys())}"
+        )
+    smoother = resolve_mod_cost_smoothing_strategy(
+        cfg.mod_cost_smoothing_strategy,
+        under_relaxation_alpha=cfg.mod_cost_under_relaxation_alpha,
+    )
+
     try:
-        for i in range(iteration_count):
-            logging.info("Iteration %s of %s", i + 1, iteration_count)
+        for i in range(cfg.iterations):
+            logging.info("Iteration %s of %s", i + 1, cfg.iterations)
 
             results_dir_path_per_iteration = results_dir_path / f"iteration_{i+1}"
             results_dir_path_per_iteration.mkdir(parents=True, exist_ok=True)
@@ -1048,10 +1330,10 @@ def main() -> None:
                         export_solution=True,
                         output_dir=results_dir_path_per_iteration,
                         gurobi_log_file=results_dir_path_per_iteration / "gurobi.log",
-                        max_route_frequency=max_frequency,
-                        rejection_cost=rejection_cost,
-                        use_request_line_valid_inequalities=True,
-                        reuse_model=True,
+                        max_route_frequency=cfg.max_frequency,
+                        rejection_cost=cfg.rejection_cost,
+                        use_request_line_valid_inequalities=cfg.use_request_line_valid_inequalities,
+                        reuse_model=cfg.reuse_model,
                     )
                 )
                 # 1.2 Write metrics.json
@@ -1063,7 +1345,12 @@ def main() -> None:
                     "run_time_seconds": run_time_ILP,
                     "instance_size": instance_size_label,
                     "demand_file": str(demand_file),
-                    "max_route_frequency": max_frequency,
+                    "experiment_config": str(cfg.experiment_yaml_path),
+                    "max_route_frequency": cfg.max_frequency,
+                    "solver_time_limit": cfg.solver_time_limit,
+                    "rejection_cost": cfg.rejection_cost,
+                    "mod_cost_recomputation_strategy": cfg.mod_cost_recomputation_strategy,
+                    "mod_cost_smoothing_strategy": cfg.mod_cost_smoothing_strategy,
                     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
                 }
                 results_file = results_dir_path_per_iteration / "metrics.json"
@@ -1075,26 +1362,26 @@ def main() -> None:
                     line_inst,
                     request_assignments,
                     request_times=None,
-                    delta_transfer_seconds=0,
+                    transfer_delay=cfg.transfer_delay,
                 )
                 write_darp_requests_csv(darp_requests, requests_csv_path, time_format="seconds")
                 write_darp_vehicles_csv(
                     darp_requests,
                     results_dir_path_per_iteration / "vehicles.csv",
-                    capacity=5,
+                    capacity=cfg.darp_vehicle_capacity,
                     time_format="seconds",
                 )
                 write_darp_config_yaml(
                     output_dir=results_dir_path_per_iteration,
                     dm_filepath=dm_file,
-                    max_travel_time_delay_seconds=300,
-                    vehicle_capacity=5,
+                    max_travel_time_delay_seconds=cfg.max_travel_time_delay_seconds,
+                    vehicle_capacity=cfg.darp_vehicle_capacity,
                 )
 
             # 2.2 call DARP solver
             darpbenchmark.experiments.run_experiment_using_config(
                 experiment_config_path,
-                executable_path=DARP_BENCHMARK_PATH,
+                executable_path=cfg.darp_benchmark_executable,
             )
 
             # 3. Recompute the MoD cost estimates (section 4.3.2)
@@ -1107,21 +1394,26 @@ def main() -> None:
                 request_assignments,
             )
 
-            strategy = MOD_COST_RECOMPUTE_STRATEGIES.get(MOD_COST_RECOMPUTE_STRATEGY)
-            if strategy is None:
-                raise KeyError(
-                    f"Unknown MOD_COST_RECOMPUTE_STRATEGY={MOD_COST_RECOMPUTE_STRATEGY!r}. "
-                    f"Available: {sorted(MOD_COST_RECOMPUTE_STRATEGIES.keys())}"
-                )
             ctx = ModCostRecomputeContext(
                 line_instance=line_inst,
                 request_assignments=request_assignments,
                 darp_request_leg_costs=darp_request_leg_costs,
                 darp_requests=darp_requests,
             )
-            new_mod_costs = strategy(ctx)
+            new_mod_costs = recompute_strategy(ctx)
 
-            solver.update_mod_costs(new_mod_costs, request_assignments)
+            previous_mod_costs = _get_current_costs_for_assignments(
+                line_inst, request_assignments
+            )
+            smooth_ctx = ModCostSmoothingContext(
+                proposed=new_mod_costs,
+                previous=previous_mod_costs,
+                line_instance=line_inst,
+                request_assignments=request_assignments,
+            )
+            final_mod_costs = smoother(smooth_ctx)
+
+            solver.update_mod_costs(final_mod_costs, request_assignments)
             logging.info("Iteration %s: updated MoD costs for %s requests", i + 1, len(new_mod_costs))
             export_mod_costs_csv(
                 line_inst,

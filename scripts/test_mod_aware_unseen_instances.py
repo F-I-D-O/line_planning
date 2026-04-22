@@ -191,15 +191,20 @@ def run_first_iteration_pipeline(
     (optional calibration of MoD costs before the ILP).
     """
     output_dir.mkdir(parents=True, exist_ok=True)
-    demand_file, dm_file = mod._load_demand_and_dm_from_instance_config(instance_dir)
-    candidate_lines_file = instance_dir / "lines.txt"
+    inst_paths = lineplanning.instance_config.load_line_planning_instance_config(
+        instance_dir / "config.yaml"
+    )
+    demand_file = inst_paths.demand_file
+    dm_file = inst_paths.dm_file
+    candidate_lines_file = inst_paths.lines_file
+    instance_root = inst_paths.config_path.parent
 
     line_inst = lineplanning.instance.line_instance(
         candidate_lines_file=candidate_lines_file,
         capacity=30,
         maximum_detour=3,
         demand_file=demand_file,
-        preprocessing_dir=instance_dir / "preprocessing",
+        preprocessing_dir=instance_root / "preprocessing",
         dm_file=dm_file,
     )
 
@@ -246,7 +251,7 @@ def run_first_iteration_pipeline(
         line_inst,
         request_assignments,
         request_times=None,
-        delta_transfer_seconds=0,
+        transfer_delay=0,
     )
     requests_csv_path = results_dir_path_per_iteration / "requests.csv"
     mod.write_darp_requests_csv(darp_requests, requests_csv_path, time_format="seconds")
