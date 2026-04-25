@@ -42,6 +42,8 @@ Example ``experiment.yaml``::
 
     mod_cost_recomputation:
       strategy: aggregate_original_requests
+      # For clustered_avg also set clusters: <int> and features: [travel_time, ...]
+      # Optional: random_state, n_init (KMeans)
       smoothing:
         strategy: none
         under_relaxation_alpha: 0.3
@@ -57,9 +59,11 @@ import sys
 import time
 import json
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
+import numpy as np
 import yaml
+from sklearn.cluster import KMeans
 
 import darpinstances.inout
 
@@ -203,6 +207,330 @@ def _load_line_planning_paths_from_instance_dir(
 
 EXPERIMENT_CONFIG_FILENAME = "experiment.yaml"
 
+DARP_POOL_EXPORT_MAP_FILENAME = "darp_pool_export_map.json"
+
+
+@dataclass(frozen=True)
+class DarpPoolRow:
+    """One canonical MoD leg row in the full DARP request pool (all trip options)."""
+
+    pool_id: int
+    passenger_idx: int
+    route_idx: Optional[int]
+    leg_kind: str
+    origin: int
+    destination: int
+    time: float
+
+
+@dataclass(frozen=True)
+class ClusteredAvgState:
+    """Extra inputs for ``clustered_avg`` recomputation (built each iteration after export)."""
+
+    pool_rows: Tuple[DarpPoolRow, ...]
+    pool_id_to_cluster: Dict[int, int]
+    exported_id_to_pool_id: Dict[int, int]
+    feature_names: Tuple[str, ...]
+    n_clusters_requested: int
+
+
+def _pool_feature_travel_time(
+    line_instance: "lineplanning.instance.line_instance",
+    row: DarpPoolRow,
+) -> float:
+    dm = line_instance.dm
+    return float(dm[row.origin][row.destination])
+
+
+POOL_FEATURE_BUILDERS: Dict[str, Callable[["lineplanning.instance.line_instance", DarpPoolRow], float]] = {
+    "travel_time": _pool_feature_travel_time,
+}
+
+
+def _pool_rows_feature_matrix(
+    line_instance: "lineplanning.instance.line_instance",
+    pool_rows: Sequence[DarpPoolRow],
+    feature_names: Tuple[str, ...],
+) -> np.ndarray:
+    for name in feature_names:
+        if name not in POOL_FEATURE_BUILDERS:
+            raise KeyError(
+                f"Unknown mod_cost_recomputation feature {name!r}. "
+                f"Available: {sorted(POOL_FEATURE_BUILDERS.keys())}"
+            )
+    X = np.zeros((len(pool_rows), len(feature_names)), dtype=float)
+    for i, row in enumerate(pool_rows):
+        for j, name in enumerate(feature_names):
+            X[i, j] = float(POOL_FEATURE_BUILDERS[name](line_instance, row))
+    return X
+
+
+def build_darp_request_pool(
+    line_instance: "lineplanning.instance.line_instance",
+    request_times: Optional[List[Union[int, float]]] = None,
+    transfer_delay: Union[int, float] = 0,
+) -> List[DarpPoolRow]:
+    """
+    Full pool of DARP legs for every passenger direct trip and every feasible line option.
+
+    Row timing and geometry match :func:`solution_to_darp_requests` for the same inputs.
+    """
+    nb_pass = line_instance.nb_pass
+    if request_times is None:
+        request_times = [0] * nb_pass
+    if len(request_times) != nb_pass:
+        request_times = list(request_times) + [0] * (nb_pass - len(request_times))
+
+    dm = line_instance.dm
+    requests_od = line_instance.requests
+    set_of_lines = line_instance.set_of_lines
+    lengths_travel_times = line_instance.lengths_travel_times
+
+    rows: List[DarpPoolRow] = []
+    pool_id = 0
+    td = float(transfer_delay)
+
+    for r in range(nb_pass):
+        o_r = int(requests_od[r][0])
+        d_r = int(requests_od[r][1])
+        t_r = float(request_times[r])
+
+        rows.append(
+            DarpPoolRow(
+                pool_id=pool_id,
+                passenger_idx=r,
+                route_idx=None,
+                leg_kind="no_mt",
+                origin=o_r,
+                destination=d_r,
+                time=t_r,
+            )
+        )
+        pool_id += 1
+
+        opts = line_instance.optimal_trip_options[r]
+        for rho in sorted(opts.keys()):
+            opt = line_instance.trip_option_on_line(r, rho)
+            if opt is None:
+                continue
+            sb = int(opt.mt_pickup_node)
+            su = int(opt.mt_drop_off_node)
+
+            rows.append(
+                DarpPoolRow(
+                    pool_id=pool_id,
+                    passenger_idx=r,
+                    route_idx=int(rho),
+                    leg_kind="first_mile",
+                    origin=o_r,
+                    destination=sb,
+                    time=t_r,
+                )
+            )
+            pool_id += 1
+
+            first_mile_time = float(dm[o_r][sb]) if dm is not None and sb >= 0 else 0.0
+            t_board = t_r + first_mile_time + td
+
+            line_length = int(set_of_lines[rho][0])
+            if line_length > 0 and lengths_travel_times is not None:
+                segment_edges = max(0, opt.mt_drop_off_line_edge_index - opt.mt_pickup_line_edge_index)
+                segment_time = float(lengths_travel_times[rho]) * (segment_edges / line_length)
+            else:
+                segment_time = 0.0
+            t_unboard = t_board + segment_time
+
+            rows.append(
+                DarpPoolRow(
+                    pool_id=pool_id,
+                    passenger_idx=r,
+                    route_idx=int(rho),
+                    leg_kind="last_mile",
+                    origin=su,
+                    destination=d_r,
+                    time=float(t_unboard),
+                )
+            )
+            pool_id += 1
+
+    return rows
+
+
+def pool_key_to_pool_id_map(pool_rows: Sequence[DarpPoolRow]) -> Dict[Tuple[int, Optional[int], str], int]:
+    m: Dict[Tuple[int, Optional[int], str], int] = {}
+    for row in pool_rows:
+        key = (row.passenger_idx, row.route_idx, row.leg_kind)
+        if key in m:
+            raise ValueError(f"Duplicate DARP pool key {key}")
+        m[key] = row.pool_id
+    return m
+
+
+def fit_kmeans_pool_cluster_labels(
+    line_instance: "lineplanning.instance.line_instance",
+    pool_rows: Sequence[DarpPoolRow],
+    feature_names: Tuple[str, ...],
+    n_clusters: int,
+    *,
+    random_state: int,
+    n_init: int,
+) -> np.ndarray:
+    """Return shape (len(pool_rows),) integer cluster label per pool row."""
+    n_samples = len(pool_rows)
+    if n_samples == 0:
+        return np.zeros(0, dtype=int)
+    X = _pool_rows_feature_matrix(line_instance, tuple(pool_rows), feature_names)
+    k_req = max(1, int(n_clusters))
+    k_eff = min(k_req, n_samples)
+    if k_eff < k_req:
+        logging.warning(
+            "KMeans: reducing clusters from %s to %s (pool size=%s).",
+            k_req,
+            k_eff,
+            n_samples,
+        )
+    km = KMeans(
+        n_clusters=k_eff,
+        random_state=int(random_state),
+        n_init=int(n_init),
+    )
+    return km.fit_predict(X)
+
+
+def select_darp_requests_from_pool(
+    pool_rows: Sequence[DarpPoolRow],
+    request_assignments: List[Tuple[str, Optional[int]]],
+) -> Tuple[List[dict], Dict[int, int]]:
+    """
+    Same passenger iteration order and leg ordering as :func:`solution_to_darp_requests`.
+
+    Returns exported DARP request dicts (sequential ``id`` 0..n-1) and ``exported_id -> pool_id``.
+    """
+    key_to_pid = pool_key_to_pool_id_map(pool_rows)
+    by_id = {r.pool_id: r for r in pool_rows}
+
+    darp_requests: List[dict] = []
+    exported_to_pool: Dict[int, int] = {}
+    export_id = 0
+    nb_pass = len(request_assignments)
+
+    for r in range(nb_pass):
+        kind, line_idx = request_assignments[r]
+        if kind == "rejected":
+            continue
+        if kind == "no_MT" or line_idx is None:
+            pid = key_to_pid[(r, None, "no_mt")]
+            row = by_id[pid]
+            darp_requests.append(
+                {
+                    "id": export_id,
+                    "original_request_id": r,
+                    "origin": row.origin,
+                    "destination": row.destination,
+                    "time": row.time,
+                }
+            )
+            exported_to_pool[export_id] = pid
+            export_id += 1
+            continue
+
+        route = int(line_idx)
+        pid_fm = key_to_pid[(r, route, "first_mile")]
+        pid_lm = key_to_pid[(r, route, "last_mile")]
+        row_fm = by_id[pid_fm]
+        row_lm = by_id[pid_lm]
+
+        darp_requests.append(
+            {
+                "id": export_id,
+                "original_request_id": r,
+                "origin": row_fm.origin,
+                "destination": row_fm.destination,
+                "time": row_fm.time,
+            }
+        )
+        exported_to_pool[export_id] = pid_fm
+        export_id += 1
+
+        darp_requests.append(
+            {
+                "id": export_id,
+                "original_request_id": r,
+                "origin": row_lm.origin,
+                "destination": row_lm.destination,
+                "time": row_lm.time,
+            }
+        )
+        exported_to_pool[export_id] = pid_lm
+        export_id += 1
+
+    return darp_requests, exported_to_pool
+
+
+def write_darp_pool_export_map(path: Path, exported_to_pool: Dict[int, int]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    order = [exported_to_pool[i] for i in range(len(exported_to_pool))]
+    path.write_text(json.dumps({"export_pool_id_order": order}, indent=2), encoding="utf-8")
+
+
+def load_darp_pool_export_map(path: Path) -> Dict[int, int]:
+    path = Path(path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    order = data["export_pool_id_order"]
+    return {i: int(pid) for i, pid in enumerate(order)}
+
+
+def _old_mod_leg_cost_on_instance(
+    line_instance: "lineplanning.instance.line_instance",
+    pool_row: DarpPoolRow,
+) -> float:
+    p = pool_row.passenger_idx
+    if pool_row.leg_kind == "no_mt":
+        opt = line_instance.direct_trip_options[p]
+        return float(opt.first_mile_cost) + float(opt.last_mile_cost)
+    assert pool_row.route_idx is not None
+    opt = line_instance.optimal_trip_options[p][int(pool_row.route_idx)]
+    if pool_row.leg_kind == "first_mile":
+        return float(opt.first_mile_cost)
+    if pool_row.leg_kind == "last_mile":
+        return float(opt.last_mile_cost)
+    raise AssertionError(f"unexpected leg_kind {pool_row.leg_kind!r}")
+
+
+def _sanity_check_pool_export_matches_solution_to_darp(
+    line_instance: "lineplanning.instance.line_instance",
+    request_assignments: List[Tuple[str, Optional[int]]],
+    pool_export_requests: List[dict],
+    *,
+    transfer_delay: float,
+) -> None:
+    legacy = solution_to_darp_requests(
+        line_instance,
+        request_assignments,
+        request_times=None,
+        transfer_delay=transfer_delay,
+    )
+
+    def norm_rows(rows: List[dict]) -> List[Tuple[Any, ...]]:
+        out = []
+        for row in rows:
+            out.append(
+                (
+                    int(row["original_request_id"]),
+                    int(row["origin"]),
+                    int(row["destination"]),
+                    float(row["time"]),
+                )
+            )
+        return out
+
+    if norm_rows(legacy) != norm_rows(pool_export_requests):
+        raise AssertionError(
+            "Pool export differs from solution_to_darp_requests:\n"
+            f"legacy={norm_rows(legacy)!r}\npool={norm_rows(pool_export_requests)!r}"
+        )
+
 
 def _parse_darp_vehicles_and_max_delay(
     raw: Dict[str, Any],
@@ -280,6 +608,10 @@ class ModAwareLineSelectionConfig:
     mod_cost_recomputation_strategy: str
     mod_cost_smoothing_strategy: str
     mod_cost_under_relaxation_alpha: float
+    mod_cost_recomputation_clusters: Optional[int]
+    mod_cost_recomputation_features: Optional[Tuple[str, ...]]
+    kmeans_random_state: int
+    kmeans_n_init: int
 
 
 def load_mod_aware_line_selection_config(experiment_yaml_path: Path) -> ModAwareLineSelectionConfig:
@@ -373,6 +705,35 @@ def load_mod_aware_line_selection_config(experiment_yaml_path: Path) -> ModAware
     mod_cost_smoothing_strategy = str(smoothing_block.get("strategy", "none")).strip()
     mod_cost_under_relaxation_alpha = float(smoothing_block.get("under_relaxation_alpha", 0.3))
 
+    clusters_raw = mod_recomputation.get("clusters")
+    features_raw = mod_recomputation.get("features")
+    mod_cost_recomputation_clusters: Optional[int] = None
+    mod_cost_recomputation_features: Optional[Tuple[str, ...]] = None
+    if clusters_raw is not None:
+        mod_cost_recomputation_clusters = int(clusters_raw)
+    if features_raw is not None:
+        if isinstance(features_raw, (list, tuple)):
+            mod_cost_recomputation_features = tuple(str(x).strip() for x in features_raw if str(x).strip())
+        else:
+            raise ValueError(
+                f"{experiment_yaml_path}: mod_cost_recomputation.features must be a list, got {type(features_raw).__name__}."
+            )
+
+    kmeans_random_state = int(mod_recomputation.get("random_state", 0))
+    kmeans_n_init = int(mod_recomputation.get("n_init", 10))
+
+    if mod_cost_recomputation_strategy == "clustered_avg":
+        if mod_cost_recomputation_clusters is None or mod_cost_recomputation_clusters < 1:
+            raise ValueError(
+                f"{experiment_yaml_path}: mod_cost_recomputation.strategy=clustered_avg requires "
+                "mod_cost_recomputation.clusters (int >= 1)."
+            )
+        if not mod_cost_recomputation_features:
+            raise ValueError(
+                f"{experiment_yaml_path}: mod_cost_recomputation.strategy=clustered_avg requires "
+                "a non-empty mod_cost_recomputation.features list."
+            )
+
     return ModAwareLineSelectionConfig(
         experiment_yaml_path=experiment_yaml_path,
         results_dir=results_dir,
@@ -395,6 +756,10 @@ def load_mod_aware_line_selection_config(experiment_yaml_path: Path) -> ModAware
         mod_cost_recomputation_strategy=mod_cost_recomputation_strategy,
         mod_cost_smoothing_strategy=mod_cost_smoothing_strategy,
         mod_cost_under_relaxation_alpha=mod_cost_under_relaxation_alpha,
+        mod_cost_recomputation_clusters=mod_cost_recomputation_clusters,
+        mod_cost_recomputation_features=mod_cost_recomputation_features,
+        kmeans_random_state=kmeans_random_state,
+        kmeans_n_init=kmeans_n_init,
     )
 
 
@@ -951,6 +1316,7 @@ class ModCostRecomputeContext:
     request_assignments: List[Tuple[str, Optional[int]]]
     darp_request_leg_costs: Dict[int, Tuple[float, float]]
     darp_requests: List[dict]
+    clustered_avg_state: Optional[ClusteredAvgState] = None
 
 
 ModCostRecomputeStrategy = Callable[[ModCostRecomputeContext], Dict[int, Tuple[float, float]]]
@@ -1097,6 +1463,129 @@ def recompute_costs__rescale_avg_cost_per_traveltime_and_request(
     return _scale_costs(new_costs, factor)
 
 
+def _apply_cluster_factors_to_all_mod_costs(
+    line_instance: "lineplanning.instance.line_instance",
+    pool_rows: Sequence[DarpPoolRow],
+    pool_id_to_cluster: Dict[int, int],
+    factor_per_cluster: Dict[int, float],
+) -> None:
+    """Multiply stored MoD leg costs by per-cluster factors (FM/LM may differ for line options)."""
+    key_to_pid = pool_key_to_pool_id_map(pool_rows)
+
+    for p in range(line_instance.nb_pass):
+        pid = key_to_pid[(p, None, "no_mt")]
+        c = pool_id_to_cluster[pid]
+        f = float(factor_per_cluster.get(c, 1.0))
+        if f == 1.0:
+            continue
+        opt = line_instance.direct_trip_options[p]
+        line_instance.direct_trip_options[p] = opt._replace(
+            first_mile_cost=float(opt.first_mile_cost) * f,
+            last_mile_cost=float(opt.last_mile_cost) * f,
+        )
+
+    for p in range(line_instance.nb_pass):
+        for rho, opt in list(line_instance.optimal_trip_options[p].items()):
+            irho = int(rho)
+            pid_fm = key_to_pid[(p, irho, "first_mile")]
+            pid_lm = key_to_pid[(p, irho, "last_mile")]
+            cf = float(factor_per_cluster.get(pool_id_to_cluster[pid_fm], 1.0))
+            cl = float(factor_per_cluster.get(pool_id_to_cluster[pid_lm], 1.0))
+            if cf == 1.0 and cl == 1.0:
+                continue
+            line_instance.optimal_trip_options[p][rho] = opt._replace(
+                first_mile_cost=float(opt.first_mile_cost) * cf,
+                last_mile_cost=float(opt.last_mile_cost) * cl,
+            )
+
+
+def recompute_costs__clustered_avg(ctx: ModCostRecomputeContext) -> Dict[int, Tuple[float, float]]:
+    """
+    Per-cluster rescaling of MoD costs using average (cost / leg travel time) from DARP vs instance.
+
+    Requires :attr:`ModCostRecomputeContext.clustered_avg_state` (pool built once, K-means once).
+    """
+    aux = ctx.clustered_avg_state
+    if aux is None:
+        raise ValueError("clustered_avg recomputation requires ModCostRecomputeContext.clustered_avg_state")
+
+    pool_by_id = {r.pool_id: r for r in aux.pool_rows}
+    key_to_pid = pool_key_to_pool_id_map(aux.pool_rows)
+
+    new_ratios: Dict[int, List[float]] = {}
+    old_ratios: Dict[int, List[float]] = {}
+
+    for exp_id, pool_id in aux.exported_id_to_pool_id.items():
+        row = pool_by_id[pool_id]
+        cluster = aux.pool_id_to_cluster[pool_id]
+        tt = _pool_feature_travel_time(ctx.line_instance, row)
+        if tt <= 0.0:
+            continue
+        new_cost = sum(float(x) for x in ctx.darp_request_leg_costs[int(exp_id)])
+        old_cost = _old_mod_leg_cost_on_instance(ctx.line_instance, row)
+        new_ratios.setdefault(cluster, []).append(new_cost / tt)
+        old_ratios.setdefault(cluster, []).append(old_cost / tt)
+
+    factor_per_cluster: Dict[int, float] = {}
+    for cluster in sorted(set(aux.pool_id_to_cluster.values())):
+        nv = new_ratios.get(cluster, [])
+        ov = old_ratios.get(cluster, [])
+        if not nv or not ov:
+            factor_per_cluster[cluster] = 1.0
+            logging.warning(
+                "MoD clustered_avg: cluster %s has insufficient DARP ratios (new=%s old=%s); factor=1.0.",
+                cluster,
+                len(nv),
+                len(ov),
+            )
+            continue
+        new_avg = sum(nv) / len(nv)
+        old_avg = sum(ov) / len(ov)
+        if new_avg <= 0.0 or old_avg <= 0.0:
+            logging.warning(
+                "MoD clustered_avg: cluster %s invalid averages (new_avg=%s old_avg=%s); factor=1.0.",
+                cluster,
+                new_avg,
+                old_avg,
+            )
+            factor_per_cluster[cluster] = 1.0
+            continue
+        factor_per_cluster[cluster] = new_avg / old_avg
+
+    logging.info("MoD clustered_avg factors by cluster: %s", factor_per_cluster)
+
+    _apply_cluster_factors_to_all_mod_costs(
+        ctx.line_instance,
+        aux.pool_rows,
+        aux.pool_id_to_cluster,
+        factor_per_cluster,
+    )
+
+    raw_costs = aggregate_mod_costs_for_original_requests(
+        ctx.darp_request_leg_costs,
+        ctx.darp_requests,
+        ctx.request_assignments,
+    )
+    out: Dict[int, Tuple[float, float]] = {}
+    for orig_id, (fm, lm) in raw_costs.items():
+        kind, rho = ctx.request_assignments[orig_id]
+        if kind == "rejected":
+            continue
+        if kind == "no_MT" or rho is None:
+            pid = key_to_pid[(orig_id, None, "no_mt")]
+            f = float(factor_per_cluster.get(aux.pool_id_to_cluster[pid], 1.0))
+            out[orig_id] = (float(fm) * f, float(lm) * f)
+        else:
+            irho = int(rho)
+            pid_fm = key_to_pid[(orig_id, irho, "first_mile")]
+            pid_lm = key_to_pid[(orig_id, irho, "last_mile")]
+            ff = float(factor_per_cluster.get(aux.pool_id_to_cluster[pid_fm], 1.0))
+            fl = float(factor_per_cluster.get(aux.pool_id_to_cluster[pid_lm], 1.0))
+            out[orig_id] = (float(fm) * ff, float(lm) * fl)
+
+    return out
+
+
 MOD_COST_RECOMPUTATION_STRATEGIES: Dict[str, ModCostRecomputeStrategy] = {
     # Baseline / reference implementation (current script behavior)
     "aggregate_original_requests": recompute_costs__aggregate_original_requests,
@@ -1104,6 +1593,7 @@ MOD_COST_RECOMPUTATION_STRATEGIES: Dict[str, ModCostRecomputeStrategy] = {
     "rescale_avg_cost_per_traveltime_and_request": (
         recompute_costs__rescale_avg_cost_per_traveltime_and_request
     ),
+    "clustered_avg": recompute_costs__clustered_avg,
 }
 
 MOD_COST_SNAPSHOT_FILENAME = "mod_cost_snapshot.csv"
@@ -1285,6 +1775,43 @@ def main() -> None:
         max_frequency=cfg.max_frequency,
     )
 
+    pool_rows: List[DarpPoolRow] = []
+    pool_id_to_cluster: Dict[int, int] = {}
+    if cfg.mod_cost_recomputation_strategy == "clustered_avg":
+        assert cfg.mod_cost_recomputation_clusters is not None
+        assert cfg.mod_cost_recomputation_features is not None
+        pool_rows = build_darp_request_pool(
+            line_inst,
+            request_times=None,
+            transfer_delay=cfg.transfer_delay,
+        )
+        expected_pool = 0
+        for r in range(line_inst.nb_pass):
+            expected_pool += 1
+            for rho in line_inst.optimal_trip_options[r]:
+                if line_inst.trip_option_on_line(r, rho) is not None:
+                    expected_pool += 2
+        if len(pool_rows) != expected_pool:
+            raise RuntimeError(
+                f"DARP pool row count mismatch: got {len(pool_rows)}, expected {expected_pool}"
+            )
+        labels = fit_kmeans_pool_cluster_labels(
+            line_inst,
+            pool_rows,
+            cfg.mod_cost_recomputation_features,
+            cfg.mod_cost_recomputation_clusters,
+            random_state=cfg.kmeans_random_state,
+            n_init=cfg.kmeans_n_init,
+        )
+        pool_id_to_cluster = {row.pool_id: int(labels[i]) for i, row in enumerate(pool_rows)}
+        logging.info(
+            "DARP request pool: %s legs, %s cluster labels (requested k=%s, features=%s)",
+            len(pool_rows),
+            len(set(pool_id_to_cluster.values())),
+            cfg.mod_cost_recomputation_clusters,
+            cfg.mod_cost_recomputation_features,
+        )
+
     instance_size_label = lineplanning.line_planning.get_instance_size_label(str(demand_file))
 
     export_mod_costs_csv(line_inst, results_dir_path / MOD_COST_INITIAL_FILENAME)
@@ -1312,6 +1839,8 @@ def main() -> None:
             passenger_assignments_csv_path = results_dir_path_per_iteration / "passenger_assignments.csv"
             experiment_config_path = results_dir_path_per_iteration / "experiment_ih.yaml"
 
+            exported_to_pool: Optional[Dict[int, int]] = None
+
             if requests_csv_path.exists() and passenger_assignments_csv_path.exists() and experiment_config_path.exists():
                 logging.info(
                     "Iteration %s: DARP input files exist, skipping ILP and loading from files",
@@ -1321,6 +1850,20 @@ def main() -> None:
                 request_assignments = load_request_assignments_csv(
                     passenger_assignments_csv_path,
                 )
+                if cfg.mod_cost_recomputation_strategy == "clustered_avg":
+                    map_path = results_dir_path_per_iteration / DARP_POOL_EXPORT_MAP_FILENAME
+                    if map_path.is_file():
+                        exported_to_pool = load_darp_pool_export_map(map_path)
+                    else:
+                        _, exported_to_pool = select_darp_requests_from_pool(
+                            pool_rows,
+                            request_assignments,
+                        )
+                        logging.warning(
+                            "Iteration %s: missing %s; rebuilt export mapping from assignments",
+                            i + 1,
+                            DARP_POOL_EXPORT_MAP_FILENAME,
+                        )
             else:
                 # 1. Solve the line selection ILP (section 4.1); get selected lines and request-line assignments
                 # Same formulation as experiment ``solver.method: non_budget_ilp`` in ``run_experiment``.
@@ -1356,14 +1899,29 @@ def main() -> None:
                 results_file = results_dir_path_per_iteration / "metrics.json"
                 results_file.write_text(json.dumps(results_payload, indent=2))
 
-                # 2. DARP
-                # Build MoD requests for DARP per section 4.2.1 (Conventional model) and write requests.csv
-                darp_requests = solution_to_darp_requests(
-                    line_inst,
-                    request_assignments,
-                    request_times=None,
-                    transfer_delay=cfg.transfer_delay,
-                )
+                # 2. DARP — export requests.csv (pool selection for clustered_avg, else legacy builder)
+                if cfg.mod_cost_recomputation_strategy == "clustered_avg":
+                    darp_requests, exported_to_pool = select_darp_requests_from_pool(
+                        pool_rows,
+                        request_assignments,
+                    )
+                    _sanity_check_pool_export_matches_solution_to_darp(
+                        line_inst,
+                        request_assignments,
+                        darp_requests,
+                        transfer_delay=cfg.transfer_delay,
+                    )
+                    write_darp_pool_export_map(
+                        results_dir_path_per_iteration / DARP_POOL_EXPORT_MAP_FILENAME,
+                        exported_to_pool,
+                    )
+                else:
+                    darp_requests = solution_to_darp_requests(
+                        line_inst,
+                        request_assignments,
+                        request_times=None,
+                        transfer_delay=cfg.transfer_delay,
+                    )
                 write_darp_requests_csv(darp_requests, requests_csv_path, time_format="seconds")
                 write_darp_vehicles_csv(
                     darp_requests,
@@ -1394,11 +1952,26 @@ def main() -> None:
                 request_assignments,
             )
 
+            clustered_state: Optional[ClusteredAvgState] = None
+            if cfg.mod_cost_recomputation_strategy == "clustered_avg":
+                if exported_to_pool is None:
+                    raise RuntimeError(
+                        "clustered_avg requires exported_id→pool_id mapping (export map or pool selection)"
+                    )
+                clustered_state = ClusteredAvgState(
+                    pool_rows=tuple(pool_rows),
+                    pool_id_to_cluster=dict(pool_id_to_cluster),
+                    exported_id_to_pool_id=dict(exported_to_pool),
+                    feature_names=tuple(cfg.mod_cost_recomputation_features or ()),
+                    n_clusters_requested=int(cfg.mod_cost_recomputation_clusters or 0),
+                )
+
             ctx = ModCostRecomputeContext(
                 line_instance=line_inst,
                 request_assignments=request_assignments,
                 darp_request_leg_costs=darp_request_leg_costs,
                 darp_requests=darp_requests,
+                clustered_avg_state=clustered_state,
             )
             new_mod_costs = recompute_strategy(ctx)
 
