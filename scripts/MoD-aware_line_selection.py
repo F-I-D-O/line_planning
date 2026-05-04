@@ -42,8 +42,9 @@ Example ``experiment.yaml``::
 
     mod_cost_recomputation:
       strategy: aggregate_original_requests
-      # For clustered_avg also set clusters: <int> and features: [travel_time, ...]
-      # Optional: random_state, n_init (KMeans)
+      # For clustered_avg with KMeans: clusters, features: [travel_time, ...], optional random_state, n_init
+      # For clustered_avg with hex OD: clusterer: hex_od and hex_resolution: <0-15> (H3).
+      # Node coordinates: <instance area_root>/map/nodes.csv (area_root from instance area_dir or dm parent).
       smoothing:
         strategy: none
         under_relaxation_alpha: 0.3
@@ -60,9 +61,11 @@ import time
 import json
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from tqdm import tqdm
 
 import numpy as np
 import yaml
+import h3
 from sklearn.cluster import KMeans
 
 import darpinstances.inout
@@ -290,7 +293,7 @@ def build_darp_request_pool(
     pool_id = 0
     td = float(transfer_delay)
 
-    for r in range(nb_pass):
+    for r in tqdm(range(nb_pass), desc="Building DARP request pool"):
         o_r = int(requests_od[r][0])
         d_r = int(requests_od[r][1])
         t_r = float(request_times[r])
@@ -395,6 +398,100 @@ def fit_kmeans_pool_cluster_labels(
         n_init=int(n_init),
     )
     return km.fit_predict(X)
+
+
+def _resolve_mod_aware_area_root(instance_config_path: Path, dm_file: Path) -> Path:
+    """
+    Area root directory containing ``map/nodes.csv``.
+
+    Uses ``area_dir`` from the instance config when set; otherwise ``dm_file``'s parent
+    (for instances that only set ``dm_filepath``).
+    """
+    instance_config_path = Path(instance_config_path).resolve()
+    base_dir = instance_config_path.parent
+    with instance_config_path.open("r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"Instance config must be a mapping: {instance_config_path}")
+    area_val = raw.get("area_dir")
+    if isinstance(area_val, str) and area_val.strip():
+        p = Path(area_val.strip())
+        if p.is_absolute():
+            return p.resolve()
+        return (base_dir / p).resolve()
+    return Path(dm_file).resolve().parent
+
+
+def load_node_latlng_from_map_nodes_csv(area_root: Path) -> Dict[int, Tuple[float, float]]:
+    """
+    Load ``id -> (lat, lng)`` from ``<area_root>/map/nodes.csv``.
+
+    Columns ``x``, ``y`` are longitude and latitude respectively (Manhattan-style exports).
+    """
+    path = Path(area_root) / "map" / "nodes.csv"
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Hex OD clustering needs node coordinates at {path}. "
+            f"Set area_dir in the instance config.yaml, or ensure dm_filepath points under "
+            f"the directory that contains map/nodes.csv (area_root={area_root})."
+        )
+    out: Dict[int, Tuple[float, float]] = {}
+    with path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f, delimiter='\t')
+        if reader.fieldnames is None:
+            raise ValueError(f"{path}: missing CSV header")
+        fields = {name.strip() for name in reader.fieldnames if name}
+        for req in ("id", "x", "y"):
+            if req not in fields:
+                raise ValueError(f"{path}: expected a '{req}' column, got {reader.fieldnames!r}")
+        for row in reader:
+            if row.get("id") is None or str(row["id"]).strip() == "":
+                continue
+            nid = int(row["id"])
+            lon = float(row["x"])
+            lat = float(row["y"])
+            out[nid] = (lat, lon)
+    if not out:
+        raise ValueError(f"{path}: no node rows loaded")
+    return out
+
+
+def fit_hex_od_pool_cluster_labels(
+    pool_rows: Sequence[DarpPoolRow],
+    node_id_to_latlng: Dict[int, Tuple[float, float]],
+    hex_resolution: int,
+) -> np.ndarray:
+    """
+    Per-pool-row cluster label from H3 cells of (origin, destination) node coordinates.
+
+    Labels are contiguous integers assigned in sorted order of (h3_origin, h3_dest) pairs.
+    """
+    n_samples = len(pool_rows)
+    if n_samples == 0:
+        return np.zeros(0, dtype=int)
+    res = int(hex_resolution)
+    keys: List[Tuple[str, str]] = []
+    hexagonal_clusters_used = set()
+    for row in tqdm(pool_rows, desc="Fitting DARP request pool to hexagonal clusters"):
+        for nid, role in ((row.origin, "origin"), (row.destination, "destination")):
+            if nid not in node_id_to_latlng:
+                raise ValueError(
+                    f"Node id {nid} ({role} of pool_id={row.pool_id}) missing from "
+                    f"map/nodes.csv for this area"
+                )
+        lat_o, lng_o = node_id_to_latlng[row.origin]
+        lat_d, lng_d = node_id_to_latlng[row.destination]
+        h_o = h3.latlng_to_cell(lat_o, lng_o, res)
+        h_d = h3.latlng_to_cell(lat_d, lng_d, res)
+        keys.append((h_o, h_d))
+        hexagonal_clusters_used.add(h_o)
+        hexagonal_clusters_used.add(h_d)
+
+    logging.info(f"Hexagonal clusters used: {len(hexagonal_clusters_used)}")
+    sorted_unique = sorted(set(keys))
+    key_to_label = {k: i for i, k in enumerate(sorted_unique)}
+    labels = np.array([key_to_label[k] for k in keys], dtype=int)
+    return labels
 
 
 def select_darp_requests_from_pool(
@@ -610,6 +707,8 @@ class ModAwareLineSelectionConfig:
     mod_cost_under_relaxation_alpha: float
     mod_cost_recomputation_clusters: Optional[int]
     mod_cost_recomputation_features: Optional[Tuple[str, ...]]
+    mod_cost_recomputation_clusterer: str
+    mod_cost_recomputation_hex_resolution: Optional[int]
     kmeans_random_state: int
     kmeans_n_init: int
 
@@ -722,17 +821,40 @@ def load_mod_aware_line_selection_config(experiment_yaml_path: Path) -> ModAware
     kmeans_random_state = int(mod_recomputation.get("random_state", 0))
     kmeans_n_init = int(mod_recomputation.get("n_init", 10))
 
+    mod_cost_recomputation_clusterer = str(mod_recomputation.get("clusterer", "kmeans")).strip().lower()
+    hex_res_raw = mod_recomputation.get("hex_resolution")
+    mod_cost_recomputation_hex_resolution: Optional[int] = None
+    if hex_res_raw is not None:
+        mod_cost_recomputation_hex_resolution = int(hex_res_raw)
+
     if mod_cost_recomputation_strategy == "clustered_avg":
-        if mod_cost_recomputation_clusters is None or mod_cost_recomputation_clusters < 1:
+        if mod_cost_recomputation_clusterer not in ("kmeans", "hex_od"):
             raise ValueError(
-                f"{experiment_yaml_path}: mod_cost_recomputation.strategy=clustered_avg requires "
-                "mod_cost_recomputation.clusters (int >= 1)."
+                f"{experiment_yaml_path}: mod_cost_recomputation.clusterer must be 'kmeans' or 'hex_od', "
+                f"got {mod_cost_recomputation_clusterer!r}."
             )
-        if not mod_cost_recomputation_features:
-            raise ValueError(
-                f"{experiment_yaml_path}: mod_cost_recomputation.strategy=clustered_avg requires "
-                "a non-empty mod_cost_recomputation.features list."
-            )
+        if mod_cost_recomputation_clusterer == "kmeans":
+            if mod_cost_recomputation_clusters is None or mod_cost_recomputation_clusters < 1:
+                raise ValueError(
+                    f"{experiment_yaml_path}: mod_cost_recomputation.strategy=clustered_avg with "
+                    "clusterer=kmeans requires mod_cost_recomputation.clusters (int >= 1)."
+                )
+            if not mod_cost_recomputation_features:
+                raise ValueError(
+                    f"{experiment_yaml_path}: mod_cost_recomputation.strategy=clustered_avg with "
+                    "clusterer=kmeans requires a non-empty mod_cost_recomputation.features list."
+                )
+        else:
+            if mod_cost_recomputation_hex_resolution is None:
+                raise ValueError(
+                    f"{experiment_yaml_path}: mod_cost_recomputation.strategy=clustered_avg with "
+                    "clusterer=hex_od requires mod_cost_recomputation.hex_resolution (int)."
+                )
+            if not (0 <= mod_cost_recomputation_hex_resolution <= 15):
+                raise ValueError(
+                    f"{experiment_yaml_path}: mod_cost_recomputation.hex_resolution must be in [0, 15] "
+                    f"(H3), got {mod_cost_recomputation_hex_resolution}."
+                )
 
     return ModAwareLineSelectionConfig(
         experiment_yaml_path=experiment_yaml_path,
@@ -758,6 +880,8 @@ def load_mod_aware_line_selection_config(experiment_yaml_path: Path) -> ModAware
         mod_cost_under_relaxation_alpha=mod_cost_under_relaxation_alpha,
         mod_cost_recomputation_clusters=mod_cost_recomputation_clusters,
         mod_cost_recomputation_features=mod_cost_recomputation_features,
+        mod_cost_recomputation_clusterer=mod_cost_recomputation_clusterer,
+        mod_cost_recomputation_hex_resolution=mod_cost_recomputation_hex_resolution,
         kmeans_random_state=kmeans_random_state,
         kmeans_n_init=kmeans_n_init,
     )
@@ -1503,7 +1627,7 @@ def recompute_costs__clustered_avg(ctx: ModCostRecomputeContext) -> Dict[int, Tu
     """
     Per-cluster rescaling of MoD costs using average (cost / leg travel time) from DARP vs instance.
 
-    Requires :attr:`ModCostRecomputeContext.clustered_avg_state` (pool built once, K-means once).
+    Requires :attr:`ModCostRecomputeContext.clustered_avg_state` (pool built once, labels fixed).
     """
     aux = ctx.clustered_avg_state
     if aux is None:
@@ -1778,8 +1902,6 @@ def main() -> None:
     pool_rows: List[DarpPoolRow] = []
     pool_id_to_cluster: Dict[int, int] = {}
     if cfg.mod_cost_recomputation_strategy == "clustered_avg":
-        assert cfg.mod_cost_recomputation_clusters is not None
-        assert cfg.mod_cost_recomputation_features is not None
         pool_rows = build_darp_request_pool(
             line_inst,
             request_times=None,
@@ -1795,22 +1917,45 @@ def main() -> None:
             raise RuntimeError(
                 f"DARP pool row count mismatch: got {len(pool_rows)}, expected {expected_pool}"
             )
-        labels = fit_kmeans_pool_cluster_labels(
-            line_inst,
-            pool_rows,
-            cfg.mod_cost_recomputation_features,
-            cfg.mod_cost_recomputation_clusters,
-            random_state=cfg.kmeans_random_state,
-            n_init=cfg.kmeans_n_init,
-        )
-        pool_id_to_cluster = {row.pool_id: int(labels[i]) for i, row in enumerate(pool_rows)}
-        logging.info(
-            "DARP request pool: %s legs, %s cluster labels (requested k=%s, features=%s)",
-            len(pool_rows),
-            len(set(pool_id_to_cluster.values())),
-            cfg.mod_cost_recomputation_clusters,
-            cfg.mod_cost_recomputation_features,
-        )
+        if cfg.mod_cost_recomputation_clusterer == "hex_od":
+            assert cfg.mod_cost_recomputation_hex_resolution is not None
+            area_root = _resolve_mod_aware_area_root(
+                cfg.instance_paths.config_path,
+                cfg.instance_paths.dm_file,
+            )
+            node_latlng = load_node_latlng_from_map_nodes_csv(area_root)
+            labels = fit_hex_od_pool_cluster_labels(
+                pool_rows,
+                node_latlng,
+                cfg.mod_cost_recomputation_hex_resolution,
+            )
+            pool_id_to_cluster = {row.pool_id: int(labels[i]) for i, row in enumerate(pool_rows)}
+            logging.info(
+                "DARP request pool: %s legs, %s hex_od clusters (H3 res=%s, area_root=%s)",
+                len(pool_rows),
+                len(set(pool_id_to_cluster.values())),
+                cfg.mod_cost_recomputation_hex_resolution,
+                area_root,
+            )
+        else:
+            assert cfg.mod_cost_recomputation_clusters is not None
+            assert cfg.mod_cost_recomputation_features is not None
+            labels = fit_kmeans_pool_cluster_labels(
+                line_inst,
+                pool_rows,
+                cfg.mod_cost_recomputation_features,
+                cfg.mod_cost_recomputation_clusters,
+                random_state=cfg.kmeans_random_state,
+                n_init=cfg.kmeans_n_init,
+            )
+            pool_id_to_cluster = {row.pool_id: int(labels[i]) for i, row in enumerate(pool_rows)}
+            logging.info(
+                "DARP request pool: %s legs, %s cluster labels (requested k=%s, features=%s)",
+                len(pool_rows),
+                len(set(pool_id_to_cluster.values())),
+                cfg.mod_cost_recomputation_clusters,
+                cfg.mod_cost_recomputation_features,
+            )
 
     instance_size_label = lineplanning.line_planning.get_instance_size_label(str(demand_file))
 
@@ -1958,12 +2103,20 @@ def main() -> None:
                     raise RuntimeError(
                         "clustered_avg requires exported_id→pool_id mapping (export map or pool selection)"
                     )
+                if cfg.mod_cost_recomputation_clusterer == "hex_od":
+                    ca_features: Tuple[str, ...] = (
+                        f"hex_od:res_{cfg.mod_cost_recomputation_hex_resolution}",
+                    )
+                    ca_n_clusters = len(set(pool_id_to_cluster.values()))
+                else:
+                    ca_features = tuple(cfg.mod_cost_recomputation_features or ())
+                    ca_n_clusters = int(cfg.mod_cost_recomputation_clusters or 0)
                 clustered_state = ClusteredAvgState(
                     pool_rows=tuple(pool_rows),
                     pool_id_to_cluster=dict(pool_id_to_cluster),
                     exported_id_to_pool_id=dict(exported_to_pool),
-                    feature_names=tuple(cfg.mod_cost_recomputation_features or ()),
-                    n_clusters_requested=int(cfg.mod_cost_recomputation_clusters or 0),
+                    feature_names=ca_features,
+                    n_clusters_requested=ca_n_clusters,
                 )
 
             ctx = ModCostRecomputeContext(

@@ -11,7 +11,8 @@ setuptools.setup(
         "gurobipy",
         "darpbenchmark",
         "darpinstances",
-        "pyYAML"
+        "pyYAML",
+        "h3>=4.0",
     ],
     extras_require={
         "viz": ["geopandas"],
