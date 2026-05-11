@@ -1138,6 +1138,9 @@ class LinePlanningSolver:
         if export_model:
             master.write(str(output_dir_path / "MoD_aware_ILP.lp"))
 
+        # master.Params.Method = 1 # use the dual simplex method for LP relaxation
+        # master.Params.Method = 0 # use the primal simplex method for LP relaxation
+
         logging.info(
             "Solving MoD-aware ILP (section 4.1, route-aggregated §4.1.1, "
             "use_request_line_valid_inequalities=%s)",
