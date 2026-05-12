@@ -1,7 +1,11 @@
 """Jupyter-style script: use Run Cell on each `# %%` region (VS Code / Cursor).
 
-Data: ``RESULTS_DIR/iteration_<k>/metrics.json`` (ILP line_cost, mod_cost estimated)
-and ``config.yaml-solution.json`` (+ CSVs) for real MoD.
+Data: ``RESULTS_DIR/iteration_<k>/metrics.json`` (ILP line_cost, mod_cost estimated),
+``config.yaml-solution.json`` (+ CSVs) for real MoD, ``used_lines.csv`` for line counts,
+and ``passenger_assignments.csv`` for MoD-only vs MT vs served passenger counts.
+
+Optional **MoD-only** folder (default ``<instance>/MoD-only`` next to ``RESULTS_DIR``): same DARP
+artifacts as an iteration; draws a horizontal **MoD-only DARP total** on the cost subplot.
 
 Requires: plotly, pandas, darpinstances.
 """
@@ -18,11 +22,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import darpinstances.inout
 import plotly.graph_objects as go
 import plotly.io as pio
+from plotly.subplots import make_subplots
 from pathlib import Path
 
 # MoD-aware results folder containing iteration_1, iteration_2, ...
 RESULTS_DIR = Path(
-    r"C:\Google Drive AIC\My Drive\AIC Experiment Data\Line Planning\Results\manhattan-2_h-10_percent\instance_01\mod-aware"
+    r"C:\Google Drive AIC\My Drive\AIC Experiment Data\Line Planning\Results\manhattan-2_h-50_percent\instance_01\mod-aware-budget"
 )
 
 # If set, write interactive HTML here; if None, no file is written
@@ -33,6 +38,9 @@ SHOW_IN_BROWSER = True
 
 # Plot title; None uses the results folder name
 FIGURE_TITLE: str | None = None
+
+# MoD-only DARP baseline directory (e.g. .../instance_01/MoD-only). None = RESULTS_DIR.parent / "MoD-only"
+MOD_ONLY_RESULTS_DIR: Path | None = None
 
 
 
@@ -225,6 +233,55 @@ def _sum_mod_real_from_darp_iteration(iter_dir: Path) -> Optional[float]:
     return sum(fm + lm for fm, lm in agg.values())
 
 
+def _count_used_lines(iter_dir: Path) -> Optional[int]:
+    """Number of MT lines / routes with positive frequency in the ILP solution (``used_lines.csv``)."""
+    path = iter_dir / "used_lines.csv"
+    if not path.is_file():
+        return None
+    with path.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        return sum(1 for _ in reader)
+
+
+def _count_passengers_mod_vs_mt_served(iter_dir: Path) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    """
+    From ``passenger_assignments.csv``: MoD-only (``no_MT``), MT (assigned route / line),
+    and all served (not rejected / not dropped).
+
+    Rows with ``rejected`` or ``Dropped`` are excluded from all three (served = mod_only + mt).
+    """
+    path = iter_dir / "passenger_assignments.csv"
+    if not path.is_file():
+        return None, None, None
+    mod_only = 0
+    mt = 0
+    with path.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            line_val = str(row.get("line", "")).strip()
+            if line_val == "no_MT":
+                mod_only += 1
+            elif line_val in ("rejected", "Dropped", ""):
+                continue
+            else:
+                mt += 1
+    served = mod_only + mt
+    return mod_only, mt, served
+
+
+def _load_mod_only_baseline_darp_cost(mod_only_dir: Path) -> Optional[float]:
+    """
+    Total realized MoD cost from the MoD-only DARP run (same layout as an ``iteration_*`` folder).
+    """
+    mod_only_dir = Path(mod_only_dir).resolve()
+    if not mod_only_dir.is_dir():
+        return None
+    try:
+        return _sum_mod_real_from_darp_iteration(mod_only_dir)
+    except (AssertionError, KeyError, ValueError, TypeError, OSError):
+        return None
+
+
 def _iter_dirs_sorted(results_dir: Path) -> List[Tuple[int, Path]]:
     pat = re.compile(r"^iteration_(\d+)$")
     out: List[Tuple[int, Path]] = []
@@ -257,11 +314,17 @@ def collect_iteration_rows(results_dir: Path) -> List[Dict[str, Any]]:
         try:
             mod_real = _sum_mod_real_from_darp_iteration(iter_dir)
         except (KeyError, ValueError, TypeError) as e:
+            n_lines = _count_used_lines(iter_dir)
+            n_mod_p, n_mt_p, n_served_p = _count_passengers_mod_vs_mt_served(iter_dir)
             rows.append({
                 "iteration": iteration_index,
                 "mod_cost_estimated": mod_est,
                 "line_cost": line_cost,
                 "mod_cost_real": None,
+                "num_lines_used": n_lines,
+                "n_passengers_mod_only": n_mod_p,
+                "n_passengers_mt": n_mt_p,
+                "n_passengers_served": n_served_p,
                 "error": str(e),
             })
             continue
@@ -270,18 +333,29 @@ def collect_iteration_rows(results_dir: Path) -> List[Dict[str, Any]]:
         if mod_real is not None and line_cost is not None:
             total = mod_real + line_cost
 
+        n_lines = _count_used_lines(iter_dir)
+        n_mod_p, n_mt_p, n_served_p = _count_passengers_mod_vs_mt_served(iter_dir)
         rows.append({
             "iteration": iteration_index,
             "mod_cost_estimated": mod_est,
             "line_cost": line_cost,
             "mod_cost_real": mod_real,
             "total_cost_real_plus_line": total,
+            "num_lines_used": n_lines,
+            "n_passengers_mod_only": n_mod_p,
+            "n_passengers_mt": n_mt_p,
+            "n_passengers_served": n_served_p,
             "error": None,
         })
     return rows
 
 
-def build_cost_figure(results_dir: Path, title: str | None = None) -> go.Figure:
+def build_cost_figure(
+    results_dir: Path,
+    title: str | None = None,
+    *,
+    mod_only_results_dir: Path | None = None,
+) -> go.Figure:
     results_dir = Path(results_dir).resolve()
     rows = collect_iteration_rows(results_dir)
     if not rows:
@@ -296,8 +370,30 @@ def build_cost_figure(results_dir: Path, title: str | None = None) -> go.Figure:
     y_line = [r["line_cost"] for r in rows]
     y_mod_real = [r["mod_cost_real"] for r in rows]
     y_total = [r["total_cost_real_plus_line"] for r in rows]
+    y_n_lines = [r.get("num_lines_used") for r in rows]
+    y_n_mod = [r.get("n_passengers_mod_only") for r in rows]
+    y_n_mt = [r.get("n_passengers_mt") for r in rows]
+    y_n_served = [r.get("n_passengers_served") for r in rows]
 
-    fig = go.Figure()
+    if mod_only_results_dir is not None:
+        mod_only_dir = Path(mod_only_results_dir).resolve()
+    else:
+        mod_only_dir = results_dir.parent / "MoD-only"
+    mod_only_baseline_cost = _load_mod_only_baseline_darp_cost(mod_only_dir)
+
+    fig = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.07,
+        row_heights=[0.52, 0.24, 0.24],
+        subplot_titles=(
+            "Costs",
+            "Lines used (ILP)",
+            "Passengers: MoD-only vs MT vs served",
+        ),
+    )
+
     fig.add_trace(
         go.Scatter(
             x=x,
@@ -305,7 +401,9 @@ def build_cost_figure(results_dir: Path, title: str | None = None) -> go.Figure:
             mode="lines+markers",
             name="MoD cost (estimated, ILP)",
             connectgaps=False,
-        )
+        ),
+        row=1,
+        col=1,
     )
     fig.add_trace(
         go.Scatter(
@@ -314,7 +412,9 @@ def build_cost_figure(results_dir: Path, title: str | None = None) -> go.Figure:
             mode="lines+markers",
             name="Line cost (ILP)",
             connectgaps=False,
-        )
+        ),
+        row=1,
+        col=1,
     )
     fig.add_trace(
         go.Scatter(
@@ -323,7 +423,9 @@ def build_cost_figure(results_dir: Path, title: str | None = None) -> go.Figure:
             mode="lines+markers",
             name="MoD cost (real, DARP)",
             connectgaps=False,
-        )
+        ),
+        row=1,
+        col=1,
     )
     fig.add_trace(
         go.Scatter(
@@ -333,21 +435,90 @@ def build_cost_figure(results_dir: Path, title: str | None = None) -> go.Figure:
             name="Total = MoD real + line cost",
             line=dict(width=3),
             connectgaps=False,
-        )
+        ),
+        row=1,
+        col=1,
     )
+
+    if mod_only_baseline_cost is not None and x:
+        x_span = [min(x), max(x)]
+        fig.add_trace(
+            go.Scatter(
+                x=x_span,
+                y=[mod_only_baseline_cost, mod_only_baseline_cost],
+                mode="lines",
+                name="MoD-only baseline (DARP total)",
+                line=dict(dash="dash", width=2),
+            ),
+            row=1,
+            col=1,
+        )
+
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=y_n_lines,
+            mode="lines+markers",
+            name="Number of lines used",
+            connectgaps=False,
+        ),
+        row=2,
+        col=1,
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=y_n_mod,
+            mode="lines+markers",
+            name="Passengers MoD-only (no_MT)",
+            connectgaps=False,
+        ),
+        row=3,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=y_n_mt,
+            mode="lines+markers",
+            name="Passengers using MT",
+            connectgaps=False,
+        ),
+        row=3,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=y_n_served,
+            mode="lines+markers",
+            name="Passengers served (not rejected)",
+            connectgaps=False,
+        ),
+        row=3,
+        col=1,
+    )
+
     fig.update_layout(
         title=display_title,
-        xaxis_title="Iteration",
-        yaxis_title="Cost",
         hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         template="plotly_white",
     )
+    fig.update_yaxes(title_text="Cost", row=1, col=1)
+    fig.update_yaxes(title_text="Count", row=2, col=1)
+    fig.update_yaxes(title_text="Passengers", row=3, col=1)
+    fig.update_xaxes(title_text="Iteration", row=3, col=1)
     return fig
 
 
 # %% Run — build figure, optionally save HTML and show
-fig = build_cost_figure(RESULTS_DIR, title=FIGURE_TITLE)
+fig = build_cost_figure(
+    RESULTS_DIR,
+    title=FIGURE_TITLE,
+    mod_only_results_dir=MOD_ONLY_RESULTS_DIR,
+)
 
 if OUTPUT_HTML is not None:
     out_path = Path(OUTPUT_HTML).resolve()

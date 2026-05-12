@@ -40,6 +40,8 @@ Example ``experiment.yaml``::
     darp:
       benchmark_executable: C:/path/to/DARP-benchmark  # optional; default: DARP_BENCHMARK_PATH / env
       transfer_delay: 0
+      method: ih  # optional; DARP-benchmark experiment method (default ih)
+      experiment_parameters: {}  # optional; extra keys for experiment_ih.yaml (e.g. timeout)
 
     vehicles:
       vehicle_capacity: 5
@@ -683,6 +685,43 @@ def _parse_darp_vehicles_and_max_delay(
     return darp_vehicle_capacity, max_travel_time_delay_seconds
 
 
+def _parse_darp_benchmark_experiment_options(
+    raw: Dict[str, Any],
+    experiment_yaml_path: Path,
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    Read DARP-benchmark experiment YAML keys from the experiment mapping.
+
+    Optional ``darp.method`` (default ``ih``): passed as top-level ``method`` in
+    ``experiment_ih.yaml`` for :func:`darpbenchmark.experiments.run_experiment_using_config`.
+
+    Optional ``darp.experiment_parameters`` (or legacy ``darp.method_parameters``): a mapping
+    merged into that experiment file. Keys ``instance`` and ``outdir`` are ignored so paths
+    stay relative to the iteration output directory.
+    """
+    darp = raw.get("darp") or {}
+    method_raw = darp.get("method", "ih")
+    method = str(method_raw).strip() if method_raw is not None else "ih"
+    if not method:
+        method = "ih"
+
+    ep = darp.get("experiment_parameters")
+    if ep is None:
+        ep = darp.get("method_parameters")
+    if ep is None:
+        extras: Dict[str, Any] = {}
+    elif isinstance(ep, dict):
+        extras = dict(ep)
+    else:
+        raise ValueError(
+            f"{experiment_yaml_path}: darp.experiment_parameters must be a mapping, "
+            f"got {type(ep).__name__}."
+        )
+    extras.pop("instance", None)
+    extras.pop("outdir", None)
+    return method, extras
+
+
 def _parse_yaml_bool(raw: object, default: bool = False) -> bool:
     """Coerce YAML values to bool (native bool and common string forms)."""
     if raw is None:
@@ -732,6 +771,8 @@ class ModAwareLineSelectionConfig:
     mod_cost_recomputation_hex_resolution: Optional[int]
     kmeans_random_state: int
     kmeans_n_init: int
+    darp_benchmark_method: str
+    darp_benchmark_experiment_parameters: Dict[str, Any]
 
 
 def _run_mod_line_selection_ilp(
@@ -769,38 +810,23 @@ def _run_mod_line_selection_ilp(
     raise AssertionError(f"unreachable solver_method={cfg.solver_method!r}")
 
 
-def load_mod_aware_line_selection_config(experiment_yaml_path: Path) -> ModAwareLineSelectionConfig:
+def build_mod_aware_line_selection_config(
+    raw: Dict[str, Any],
+    experiment_yaml_path: Path,
+) -> ModAwareLineSelectionConfig:
     """
-    Load MoD-aware line selection settings from an experiment YAML file.
+    Build :class:`ModAwareLineSelectionConfig` from a raw experiment mapping.
 
-    Required:
-    - ``instance``: path to the line-planning instance ``config.yaml`` (same as ``run_experiment``).
+    ``raw`` uses the same keys and defaults as a MoD-aware ``experiment.yaml`` (see
+    :func:`load_mod_aware_line_selection_config`). ``experiment_yaml_path`` is the anchor path
+    for resolving relative paths (e.g. ``darp.benchmark_executable``) and for
+    :func:`~lineplanning.instance_config.resolve_results_dir` when ``results_dir`` is omitted.
 
-    Optional ``darp.benchmark_executable``: path to the DARP-benchmark binary; if omitted, uses
-    module default :data:`DARP_BENCHMARK_PATH` (from ``DARP_BENCHMARK_EXECUTABLE`` when set).
-
-    Optional ``results_dir``: output root (defaults to the experiment file's directory); see
-    :func:`lineplanning.instance_config.resolve_results_dir`.
-
-    Optional ``initial_mod_cost_scale`` (default 1.0): scales stored MoD costs after load.
-
-    Optional ``darp.transfer_delay`` (seconds, default 0): extra delay δ_transfer when building DARP
-    request times for first/last mile.
-
-    DARP instance fields (same shape as Ridesharing_DARP_instances ``config.yaml``): optional
-    ``vehicles.vehicle_capacity`` and ``max_travel_time_delay`` with ``mode: absolute`` and
-    ``seconds: <int>``.
-
-    MoD cost update: ``mod_cost_recomputation`` with ``strategy`` and optional nested ``smoothing``
-    (``strategy``, ``under_relaxation_alpha``).
-
-    Line-planning ILP: optional ``solver.method`` (``non_budget_ilp`` default, or ``ilp_with_mod_costs``)
-    and optional top-level ``budget`` (same semantics as :func:`lineplanning.line_planning.run_experiment`).
-
-    Other keys default to the previous script defaults documented in the module docstring.
+    When no experiment file exists, pass a minimal ``raw`` with at least ``"instance"`` and set
+    ``experiment_yaml_path`` to the instance ``config.yaml`` path (so its parent anchors
+    relative paths the same way as a co-located experiment file).
     """
     experiment_yaml_path = Path(experiment_yaml_path).resolve()
-    raw = lineplanning.instance_config.load_experiment_yaml(experiment_yaml_path)
     inst_path = lineplanning.instance_config.resolve_instance_config_path(experiment_yaml_path, raw)
     instance_paths = lineplanning.instance_config.load_line_planning_instance_config(inst_path)
     results_dir = lineplanning.instance_config.resolve_results_dir(experiment_yaml_path, raw)
@@ -862,6 +888,11 @@ def load_mod_aware_line_selection_config(experiment_yaml_path: Path) -> ModAware
     transfer_delay = float(darp.get("transfer_delay", 0))
 
     darp_vehicle_capacity, max_travel_time_delay_seconds = _parse_darp_vehicles_and_max_delay(
+        raw,
+        experiment_yaml_path,
+    )
+
+    darp_benchmark_method, darp_benchmark_experiment_parameters = _parse_darp_benchmark_experiment_options(
         raw,
         experiment_yaml_path,
     )
@@ -958,7 +989,59 @@ def load_mod_aware_line_selection_config(experiment_yaml_path: Path) -> ModAware
         mod_cost_recomputation_hex_resolution=mod_cost_recomputation_hex_resolution,
         kmeans_random_state=kmeans_random_state,
         kmeans_n_init=kmeans_n_init,
+        darp_benchmark_method=darp_benchmark_method,
+        darp_benchmark_experiment_parameters=darp_benchmark_experiment_parameters,
     )
+
+
+def load_mod_aware_line_selection_config(
+    experiment_yaml_path: Path,
+    *,
+    instance_config_override: Optional[Path] = None,
+) -> ModAwareLineSelectionConfig:
+    """
+    Load MoD-aware line selection settings from an experiment YAML file.
+
+    Required:
+    - ``instance``: path to the line-planning instance ``config.yaml`` (same as ``run_experiment``),
+      unless ``instance_config_override`` is passed (then that path is used instead).
+
+    Optional ``darp.benchmark_executable``: path to the DARP-benchmark binary; if omitted, uses
+    module default :data:`DARP_BENCHMARK_PATH` (from ``DARP_BENCHMARK_EXECUTABLE`` when set).
+
+    Optional ``darp.method`` (default ``ih``) and ``darp.experiment_parameters``: mapping merged
+    into ``experiment_ih.yaml`` for :func:`darpbenchmark.experiments.run_experiment_using_config`
+    (keys ``instance`` and ``outdir`` in that mapping are ignored). Legacy alias:
+    ``darp.method_parameters`` for ``experiment_parameters``.
+
+    Optional ``results_dir``: output root (defaults to the experiment file's directory); see
+    :func:`lineplanning.instance_config.resolve_results_dir`.
+
+    Optional ``initial_mod_cost_scale`` (default 1.0): scales stored MoD costs after load.
+
+    Optional ``darp.transfer_delay`` (seconds, default 0): extra delay δ_transfer when building DARP
+    request times for first/last mile.
+
+    DARP instance fields (same shape as Ridesharing_DARP_instances ``config.yaml``): optional
+    ``vehicles.vehicle_capacity`` and ``max_travel_time_delay`` with ``mode: absolute`` and
+    ``seconds: <int>``.
+
+    MoD cost update: ``mod_cost_recomputation`` with ``strategy`` and optional nested ``smoothing``
+    (``strategy``, ``under_relaxation_alpha``).
+
+    Line-planning ILP: optional ``solver.method`` (``non_budget_ilp`` default, or ``ilp_with_mod_costs``)
+    and optional top-level ``budget`` (same semantics as :func:`lineplanning.line_planning.run_experiment`).
+
+    Other keys default to the previous script defaults documented in the module docstring.
+
+    Equivalent to loading the YAML into a dict and calling :func:`build_mod_aware_line_selection_config`.
+    """
+    experiment_yaml_path = Path(experiment_yaml_path).resolve()
+    raw = lineplanning.instance_config.load_experiment_yaml(experiment_yaml_path)
+    if instance_config_override is not None:
+        raw = dict(raw)
+        raw["instance"] = str(Path(instance_config_override).resolve())
+    return build_mod_aware_line_selection_config(raw, experiment_yaml_path)
 
 
 def _load_demand_and_dm_from_instance_config(instance_dir_path: Path) -> Tuple[Path, Path]:
@@ -1062,6 +1145,42 @@ def solution_to_darp_requests(
         })
         request_id += 1
 
+    return darp_requests
+
+
+def line_planning_original_requests_as_mod_darp_requests(
+    line_instance: "lineplanning.instance.line_instance",
+    request_times: Optional[List[Union[int, float]]] = None,
+) -> List[dict]:
+    """
+    Build one direct-MoD DARP row per original line-planning passenger (o_r, d_r, t_r).
+
+    Dict layout matches :func:`solution_to_darp_requests` for ``no_MT`` assignments
+    (columns for :func:`write_darp_requests_csv` / :func:`write_darp_vehicles_csv`).
+    """
+    nb_pass = line_instance.nb_pass
+    if request_times is None:
+        request_times = [0] * nb_pass
+    if len(request_times) != nb_pass:
+        request_times = list(request_times) + [0] * (nb_pass - len(request_times))
+
+    requests_od = line_instance.requests
+    darp_requests: List[dict] = []
+    request_id = 0
+    for r in range(nb_pass):
+        o_r = requests_od[r][0]
+        d_r = requests_od[r][1]
+        t_r = float(request_times[r])
+        darp_requests.append(
+            {
+                "id": request_id,
+                "original_request_id": r,
+                "origin": o_r,
+                "destination": d_r,
+                "time": t_r,
+            }
+        )
+        request_id += 1
     return darp_requests
 
 
@@ -1186,6 +1305,9 @@ def write_darp_config_yaml(
     dm_filepath: Union[Path, str],
     max_travel_time_delay_seconds: int = 300,
     vehicle_capacity: int = 5,
+    *,
+    darp_method: str = "ih",
+    darp_experiment_parameters: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Write DARP instance and experiment config YAML files for DARP-benchmark.
@@ -1195,6 +1317,10 @@ def write_darp_config_yaml(
     - experiment_ih.yaml: Experiment configuration for running insertion heuristic
 
     See: https://github.com/aicenter/DARP-benchmark
+
+    ``darp_method`` and ``darp_experiment_parameters`` populate ``experiment_ih.yaml`` together
+    with ``instance`` and ``outdir`` (same keys consumed by
+    :func:`darpbenchmark.experiments.run_experiment_using_config`).
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1218,11 +1344,16 @@ def write_darp_config_yaml(
     with instance_config_path.open("w", encoding="utf-8") as f:
         yaml.dump(instance_config, f, default_flow_style=False, sort_keys=False)
 
-    experiment_config = {
+    experiment_config: Dict[str, Any] = {
         "instance": "./config.yaml",
-        "method": "ih",
+        "method": darp_method,
         "outdir": ".",
     }
+    if darp_experiment_parameters:
+        for key, value in darp_experiment_parameters.items():
+            if key in ("instance", "outdir"):
+                continue
+            experiment_config[key] = value
 
     experiment_config_path = output_dir / "experiment_ih.yaml"
     with experiment_config_path.open("w", encoding="utf-8") as f:
@@ -2163,6 +2294,8 @@ def main() -> None:
                     dm_filepath=dm_file,
                     max_travel_time_delay_seconds=cfg.max_travel_time_delay_seconds,
                     vehicle_capacity=cfg.darp_vehicle_capacity,
+                    darp_method=cfg.darp_benchmark_method,
+                    darp_experiment_parameters=cfg.darp_benchmark_experiment_parameters,
                 )
 
             # 2.2 call DARP solver
