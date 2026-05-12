@@ -7,7 +7,9 @@ Run::
     python MoD-aware_line_selection.py /path/to/experiment.yaml
 
 Configuration is read entirely from the experiment YAML (same layout as ``lineplanning.line_planning.run_experiment``
-where applicable: ``instance``, ``results_dir``, ``solver``, ``mass_transport``), plus MoD-specific keys.
+where applicable: ``instance``, ``results_dir``, ``solver``, ``mass_transport``, optional ``budget``),
+plus MoD-specific keys. The ``ilp_with_mod_costs`` method maximizes served requests under a joint
+line+MoD budget; ``non_budget_ilp`` minimizes total generalized cost (different objective sense).
 
 Example ``experiment.yaml``::
 
@@ -18,9 +20,15 @@ Example ``experiment.yaml``::
 
     solver:
       time_limit: 1500
+      # Line-planning ILP: non_budget_ilp (default, MoD-aware §4.1) or ilp_with_mod_costs (budget ILP).
+      method: non_budget_ilp
       rejection_cost: 1000
       use_request_line_valid_inequalities: true
       reuse_model: true
+
+    # Optional; same as ``run_experiment``. Required for meaningful ``ilp_with_mod_costs`` runs
+    # (omit or null for an unconstrained budget RHS).
+    budget: 1000000
 
     mass_transport:
       cost_coefficient: 1.0
@@ -76,6 +84,17 @@ import lineplanning.instance
 import lineplanning.instance_config
 from lineplanning.instance_config import LinePlanningInstancePaths
 import lineplanning.line_planning
+from lineplanning.line_planning import (
+    LineSelectionSolveResult,
+    _ilp_budget_rhs,
+    _parse_optional_budget,
+)
+
+from gurobipy import GRB
+
+
+# ``solver.method`` values supported by this script (extend the registry when adding runners).
+MOD_AWARE_LINE_SELECTION_SOLVER_METHODS = frozenset({"non_budget_ilp", "ilp_with_mod_costs"})
 
 
 # Defaults for code that imports this module without running ``main()`` (e.g. test scripts).
@@ -693,6 +712,8 @@ class ModAwareLineSelectionConfig:
     rejection_cost: float
     use_request_line_valid_inequalities: bool
     reuse_model: bool
+    solver_method: str
+    budget: Optional[float]
     cost_coefficient: float
     max_frequency: int
     capacity: int
@@ -711,6 +732,41 @@ class ModAwareLineSelectionConfig:
     mod_cost_recomputation_hex_resolution: Optional[int]
     kmeans_random_state: int
     kmeans_n_init: int
+
+
+def _run_mod_line_selection_ilp(
+    solver: "lineplanning.line_planning.LinePlanningSolver",
+    cfg: ModAwareLineSelectionConfig,
+    output_dir: Path,
+) -> LineSelectionSolveResult:
+    """
+    Run the configured line-planning ILP for one MoD-aware iteration.
+
+    ``cfg.solver_method`` selects between MoD-aware (``non_budget_ilp``) and budget ILP
+    (``ilp_with_mod_costs``). ``line_instance.B`` must already follow ``run_experiment`` rules
+    except that this function sets ``B = _ilp_budget_rhs(cfg.budget)`` immediately before
+    ``solve_modified_ILP``, matching :func:`lineplanning.line_planning.run_experiment`.
+    """
+    if cfg.solver_method == "non_budget_ilp":
+        return solver.solve_MoD_aware_ILP(
+            export_model=True,
+            export_solution=True,
+            output_dir=output_dir,
+            gurobi_log_file=output_dir / "gurobi.log",
+            max_route_frequency=cfg.max_frequency,
+            rejection_cost=cfg.rejection_cost,
+            use_request_line_valid_inequalities=cfg.use_request_line_valid_inequalities,
+            reuse_model=cfg.reuse_model,
+        )
+    if cfg.solver_method == "ilp_with_mod_costs":
+        solver.line_instance.B = _ilp_budget_rhs(cfg.budget)
+        return solver.solve_modified_ILP(
+            export_model=True,
+            export_solution=True,
+            output_dir=output_dir,
+            gurobi_log_file=output_dir / "gurobi.log",
+        )
+    raise AssertionError(f"unreachable solver_method={cfg.solver_method!r}")
 
 
 def load_mod_aware_line_selection_config(experiment_yaml_path: Path) -> ModAwareLineSelectionConfig:
@@ -737,6 +793,9 @@ def load_mod_aware_line_selection_config(experiment_yaml_path: Path) -> ModAware
 
     MoD cost update: ``mod_cost_recomputation`` with ``strategy`` and optional nested ``smoothing``
     (``strategy``, ``under_relaxation_alpha``).
+
+    Line-planning ILP: optional ``solver.method`` (``non_budget_ilp`` default, or ``ilp_with_mod_costs``)
+    and optional top-level ``budget`` (same semantics as :func:`lineplanning.line_planning.run_experiment`).
 
     Other keys default to the previous script defaults documented in the module docstring.
     """
@@ -769,6 +828,19 @@ def load_mod_aware_line_selection_config(experiment_yaml_path: Path) -> ModAware
         solver.get("use_request_line_valid_inequalities"), default=True
     )
     reuse_model = _parse_yaml_bool(solver.get("reuse_model"), default=True)
+
+    solver_method_raw = solver.get("method", "non_budget_ilp")
+    if isinstance(solver_method_raw, str) and solver_method_raw.strip():
+        solver_method = solver_method_raw.strip()
+    else:
+        solver_method = "non_budget_ilp"
+    if solver_method not in MOD_AWARE_LINE_SELECTION_SOLVER_METHODS:
+        raise ValueError(
+            f"{experiment_yaml_path}: solver.method must be one of "
+            f"{sorted(MOD_AWARE_LINE_SELECTION_SOLVER_METHODS)}, got {solver_method!r}."
+        )
+
+    budget = _parse_optional_budget(raw.get("budget"))
 
     cost_coefficient = float(mt.get("cost_coefficient", 1.0))
     max_frequency_cfg = int(mt.get("max_frequency", 20))
@@ -866,6 +938,8 @@ def load_mod_aware_line_selection_config(experiment_yaml_path: Path) -> ModAware
         rejection_cost=rejection_cost_cfg,
         use_request_line_valid_inequalities=use_request_line_valid_inequalities,
         reuse_model=reuse_model,
+        solver_method=solver_method,
+        budget=budget,
         cost_coefficient=cost_coefficient,
         max_frequency=max_frequency_cfg,
         capacity=capacity,
@@ -1022,8 +1096,8 @@ def load_request_assignments_csv(
     where `line` is either:
     - an integer (route index ρ) if assigned to a line
     - "no_MT" if assigned to MoD-only
-    - "rejected" if not served (§4.1.2)
-    - "Dropped" if dropped (treated as no_MT here)
+    - "rejected" if not served (§4.1.2) or unserved in the budget ILP
+    - "Dropped" if dropped (legacy export); treated as ``rejected`` here
 
     Returns a list of (kind, route_index) tuples where kind is "no_MT", "line", or "rejected";
     for "line", the second entry is the route index ρ (0 .. nb_lines-1).
@@ -1039,6 +1113,8 @@ def load_request_assignments_csv(
         if line_value == "no_MT":
             request_assignments.append(("no_MT", None))
         elif line_value == "rejected":
+            request_assignments.append(("rejected", None))
+        elif str(line_value) == "Dropped":
             request_assignments.append(("rejected", None))
         else:
             route_index = int(line_value)
@@ -1899,6 +1975,20 @@ def main() -> None:
         max_frequency=cfg.max_frequency,
     )
 
+    if cfg.budget is not None:
+        line_inst.B = float(cfg.budget) * 0.95
+    else:
+        line_inst.B = GRB.INFINITY
+    logging.info(
+        "Line selection: solver.method=%s budget=%s (line_instance.B initialized like run_experiment)",
+        cfg.solver_method,
+        cfg.budget,
+    )
+    if cfg.solver_method == "ilp_with_mod_costs" and cfg.reuse_model:
+        logging.debug(
+            "solver.method=ilp_with_mod_costs does not use reuse_model; incremental reuse applies only to non_budget_ilp.",
+        )
+
     pool_rows: List[DarpPoolRow] = []
     pool_id_to_cluster: Dict[int, int] = {}
     if cfg.mod_cost_recomputation_strategy == "clustered_avg":
@@ -2011,18 +2101,9 @@ def main() -> None:
                         )
             else:
                 # 1. Solve the line selection ILP (section 4.1); get selected lines and request-line assignments
-                # Same formulation as experiment ``solver.method: non_budget_ilp`` in ``run_experiment``.
-                obj_val, run_time_ILP, selected_lines, request_assignments, line_cost, mod_cost = (
-                    solver.solve_MoD_aware_ILP(
-                        export_model=True,
-                        export_solution=True,
-                        output_dir=results_dir_path_per_iteration,
-                        gurobi_log_file=results_dir_path_per_iteration / "gurobi.log",
-                        max_route_frequency=cfg.max_frequency,
-                        rejection_cost=cfg.rejection_cost,
-                        use_request_line_valid_inequalities=cfg.use_request_line_valid_inequalities,
-                        reuse_model=cfg.reuse_model,
-                    )
+                # ``solver.method`` selects the formulation (see ``_run_mod_line_selection_ilp``).
+                obj_val, run_time_ILP, _selected_lines, request_assignments, line_cost, mod_cost = (
+                    _run_mod_line_selection_ilp(solver, cfg, results_dir_path_per_iteration)
                 )
                 # 1.2 Write metrics.json
                 results_payload = {
@@ -2034,6 +2115,7 @@ def main() -> None:
                     "instance_size": instance_size_label,
                     "demand_file": str(demand_file),
                     "experiment_config": str(cfg.experiment_yaml_path),
+                    "solver_method": cfg.solver_method,
                     "max_route_frequency": cfg.max_frequency,
                     "solver_time_limit": cfg.solver_time_limit,
                     "rejection_cost": cfg.rejection_cost,
@@ -2041,6 +2123,8 @@ def main() -> None:
                     "mod_cost_smoothing_strategy": cfg.mod_cost_smoothing_strategy,
                     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
                 }
+                if cfg.budget is not None:
+                    results_payload["budget"] = cfg.budget
                 results_file = results_dir_path_per_iteration / "metrics.json"
                 results_file.write_text(json.dumps(results_payload, indent=2))
 

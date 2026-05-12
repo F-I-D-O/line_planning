@@ -7,8 +7,9 @@ import sys
 import time
 from collections import defaultdict
 from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -28,6 +29,39 @@ from lineplanning.instance_config import (
 import lineplanning.log
 
 EPS = 1.e-5
+
+
+@dataclass(frozen=True)
+class LineSelectionSolveResult:
+    """
+    Unified return type for line-selection ILPs used by ``run_experiment`` and the MoD-aware
+    line selection script.
+
+    ``request_assignments`` entries are ``("no_MT", None)``, ``("line", rho)`` with route index
+    ``rho``, or ``("rejected", None)``.
+
+    ``line_objective_component`` / ``mod_objective_component`` may be ``None`` when the
+    formulation does not expose the same decomposition as the MoD-aware ILP.
+    """
+
+    objective_value: float
+    run_time_seconds: float
+    selected_lines: List[int]
+    request_assignments: Tuple[Tuple[str, Optional[int]], ...]
+    line_objective_component: Optional[float]
+    mod_objective_component: Optional[float]
+
+    def __iter__(self):
+        """Allow ``a, b, c, d, e, f = solver.solve_*`` unpacking like the legacy 6-tuple."""
+        yield from (
+            self.objective_value,
+            self.run_time_seconds,
+            self.selected_lines,
+            self.request_assignments,
+            self.line_objective_component,
+            self.mod_objective_component,
+        )
+
 
 def get_instance_size_label(demand_file_path: Optional[str]) -> str:
     if demand_file_path:
@@ -161,7 +195,7 @@ class LinePlanningSolver:
         Args:
             new_costs: Dict mapping original_request_id -> (first_mile_cost, last_mile_cost).
                        For MoD-only requests, last_mile_cost should be 0.
-            request_assignments: List of (kind, line_idx) tuples from solve_MoD_aware_ILP.
+            request_assignments: List of (kind, line_idx) tuples from :class:`LineSelectionSolveResult`.
                                  kind is "no_MT", "line", or "rejected"; for "line", line_idx is the route index ρ.
         """
         for original_request_id, (first_mile_cost, last_mile_cost) in new_costs.items():
@@ -193,6 +227,7 @@ class LinePlanningSolver:
         output_dir: Path,
         passenger_vars,
         no_assignment_means_no_mt_option: bool = False,
+        no_assignment_means_rejected: bool = False,
         no_mt_line_key: Optional[int] = None,
         line_var_is_route_index: bool = False,
         rejection_vars: Optional[Dict[int, Any]] = None,
@@ -254,7 +289,18 @@ class LinePlanningSolver:
                 )
                 assigned_passengers.add(passenger_idx)
                 continue
-            if no_assignment_means_no_mt_option:
+            if no_assignment_means_rejected:
+                rows.append(
+                    {
+                        "passenger": passenger_idx,
+                        "line_index": -2,
+                        "route_index": np.nan,
+                        "line_repr": "rejected",
+                        "mod_cost": 0.0,
+                        "is_no_mt": False,
+                    }
+                )
+            elif no_assignment_means_no_mt_option:
                 rows.append(
                     {
                         "passenger": passenger_idx,
@@ -741,6 +787,7 @@ class LinePlanningSolver:
 
         return master.ObjVal, t1-t0
 
+    
     def solve_modified_ILP(
         self,
         export_model: bool = False,
@@ -748,6 +795,20 @@ class LinePlanningSolver:
         output_dir: Union[Path, str] = Path("."),
         gurobi_log_file: Union[Path, str, None] = None,
     ):
+        """Solve the problem as described in Section 3 of stage_1_formulation.pdf. It is 
+        a modification of (Périvier et al., 2021), where the MoD is also considered under the same budget constraint
+        as the lines.
+
+        Args:
+            export_model (bool, optional): Defaults to False.
+            export_solution (bool, optional): Defaults to False.
+            output_dir (Union[Path, str], optional): Defaults to the current directory.
+            gurobi_log_file (Union[Path, str, None], optional): Defaults to None.
+
+        Returns:
+            :class:`LineSelectionSolveResult` (also iterable as ``(obj, time, lines, assignments, line_c, mod_c)``).
+        """
+
         request_count = self.line_instance.nb_pass
         bus_capacity = self.line_instance.capacity
 
@@ -762,7 +823,7 @@ class LinePlanningSolver:
         # binary variables indicating if passenger p is assigned to line l. If first mile + last mile costs are
         # higher than the no_MT MoD cost, the line-passenger combination is not considered at all
         potential_line_passenger_combinations = [
-            (l, p) for l in range(self.line_count_total) for p in range(request_count)
+            (l, p) for l in tqdm(range(self.line_count_total), desc="Computing potential line-passenger combinations") for p in range(request_count)
             if self.line_instance.trip_value_on_line(p, l // self.max_frequency) > 0
         ]
         passenger_vars = master.addVars(potential_line_passenger_combinations, vtype=GRB.BINARY, obj=1, name="x")
@@ -840,6 +901,7 @@ class LinePlanningSolver:
         assignments = self._export_passenger_assignments(
             output_dir=output_dir_path,
             passenger_vars=passenger_vars,
+            no_assignment_means_rejected=True,
         )
 
         self._solve_and_export_flows(
@@ -847,7 +909,51 @@ class LinePlanningSolver:
             output_dir=output_dir_path,
         )
 
-        return master.ObjVal, t1-t0
+        nb_lines = self.line_instance.nb_lines
+        no_mt_key = self.line_count_total
+        selected_lines: List[int] = []
+        for rho in range(nb_lines):
+            slot_lo = rho * self.max_frequency
+            slot_hi = min((rho + 1) * self.max_frequency, self.line_count_total)
+            if any(line_vars[l].X > EPS for l in range(slot_lo, slot_hi)):
+                selected_lines.append(rho)
+
+        request_assignments_list: List[Tuple[str, Optional[int]]] = []
+        for p in range(request_count):
+            if passenger_vars[no_mt_key, p].X > EPS:
+                request_assignments_list.append(("no_MT", None))
+                continue
+            assigned_route: Optional[int] = None
+            for l in range(self.line_count_total):
+                if (l, p) in passenger_vars and passenger_vars[l, p].X > EPS:
+                    assigned_route = l // self.max_frequency
+                    break
+            if assigned_route is not None:
+                request_assignments_list.append(("line", assigned_route))
+            else:
+                request_assignments_list.append(("rejected", None))
+
+        line_obj_val: Optional[float] = None
+        mod_obj_val: Optional[float] = None
+        try:
+            line_obj_val = float(line_costs_expression.getValue())
+            mod_obj_val = float(mod_cost_expression.getValue())
+        except (GurobiError, AttributeError, TypeError, ValueError):
+            pass
+
+        try:
+            obj_v = float(master.ObjVal)
+        except (GurobiError, TypeError, ValueError):
+            obj_v = float("nan")
+
+        return LineSelectionSolveResult(
+            objective_value=obj_v,
+            run_time_seconds=float(t1 - t0),
+            selected_lines=selected_lines,
+            request_assignments=tuple(request_assignments_list),
+            line_objective_component=line_obj_val,
+            mod_objective_component=mod_obj_val,
+        )
 
     def _dispose_mod_aware_mip_state(self) -> None:
         if self._mod_aware_mip_state is None:
@@ -1072,9 +1178,12 @@ class LinePlanningSolver:
         parameters that discard MIP starts (e.g. ``IgnoreStart``).
 
         Returns:
-            objective value, wall-clock seconds, selected route indices, request assignments,
-            line objective term (sum_ρ cost_coefficient·length·y_ρ), MoD objective term (passenger mod costs).
-            The last two entries are None if the objective could not be decomposed from the solution.
+            :class:`LineSelectionSolveResult` with objective value, wall-clock seconds, selected route
+            indices, request assignments, line objective term (sum_ρ cost_coefficient·length·y_ρ), and
+            MoD objective term (passenger mod costs). The last two fields are ``None`` if the objective
+            could not be decomposed from the solution.
+
+            The result is iterable as a 6-tuple for backward compatibility.
         """
         freq_ub = max_route_frequency if max_route_frequency is not None else self.max_frequency
 
@@ -1211,21 +1320,33 @@ class LinePlanningSolver:
         selected_lines = [
             rho for rho in range(nb_lines) if frequency_vars[rho].X > EPS
         ]
-        request_assignments = []
+        request_assignments_list: List[Tuple[str, Optional[int]]] = []
         for p in range(request_count):
             if allow_rejection and rej_vars is not None and rej_vars[p].X > EPS:
-                request_assignments.append(("rejected", None))
+                request_assignments_list.append(("rejected", None))
             elif passenger_vars[no_mt_key, p].X > EPS:
-                request_assignments.append(("no_MT", None))
+                request_assignments_list.append(("no_MT", None))
             else:
                 assigned_route = None
                 for rho in range(nb_lines):
                     if (rho, p) in passenger_vars and passenger_vars[rho, p].X > EPS:
                         assigned_route = rho
                         break
-                request_assignments.append(("line", assigned_route))
+                request_assignments_list.append(("line", assigned_route))
 
-        return master.ObjVal, t1 - t0, selected_lines, request_assignments, line_obj_val, mod_obj_val
+        try:
+            obj_v = float(master.ObjVal)
+        except (GurobiError, TypeError, ValueError):
+            obj_v = float("nan")
+
+        return LineSelectionSolveResult(
+            objective_value=obj_v,
+            run_time_seconds=float(t1 - t0),
+            selected_lines=selected_lines,
+            request_assignments=tuple(request_assignments_list),
+            line_objective_component=line_obj_val,
+            mod_objective_component=mod_obj_val,
+        )
 
     def solve_ILP_with_empty_trips(
         self,
@@ -1663,12 +1784,16 @@ def run_experiment(experiment_config_path: Path) -> None:
             logging.info("Running solver.method=%s (budget=%s)", solver_method, budget)
             solver.line_instance.B = _ilp_budget_rhs(budget)
             if solver_method == "ilp_with_mod_costs":
-                obj_val, run_time_sec = solver.solve_modified_ILP(
+                lsr = solver.solve_modified_ILP(
                     export_model=True,
                     export_solution=True,
                     output_dir=base_results_directory,
                     gurobi_log_file=gurobi_log_path,
                 )
+                obj_val = lsr.objective_value
+                run_time_sec = lsr.run_time_seconds
+                line_obj_component = lsr.line_objective_component
+                mod_obj_component = lsr.mod_objective_component
             elif solver_method == "ilp_with_empty_trips":
                 obj_val, run_time_sec = solver.solve_ILP_with_empty_trips(
                     export_model=True,
@@ -1690,14 +1815,7 @@ def run_experiment(experiment_config_path: Path) -> None:
                 rejection_cost_cfg,
                 use_request_line_valid_inequalities,
             )
-            (
-                obj_val,
-                run_time_sec,
-                _selected_lines,
-                _request_assignments,
-                line_obj_component,
-                mod_obj_component,
-            ) = solver.solve_MoD_aware_ILP(
+            lsr = solver.solve_MoD_aware_ILP(
                 export_model=True,
                 export_solution=True,
                 output_dir=base_results_directory,
@@ -1705,6 +1823,10 @@ def run_experiment(experiment_config_path: Path) -> None:
                 rejection_cost=rejection_cost_cfg,
                 use_request_line_valid_inequalities=use_request_line_valid_inequalities,
             )
+            obj_val = lsr.objective_value
+            run_time_sec = lsr.run_time_seconds
+            line_obj_component = lsr.line_objective_component
+            mod_obj_component = lsr.mod_objective_component
         else:
             raise AssertionError("unreachable solver_method")
     finally:
