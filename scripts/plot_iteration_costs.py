@@ -4,8 +4,12 @@ Data: ``RESULTS_DIR/iteration_<k>/metrics.json`` (ILP line_cost, mod_cost estima
 ``config.yaml-solution.json`` (+ CSVs) for real MoD, ``used_lines.csv`` for line counts,
 and ``passenger_assignments.csv`` for MoD-only vs MT vs served passenger counts.
 
-Optional **MoD-only** folder (default ``<instance>/MoD-only`` next to ``RESULTS_DIR``): same DARP
-artifacts as an iteration; draws a horizontal **MoD-only DARP total** on the cost subplot.
+Optional **MoD-only** folder (default ``<instance>/MoD-only`` next to ``RESULTS_DIR``): standalone
+DARP run with ``config.yaml-solution.json``; draws a horizontal **MoD-only DARP total** (root
+``cost``) on the cost subplot.
+
+Set environment variable ``PLOT_ITERATION_COSTS_DEBUG=1`` to log per-iteration cost fields, full
+tracebacks on MoD-real failures, and a table of collected rows (no separate debugger connection).
 
 Requires: plotly, pandas, darpinstances.
 """
@@ -14,16 +18,36 @@ from __future__ import annotations
 
 # %% Configuration — edit this cell only
 # %% Imports
-import csv
 import json
+import logging
+import math
+import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import darpinstances.inout
+import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
 import plotly.io as pio
 from plotly.subplots import make_subplots
 from pathlib import Path
+
+_PLOG = logging.getLogger(__name__)
+
+
+def _plot_iteration_costs_debug() -> bool:
+    return os.environ.get("PLOT_ITERATION_COSTS_DEBUG", "").strip().lower() in ("1", "true", "yes")
+
+
+def _ensure_plot_iteration_costs_debug_logging() -> None:
+    if not _plot_iteration_costs_debug():
+        return
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+    if not root.handlers:
+        logging.basicConfig(level=logging.DEBUG, format="%(levelname)s %(message)s")
+
 
 # MoD-aware results folder containing iteration_1, iteration_2, ...
 RESULTS_DIR = Path(
@@ -48,54 +72,89 @@ MOD_ONLY_RESULTS_DIR: Path | None = None
 # %% Helpers (from MoD-aware pipeline; cannot import MoD-aware_line_selection.py on load)
 
 
-def _load_darp_requests_csv(path: Path) -> List[dict]:
-    darp_requests = []
-    with path.open("r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            darp_requests.append({
-                "id": int(row["id"]),
-                "original_request_id": int(row["original_request_id"]),
-                "origin": int(row["origin"]),
-                "destination": int(row["destination"]),
-                "time": float(row["time"]),
-            })
-    return darp_requests
+def _scalar_float(v: Any) -> float:
+    """Python ``float`` for plot math; avoids ``TypeError`` on ``pd.NA`` / nullable pandas scalars."""
+    if v is None:
+        return float("nan")
+    if pd.api.types.is_scalar(v) and pd.isna(v):
+        return float("nan")
+    return float(v)
 
 
-def _load_request_assignments_csv(path: Path) -> List[Tuple[str, Optional[int]]]:
-    import pandas as pd
+def _load_darp_requests_csv(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(
+        path,
+        encoding="utf-8-sig",
+        dtype={
+            "id": "int64",
+            "original_request_id": "int64",
+            "origin": "int64",
+            "destination": "int64",
+        },
+    )
+    df["time"] = df["time"].astype("float64")
+    return df
 
-    df = pd.read_csv(path)
-    df = df.sort_values("passenger").reset_index(drop=True)
-    request_assignments = []
-    for _, row in df.iterrows():
-        line_value = row["line"]
-        if line_value == "no_MT":
-            request_assignments.append(("no_MT", None))
-        elif line_value == "rejected":
-            request_assignments.append(("rejected", None))
+
+def _load_request_assignments_csv(path: Path) -> pd.DataFrame:
+    """
+    Same semantics as ``load_request_assignments_csv`` in ``MoD-aware_line_selection.py``:
+    strip string ``line`` cells, map ``Dropped`` to rejected, integer route indices as ``line``.
+    """
+    raw = pd.read_csv(path, encoding="utf-8-sig").sort_values("passenger").reset_index(drop=True)
+    n = len(raw)
+    kinds: List[str] = []
+    line_indices: List[Optional[int]] = []
+    for cell in raw["line"]:
+        if pd.isna(cell):
+            kinds.append("rejected")
+            line_indices.append(None)
+            continue
+        if isinstance(cell, str):
+            token = cell.strip()
         else:
-            request_assignments.append(("line", int(line_value)))
-    return request_assignments
+            token = cell
+        if token == "no_MT":
+            kinds.append("no_MT")
+            line_indices.append(None)
+        elif token == "rejected":
+            kinds.append("rejected")
+            line_indices.append(None)
+        elif str(token) == "Dropped":
+            kinds.append("rejected")
+            line_indices.append(None)
+        else:
+            kinds.append("line")
+            line_indices.append(int(token))
+
+    return pd.DataFrame(
+        {
+            "original_id": np.arange(n, dtype=np.int64),
+            "kind": kinds,
+            "line_idx": pd.array(line_indices, dtype="Int64"),
+        }
+    )
 
 
 def _darp_id_to_line_planning_leg(
-    darp_requests: List[dict],
-    request_assignments: List[Tuple[str, Optional[int]]],
+    darp_requests: pd.DataFrame,
+    request_assignments: pd.DataFrame,
 ) -> Dict[int, str]:
     """Match ``_darp_id_to_line_planning_leg`` in MoD-aware_line_selection.py."""
-    by_original: Dict[int, List[int]] = {}
-    for row in darp_requests:
-        oid = int(row["original_request_id"])
-        by_original.setdefault(oid, []).append(int(row["id"]))
+    asg = request_assignments.set_index("original_id")
+    by_original = (
+        darp_requests.groupby("original_request_id", sort=False)["id"]
+        .agg(lambda s: sorted(s.tolist()))
+        .to_dict()
+    )
 
     out: Dict[int, str] = {}
-    for oid, ids in by_original.items():
-        ids_sorted = sorted(ids)
-        kind, line_idx = request_assignments[oid]
+    for oid, ids_sorted in by_original.items():
+        row = asg.loc[oid]
+        kind = str(row["kind"])
+        line_idx = row["line_idx"]
         assert kind != "rejected", f"DARP row(s) for original {oid} but assignment is rejected"
-        if kind == "no_MT" or line_idx is None:
+        if kind == "no_MT" or line_idx is None or pd.isna(line_idx):
             assert len(ids_sorted) == 1, (
                 f"original {oid} no_MT: expected 1 DARP id, got {ids_sorted}"
             )
@@ -111,8 +170,8 @@ def _darp_id_to_line_planning_leg(
 
 def _compute_per_darp_request_costs(
     solution: dict,
-    darp_requests: List[dict],
-    request_assignments: List[Tuple[str, Optional[int]]],
+    darp_requests: pd.DataFrame,
+    request_assignments: pd.DataFrame,
 ) -> Dict[int, Tuple[float, float]]:
     """Match ``compute_per_darp_request_costs`` in MoD-aware_line_selection.py."""
     plan_share: Dict[int, float] = {}
@@ -155,7 +214,7 @@ def _compute_per_darp_request_costs(
             assert rid not in plan_share, f"DARP request {rid} appears in more than one plan"
             plan_share[rid] = cost_per_request
 
-    expected = {int(r["id"]) for r in darp_requests}
+    expected = {int(x) for x in darp_requests["id"].tolist()}
     assert plan_share.keys() == expected, (
         f"DARP cost extraction: ids in solution {sorted(plan_share.keys())} != "
         f"ids in requests.csv {sorted(expected)}"
@@ -180,38 +239,59 @@ def _compute_per_darp_request_costs(
 
 def _aggregate_mod_costs_for_original_requests(
     darp_request_leg_costs: Dict[int, Tuple[float, float]],
-    darp_requests: List[dict],
-    request_assignments: List[Tuple[str, Optional[int]]],
+    darp_requests: pd.DataFrame,
+    request_assignments: pd.DataFrame,
 ) -> dict:
+    costs_df = pd.DataFrame(
+        [(rid, fm, lm) for rid, (fm, lm) in darp_request_leg_costs.items()],
+        columns=["id", "fm", "lm"],
+    )
+    costs_df["fm"] = costs_df["fm"].astype("float64")
+    costs_df["lm"] = costs_df["lm"].astype("float64")
+    # Match ``aggregate_mod_costs_for_original_requests`` in MoD-aware_line_selection.py:
+    # pair first/last mile rows by ascending DARP ``id`` within each original.
+    merged = darp_requests[["id", "original_request_id"]].merge(costs_df, on="id", how="inner")
+    merged = merged.sort_values(["original_request_id", "id"], kind="mergesort")
+    # Do not use ``groupby(...).nth(1)`` for the second leg: in some pandas versions the
+    # ``nth(1)`` frame can omit group keys that ``size()`` still reports as size 2, which
+    # then raises ``KeyError`` on ``.loc[oid]`` (e.g. KeyError: 0).
+    merged["_leg_seq"] = merged.groupby("original_request_id", sort=False).cumcount()
+    sizes = merged.groupby("original_request_id", sort=False).size()
+    first_leg = merged.loc[merged["_leg_seq"] == 0].drop(columns=["_leg_seq"]).set_index(
+        "original_request_id"
+    )
+    second_leg = merged.loc[merged["_leg_seq"] == 1].drop(columns=["_leg_seq"]).set_index(
+        "original_request_id"
+    )
+
+    asg = request_assignments.set_index("original_id")
     original_request_costs: dict = {}
+
     for original_id in range(len(request_assignments)):
-        kind, line_idx = request_assignments[original_id]
+        row = asg.loc[original_id]
+        kind = str(row["kind"])
+        line_idx = row["line_idx"]
         if kind == "rejected":
             continue
-        darp_ids_for_original = [
-            req["id"] for req in darp_requests if req["original_request_id"] == original_id
-        ]
-        if kind == "no_MT" or line_idx is None:
-            assert len(darp_ids_for_original) == 1, (
-                f"MoD-only original request {original_id} expected 1 DARP request, "
-                f"found {len(darp_ids_for_original)}"
+        oid = int(original_id)
+        n = int(sizes.loc[oid]) if oid in sizes.index else 0
+        if kind == "no_MT" or line_idx is None or pd.isna(line_idx):
+            assert n == 1, (
+                f"MoD-only original request {oid} expected 1 DARP request, found {n}"
             )
-            darp_id = darp_ids_for_original[0]
-            fm_dl, lm_dl = darp_request_leg_costs[darp_id]
-            original_request_costs[original_id] = (float(fm_dl), float(lm_dl))
+            r = first_leg.loc[oid]
+            original_request_costs[oid] = (_scalar_float(r["fm"]), _scalar_float(r["lm"]))
         else:
-            assert len(darp_ids_for_original) == 2, (
-                f"Line-assigned original request {original_id} expected 2 DARP requests, "
-                f"found {len(darp_ids_for_original)}"
+            assert n == 2, (
+                f"Line-assigned original request {oid} expected 2 DARP requests, found {n}"
             )
-            first_mile_darp_id = darp_ids_for_original[0]
-            last_mile_darp_id = darp_ids_for_original[1]
-            f1, l1 = darp_request_leg_costs[first_mile_darp_id]
-            f2, l2 = darp_request_leg_costs[last_mile_darp_id]
-            original_request_costs[original_id] = (
-                float(f1) + float(l1),
-                float(f2) + float(l2),
+            r0 = first_leg.loc[oid]
+            r1 = second_leg.loc[oid]
+            original_request_costs[oid] = (
+                _scalar_float(r0["fm"]) + _scalar_float(r0["lm"]),
+                _scalar_float(r1["fm"]) + _scalar_float(r1["lm"]),
             )
+
     return original_request_costs
 
 
@@ -219,8 +299,6 @@ def _sum_mod_real_from_darp_iteration(iter_dir: Path) -> Optional[float]:
     solution_path = iter_dir / "config.yaml-solution.json"
     requests_path = iter_dir / "requests.csv"
     assignments_path = iter_dir / "passenger_assignments.csv"
-    if not (solution_path.exists() and requests_path.exists() and assignments_path.exists()):
-        return None
     solution = darpinstances.inout.load_json(solution_path)
     darp_requests = _load_darp_requests_csv(requests_path)
     request_assignments = _load_request_assignments_csv(assignments_path)
@@ -230,7 +308,7 @@ def _sum_mod_real_from_darp_iteration(iter_dir: Path) -> Optional[float]:
     agg = _aggregate_mod_costs_for_original_requests(
         darp_request_leg_costs, darp_requests, request_assignments
     )
-    return sum(fm + lm for fm, lm in agg.values())
+    return float(sum(fm + lm for fm, lm in agg.values()))
 
 
 def _count_used_lines(iter_dir: Path) -> Optional[int]:
@@ -238,9 +316,7 @@ def _count_used_lines(iter_dir: Path) -> Optional[int]:
     path = iter_dir / "used_lines.csv"
     if not path.is_file():
         return None
-    with path.open("r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        return sum(1 for _ in reader)
+    return len(pd.read_csv(path, encoding="utf-8-sig"))
 
 
 def _count_passengers_mod_vs_mt_served(iter_dir: Path) -> Tuple[Optional[int], Optional[int], Optional[int]]:
@@ -253,33 +329,41 @@ def _count_passengers_mod_vs_mt_served(iter_dir: Path) -> Tuple[Optional[int], O
     path = iter_dir / "passenger_assignments.csv"
     if not path.is_file():
         return None, None, None
-    mod_only = 0
-    mt = 0
-    with path.open("r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            line_val = str(row.get("line", "")).strip()
-            if line_val == "no_MT":
-                mod_only += 1
-            elif line_val in ("rejected", "Dropped", ""):
-                continue
-            else:
-                mt += 1
+    line_val = pd.read_csv(path, encoding="utf-8-sig", usecols=["line"])["line"].astype(str).str.strip()
+    mod_only = int((line_val == "no_MT").sum())
+    excluded = line_val.isin(("rejected", "Dropped", ""))
+    mt = int((~excluded & (line_val != "no_MT")).sum())
     served = mod_only + mt
     return mod_only, mt, served
 
 
 def _load_mod_only_baseline_darp_cost(mod_only_dir: Path) -> Optional[float]:
     """
-    Total realized MoD cost from the MoD-only DARP run (same layout as an ``iteration_*`` folder).
+    Total DARP objective from the MoD-only baseline: read root ``cost`` from
+    ``config.yaml-solution.json`` only (no ``passenger_assignments.csv`` / line-planning leg logic).
     """
     mod_only_dir = Path(mod_only_dir).resolve()
     if not mod_only_dir.is_dir():
+        raise FileNotFoundError(f"MoD-only DARP results directory not found: {mod_only_dir}")
+    solution_path = mod_only_dir / "config.yaml-solution.json"
+    if not solution_path.is_file():
+        logging.warning("MoD-only baseline solution missing: %s", solution_path)
         return None
     try:
-        return _sum_mod_real_from_darp_iteration(mod_only_dir)
-    except (AssertionError, KeyError, ValueError, TypeError, OSError):
+        data = json.loads(solution_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        logging.error("Could not read MoD-only solution JSON %s: %s", solution_path, e)
         return None
+    if data.get("feasible") is False:
+        logging.warning("MoD-only baseline solution is infeasible: %s", solution_path)
+        return None
+    cost = data.get("cost")
+    if cost is None:
+        logging.warning("MoD-only solution JSON has no top-level 'cost' key: %s", solution_path)
+        return None
+    value = float(cost)
+    logging.info("MoD-only DARP cost loaded: %s", value)
+    return value
 
 
 def _iter_dirs_sorted(results_dir: Path) -> List[Tuple[int, Path]]:
@@ -313,7 +397,8 @@ def collect_iteration_rows(results_dir: Path) -> List[Dict[str, Any]]:
         mod_real: Optional[float] = None
         try:
             mod_real = _sum_mod_real_from_darp_iteration(iter_dir)
-        except (KeyError, ValueError, TypeError) as e:
+        except Exception as e:
+            _PLOG.exception("iteration %s: real MoD cost computation failed", iteration_index)
             n_lines = _count_used_lines(iter_dir)
             n_mod_p, n_mt_p, n_served_p = _count_passengers_mod_vs_mt_served(iter_dir)
             rows.append({
@@ -321,17 +406,46 @@ def collect_iteration_rows(results_dir: Path) -> List[Dict[str, Any]]:
                 "mod_cost_estimated": mod_est,
                 "line_cost": line_cost,
                 "mod_cost_real": None,
+                "total_cost_real_plus_line": None,
                 "num_lines_used": n_lines,
                 "n_passengers_mod_only": n_mod_p,
                 "n_passengers_mt": n_mt_p,
                 "n_passengers_served": n_served_p,
-                "error": str(e),
+                "error": f"{type(e).__name__}: {e}",
             })
             continue
 
         total: Optional[float] = None
+        if mod_real is not None:
+            mod_real_f = float(mod_real)
+            if not math.isfinite(mod_real_f):
+                _PLOG.warning(
+                    "iteration %s: mod_cost_real is not finite (%r); omitting from plot",
+                    iteration_index,
+                    mod_real_f,
+                )
+                mod_real = None
+            else:
+                mod_real = mod_real_f
         if mod_real is not None and line_cost is not None:
-            total = mod_real + line_cost
+            total = float(mod_real + line_cost)
+            if not math.isfinite(total):
+                _PLOG.warning(
+                    "iteration %s: total_cost_real_plus_line is not finite (%r); omitting",
+                    iteration_index,
+                    total,
+                )
+                total = None
+
+        if _plot_iteration_costs_debug():
+            _PLOG.info(
+                "iteration %s: mod_est=%r mod_real=%r line_cost=%r total=%r",
+                iteration_index,
+                mod_est,
+                mod_real,
+                line_cost,
+                total,
+            )
 
         n_lines = _count_used_lines(iter_dir)
         n_mod_p, n_mt_p, n_served_p = _count_passengers_mod_vs_mt_served(iter_dir)
@@ -357,11 +471,22 @@ def build_cost_figure(
     mod_only_results_dir: Path | None = None,
 ) -> go.Figure:
     results_dir = Path(results_dir).resolve()
+
+    # Load MoD-only baseline cost
+    if mod_only_results_dir is not None:
+        mod_only_dir = Path(mod_only_results_dir).resolve()
+    else:
+        mod_only_dir = results_dir.parent / "MoD-only"
+    mod_only_baseline_cost = _load_mod_only_baseline_darp_cost(mod_only_dir)
+    
     rows = collect_iteration_rows(results_dir)
     if not rows:
         raise FileNotFoundError(
             f"No iteration_* subdirectories with data under {results_dir}"
         )
+
+    if _plot_iteration_costs_debug():
+        _PLOG.info("Collected rows:\n%s", pd.DataFrame(rows).to_string())
 
     display_title = title if title is not None else f"Cost evolution — {results_dir.name}"
 
@@ -373,13 +498,7 @@ def build_cost_figure(
     y_n_lines = [r.get("num_lines_used") for r in rows]
     y_n_mod = [r.get("n_passengers_mod_only") for r in rows]
     y_n_mt = [r.get("n_passengers_mt") for r in rows]
-    y_n_served = [r.get("n_passengers_served") for r in rows]
-
-    if mod_only_results_dir is not None:
-        mod_only_dir = Path(mod_only_results_dir).resolve()
-    else:
-        mod_only_dir = results_dir.parent / "MoD-only"
-    mod_only_baseline_cost = _load_mod_only_baseline_darp_cost(mod_only_dir)
+    y_n_served = [r.get("n_passengers_served") for r in rows]    
 
     fig = make_subplots(
         rows=3,
@@ -514,6 +633,7 @@ def build_cost_figure(
 
 
 # %% Run — build figure, optionally save HTML and show
+_ensure_plot_iteration_costs_debug_logging()
 fig = build_cost_figure(
     RESULTS_DIR,
     title=FIGURE_TITLE,
