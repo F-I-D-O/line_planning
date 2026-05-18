@@ -5,8 +5,6 @@ from typing import Any, Dict
 
 from lineplanning.candidate_lines import (
     generate_candidate_lines,
-    DEFAULT_NUMBER_OF_STOPS,
-    DEFAULT_NB_LINES,
     DEFAULT_MIN_LENGTH,
     DEFAULT_MAX_LENGTH,
     DEFAULT_MIN_START_END_DISTANCE,
@@ -133,14 +131,12 @@ def main() -> None:
     parser.add_argument(
         "--number-of-stops",
         type=int,
-        default=DEFAULT_NUMBER_OF_STOPS,
-        help=f"Number of stops to sample per instance (default: {DEFAULT_NUMBER_OF_STOPS}).",
+        help="Number of stops to sample per instance.",
     )
     parser.add_argument(
         "--nb-lines",
         type=int,
-        default=DEFAULT_NB_LINES,
-        help=f"Number of candidate lines to generate per instance (default: {DEFAULT_NB_LINES}).",
+        help="Number of candidate lines to generate per instance.",
     )
     parser.add_argument(
         "--min-length",
@@ -203,32 +199,15 @@ def main() -> None:
         raise NotADirectoryError(f"Instances root is not a directory: {root}")
 
     # Process all immediate subdirectories that look like instances
-    subdirs = sorted([p for p in root.iterdir() if p.is_dir()])
+    instance_dirs = []
+    for config_path in root.rglob("*.yaml"):
+        instance_dirs.append(config_path.parent)
+        
     gpkg_arg = Path(args.geopackage_path) if args.geopackage_path else None
 
-    if not subdirs:
-        # If there are no subdirectories, treat the root itself as a single instance directory
-        logging.info(
-            "No subdirectories found under %s. Treating it as a single instance directory.",
-            root,
-        )
-        process_instance_directory(
-            root,
-            number_of_stops=args.number_of_stops,
-            nb_lines=args.nb_lines,
-            min_length=args.min_length,
-            max_length=args.max_length,
-            min_start_end_distance=args.min_start_end_distance,
-            detour_skeleton=args.detour_skeleton,
-            area_name=args.area_name,
-            export_geopackage=not args.no_geopackage,
-            geopackage_path=gpkg_arg,
-        )
-        return
-
-    for instance_dir in subdirs:
+    for instance_dir in instance_dirs:
         try:
-            if gpkg_arg is not None and len(subdirs) > 1:
+            if gpkg_arg is not None and len(instance_dirs) > 1:
                 out_gpkg = gpkg_arg.parent / f"{instance_dir.name}_{gpkg_arg.name}"
             else:
                 out_gpkg = gpkg_arg

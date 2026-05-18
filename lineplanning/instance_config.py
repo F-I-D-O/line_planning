@@ -93,16 +93,18 @@ def load_line_planning_instance_config(config_path: Path) -> LinePlanningInstanc
         area_val = data.get("area_dir")
         if isinstance(area_val, str) and area_val.strip():
             area_root = _resolve_path(base_dir, area_val)
-            dm_file = _first_existing(
-                [
-                    area_root / "dm.h5",
-                    area_root / "dm.hd5",
-                    area_root / "dm.hdf5",
-                    area_root / "dm.csv",
-                ]
-            )
-            if dm_file is None:
-                dm_file = area_root / "dm.h5"
+        else:
+            area_root = base_dir
+        dm_file = _first_existing(
+            [
+                area_root / "dm.h5",
+                area_root / "dm.hd5",
+                area_root / "dm.hdf5",
+                area_root / "dm.csv",
+            ]
+        )
+        if dm_file is None:
+            dm_file = area_root / "dm.h5"
 
     if dm_file is None:
         raise ValueError(
