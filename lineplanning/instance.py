@@ -212,7 +212,6 @@ class line_instance:
         self._line_position_cache = {}
         self.direct_trip_options: List[TripOption] = []
         self.dm: Optional[np.ndarray] = None  # dm.
-        self.edge_to_passengers: Optional[List[List[List[int]]]] = None
         if preprocessing_dir is not None:
             self.preprocessing_dir = Path(preprocessing_dir)
         elif demand_file is not None:
@@ -242,12 +241,8 @@ class line_instance:
         logging.info('Found %s candidate lines in file', nb_lines)
         self.nb_lines = nb_lines
         (
-            self.set_of_lines,
-            self.pass_to_lines,
             self.optimal_trip_options,
             self.direct_trip_options,
-            self.lines_to_passengers,
-            self.edge_to_passengers,
             self.candidate_set_of_lines,
             self.lengths_travel_times,
             self.dm,
@@ -550,30 +545,6 @@ class line_instance:
         passengers = df["passenger_idx"].to_numpy(copy=False)[positions[mask]]
         return np.asarray(passengers, dtype=np.int32)
 
-    def _aggregates_from_line_trip_options(
-        self,
-        optimal_trip_options_per_line: pd.DataFrame,
-        candidate_set_of_lines,
-        nb_pass: int,
-        nb_lines: int,
-    ) -> Tuple[list, list, list, List[List[List[int]]]]:
-        """
-        Build only lightweight legacy compatibility structures.
-
-        The trip-option DataFrame is the canonical store. Passenger/line and
-        edge-passenger views are exposed through accessors such as
-        :meth:`line_passengers` and :meth:`edge_passengers`, so this method avoids
-        materializing the formerly large nested Python lists.
-        """
-        set_of_lines = [
-            [len(candidate_set_of_lines[line]) - 1, []]
-            for line in range(nb_lines)
-        ]
-        pass_to_lines: List[List[int]] = []
-        lines_to_passengers: List[List[int]] = []
-        edge_to_passengers: List[List[List[int]]] = []
-        return set_of_lines, pass_to_lines, lines_to_passengers, edge_to_passengers
-
     def _get_preprocessing_cache_path(
         self,
         maximum_detour: Optional[int],
@@ -592,9 +563,7 @@ class line_instance:
     def _load_preprocessing_cache_legacy_json(
         self,
         json_path: Path,
-        candidate_set_of_lines,
         nb_pass: int,
-        nb_lines: int,
     ):
         try:
             with json_path.open("r", encoding="utf-8") as cache_file:
@@ -649,29 +618,15 @@ class line_instance:
 
         optimal_trip_options = self._trip_options_df_from_records(optimal_trip_option_records)
 
-        (
-            set_of_lines,
-            pass_to_lines,
-            lines_to_passengers,
-            edge_to_passengers,
-        ) = self._aggregates_from_line_trip_options(
-            optimal_trip_options, candidate_set_of_lines, nb_pass, nb_lines
-        )
-
         logging.info("Loaded preprocessing data from legacy JSON cache %s", json_path)
         return (
-            set_of_lines,
-            pass_to_lines,
             optimal_trip_options,
             direct_trip_options,
-            lines_to_passengers,
-            edge_to_passengers,
         )
 
     def _load_preprocessing_cache(
         self,
         cache_path: Path,
-        candidate_set_of_lines,
         passengers: List[List[int]],
         distances: np.ndarray,
         nb_pass: int,
@@ -715,14 +670,6 @@ class line_instance:
                 logging.warning("Invalid row in preprocessing cache %s: %s", cache_path, exc)
                 return None
 
-            (
-                set_of_lines,
-                pass_to_lines,
-                lines_to_passengers,
-                edge_to_passengers,
-            ) = self._aggregates_from_line_trip_options(
-                optimal_trip_options, candidate_set_of_lines, nb_pass, nb_lines
-            )
             direct_trip_options = [
                 TripOption(
                     0,
@@ -739,18 +686,14 @@ class line_instance:
 
             logging.info("Loaded preprocessing data from cache %s", cache_path)
             return (
-                set_of_lines,
-                pass_to_lines,
                 optimal_trip_options,
                 direct_trip_options,
-                lines_to_passengers,
-                edge_to_passengers,
             )
 
         legacy_json = cache_path.with_suffix(".json")
         if legacy_json.exists():
             return self._load_preprocessing_cache_legacy_json(
-                legacy_json, candidate_set_of_lines, nb_pass, nb_lines
+                legacy_json, nb_pass
             )
 
         return None
@@ -777,12 +720,8 @@ class line_instance:
         logging.info("Stored preprocessing data to cache %s", cache_path)
 
     def manhattan_instance(self, maximum_detour) -> Tuple[
-        list,
-        list,
         pd.DataFrame,
         List[TripOption],
-        list,
-        List[List[List[int]]],
         list,
         list,
         np.ndarray,
@@ -828,7 +767,6 @@ class line_instance:
         cache_path = self._get_preprocessing_cache_path(maximum_detour)
         cached_preprocessing = self._load_preprocessing_cache(
             cache_path,
-            candidate_set_of_lines,
             passengers,
             distances,
             nb_pass,
@@ -837,21 +775,13 @@ class line_instance:
 
         if cached_preprocessing is not None:
             (
-                set_of_lines,
-                pass_to_lines,
                 optimal_trip_options,
                 direct_trip_options,
-                lines_to_passengers,
-                edge_to_passengers,
             ) = cached_preprocessing
         else:
             (
-                set_of_lines,
-                pass_to_lines,
                 optimal_trip_options,
                 direct_trip_options,
-                lines_to_passengers,
-                edge_to_passengers,
             ) = self.preprocessing(
                 candidate_set_of_lines,
                 passengers,
@@ -876,7 +806,6 @@ class line_instance:
             if prune_path.exists():
                 pruned_bundle = self._load_preprocessing_cache(
                     prune_path,
-                    candidate_set_of_lines,
                     passengers,
                     distances,
                     nb_pass,
@@ -889,12 +818,8 @@ class line_instance:
                     )
                 else:
                     (
-                        set_of_lines,
-                        pass_to_lines,
                         optimal_trip_options,
                         direct_trip_options,
-                        lines_to_passengers,
-                        edge_to_passengers,
                     ) = pruned_bundle
                     logging.info(
                         "Loaded line-mod-aggregate pruned trip options from %s",
@@ -919,22 +844,10 @@ class line_instance:
                         prune_path,
                     )
                 self._save_preprocessing_cache(prune_path, optimal_trip_options)
-                (
-                    set_of_lines,
-                    pass_to_lines,
-                    lines_to_passengers,
-                    edge_to_passengers,
-                ) = self._aggregates_from_line_trip_options(
-                    optimal_trip_options, candidate_set_of_lines, nb_pass, nb_lines
-                )
 
         return (
-            set_of_lines,
-            pass_to_lines,
             optimal_trip_options,
             direct_trip_options,
-            lines_to_passengers,
-            edge_to_passengers,
             candidate_set_of_lines,
             lengths_travel_times,
             distances,
@@ -943,7 +856,7 @@ class line_instance:
 
     def preprocessing(
         self, candidate_set_of_lines, passengers: List[List[int]], travel_times_on_lines, distances, maximum_detour, nb_pass
-    ) -> Tuple[list, list, pd.DataFrame, List[TripOption], list, List[List[List[int]]]]:
+    ) -> Tuple[pd.DataFrame, List[TripOption]]:
         logging.info('Preprocessing optimal trip options')
         nb_lines = len(candidate_set_of_lines)
 
@@ -963,15 +876,6 @@ class line_instance:
 
         optimal_trip_options = self._trip_options_df_from_column_buffers(optimal_trip_option_buffers)
 
-        (
-            set_of_lines,
-            pass_to_lines,
-            lines_to_passengers,
-            edge_to_passengers,
-        ) = self._aggregates_from_line_trip_options(
-            optimal_trip_options, candidate_set_of_lines, nb_pass, nb_lines
-        )
-
         direct_trip_options = [
             TripOption(
                 0,
@@ -989,12 +893,8 @@ class line_instance:
         logging.info('Preprocessing finished')
 
         return (
-            set_of_lines,
-            pass_to_lines,
             optimal_trip_options,
             direct_trip_options,
-            lines_to_passengers,
-            edge_to_passengers,
         )
 
     def _append_optimal_trip_columns_for_line(
