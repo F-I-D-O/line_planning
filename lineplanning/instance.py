@@ -3,9 +3,10 @@ import logging
 import random
 import re
 import hashlib
+from array import array
 from copy import deepcopy
 from pathlib import Path
-from typing import Dict, NamedTuple, Optional, List, Tuple
+from typing import Iterable, NamedTuple, Optional, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -126,12 +127,12 @@ def line_mod_aggregate_prune_csv_path(
 
 
 def prune_trip_options_line_mod_aggregate(
-    optimal_trip_options: List[Dict[int, TripOption]],
+    optimal_trip_options: pd.DataFrame,
     direct_trip_options: List[TripOption],
     nb_lines: int,
     line_opening_costs: List[float],
     rejection_cost: Optional[float] = None,
-) -> Tuple[List[Dict[int, TripOption]], List[int]]:
+) -> Tuple[pd.DataFrame, List[int]]:
     """
     For each line ρ, let P_ρ be passengers with a trip option on ρ. If
     ``sum_{p in P_ρ} (fm + lm) + line_cost[ρ] > sum_{p in P_ρ} baseline[p]``,
@@ -152,30 +153,33 @@ def prune_trip_options_line_mod_aggregate(
         if rej_val > 0:
             rej = rej_val
 
-    removed_routes: List[int] = []
-    for rho in range(nb_lines):
-        ps = [p for p in range(len(optimal_trip_options)) if rho in optimal_trip_options[p]]
-        if not ps:
-            continue
-        sum_mod = sum(
-            float(optimal_trip_options[p][rho].first_mile_cost)
-            + float(optimal_trip_options[p][rho].last_mile_cost)
-            for p in ps
-        )
-        if rej is None:
-            sum_direct = sum(float(direct_trip_options[p].first_mile_cost) for p in ps)
-        else:
-            sum_direct = sum(min(float(direct_trip_options[p].first_mile_cost), rej) for p in ps)
-        lc = float(line_opening_costs[rho])
-        if sum_mod + lc > sum_direct:
-            removed_routes.append(rho)
+    if optimal_trip_options.empty:
+        return optimal_trip_options.copy(), []
 
-    remove_set = set(removed_routes)
-    pruned: List[Dict[int, TripOption]] = [
-        {rho: opt for rho, opt in by_line.items() if rho not in remove_set}
-        for by_line in optimal_trip_options
+    df = optimal_trip_options
+    work = df[["passenger_idx", "line_idx", "first_mile_cost", "last_mile_cost"]].copy()
+    work["mod_cost"] = work["first_mile_cost"].to_numpy() + work["last_mile_cost"].to_numpy()
+    direct_costs = np.asarray([float(opt.first_mile_cost) for opt in direct_trip_options], dtype=np.float64)
+    baselines = direct_costs[work["passenger_idx"].to_numpy(dtype=np.int64, copy=False)]
+    if rej is not None:
+        baselines = np.minimum(baselines, rej)
+    work["baseline"] = baselines
+
+    sum_mod = work.groupby("line_idx", sort=False)["mod_cost"].sum()
+    sum_direct = work.groupby("line_idx", sort=False)["baseline"].sum()
+    line_costs = np.asarray(line_opening_costs, dtype=np.float64)
+
+    removable = sum_mod.index[
+        sum_mod.to_numpy(dtype=np.float64, copy=False)
+        + line_costs[sum_mod.index.to_numpy(dtype=np.int64, copy=False)]
+        > sum_direct.reindex(sum_mod.index).to_numpy(dtype=np.float64, copy=False)
     ]
-    return pruned, removed_routes
+    removed_routes = [int(rho) for rho in removable]
+    if not removed_routes:
+        return optimal_trip_options.copy(), []
+
+    pruned = df.loc[~df["line_idx"].isin(removed_routes)].copy()
+    return pruned.reset_index(drop=True), removed_routes
 
 
 class line_instance:
@@ -203,7 +207,9 @@ class line_instance:
         self.lengths_travel_times = None  # used only for the manhattan instance
         self.capacity = capacity
         self.demand_file = demand_file
-        self.optimal_trip_options: List[Dict[int, TripOption]] = []
+        self.optimal_trip_options: pd.DataFrame = self._empty_trip_options_df()
+        self._trip_option_keys = np.asarray([], dtype=np.int64)
+        self._line_position_cache = {}
         self.direct_trip_options: List[TripOption] = []
         self.dm: Optional[np.ndarray] = None  # dm.
         self.edge_to_passengers: Optional[List[List[List[int]]]] = None
@@ -247,6 +253,7 @@ class line_instance:
             self.dm,
             self.requests
         ) = self.manhattan_instance(maximum_detour)
+        self._rebuild_trip_option_index()
 
     def _get_instance_size_label(self, date: Optional[str]) -> str:
         if self.demand_file:
@@ -282,59 +289,289 @@ class line_instance:
         "mt_cost",
     ]
 
+    _PREPROCESSING_CSV_DTYPES = {
+        "passenger_idx": np.int32,
+        "line_idx": np.int32,
+        "value": np.float32,
+        "mt_pickup_node": np.int32,
+        "mt_drop_off_node": np.int32,
+        "mt_pickup_line_edge_index": np.int16,
+        "mt_drop_off_line_edge_index": np.int16,
+        "first_mile_cost": np.float32,
+        "last_mile_cost": np.float32,
+        "mt_cost": np.float32,
+    }
+
+    _PREPROCESSING_ARRAY_TYPECODES = {
+        "passenger_idx": "i",
+        "line_idx": "i",
+        "value": "f",
+        "mt_pickup_node": "i",
+        "mt_drop_off_node": "i",
+        "mt_pickup_line_edge_index": "h",
+        "mt_drop_off_line_edge_index": "h",
+        "first_mile_cost": "f",
+        "last_mile_cost": "f",
+        "mt_cost": "f",
+    }
+
+    def _new_trip_option_column_buffers(self) -> dict:
+        buffers = {
+            column: array(self._PREPROCESSING_ARRAY_TYPECODES[column])
+            for column in self._PREPROCESSING_CSV_COLUMNS
+        }
+        for column, buffer in buffers.items():
+            expected = np.dtype(self._PREPROCESSING_CSV_DTYPES[column]).itemsize
+            if buffer.itemsize != expected:
+                raise RuntimeError(
+                    f"array.array typecode {self._PREPROCESSING_ARRAY_TYPECODES[column]!r} "
+                    f"for {column!r} has itemsize {buffer.itemsize}, expected {expected}"
+                )
+        return buffers
+
+    def _append_trip_option_column_values(self, buffers: dict, column: str, values) -> None:
+        arr = np.asarray(values, dtype=self._PREPROCESSING_CSV_DTYPES[column])
+        if arr.size == 0:
+            return
+        buffers[column].frombytes(np.ascontiguousarray(arr).tobytes())
+
+    def _trip_options_df_from_column_buffers(self, buffers: dict) -> pd.DataFrame:
+        if not buffers or len(buffers["passenger_idx"]) == 0:
+            return self._empty_trip_options_df()
+        columns = {
+            column: np.frombuffer(buffers[column], dtype=self._PREPROCESSING_CSV_DTYPES[column])
+            for column in self._PREPROCESSING_CSV_COLUMNS
+        }
+        return self._normalize_trip_options_df(pd.DataFrame(columns, columns=self._PREPROCESSING_CSV_COLUMNS))
+
+    def _empty_trip_options_df(self) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                column: pd.Series(dtype=dtype)
+                for column, dtype in self._PREPROCESSING_CSV_DTYPES.items()
+            },
+            columns=self._PREPROCESSING_CSV_COLUMNS,
+        )
+
+    def _normalize_trip_options_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return self._empty_trip_options_df()
+        normalized = df.loc[:, self._PREPROCESSING_CSV_COLUMNS].copy()
+        for column, dtype in self._PREPROCESSING_CSV_DTYPES.items():
+            normalized[column] = normalized[column].astype(dtype, copy=False)
+        normalized = normalized.loc[normalized["mt_pickup_node"] != -1]
+        normalized = normalized.drop_duplicates(["passenger_idx", "line_idx"], keep="last")
+        normalized = normalized.sort_values(["passenger_idx", "line_idx"], kind="mergesort")
+        return normalized.reset_index(drop=True)
+
+    def _trip_options_df_from_records(self, records: Iterable[tuple]) -> pd.DataFrame:
+        df = pd.DataFrame.from_records(records, columns=self._PREPROCESSING_CSV_COLUMNS)
+        return self._normalize_trip_options_df(df)
+
+    def _trip_options_df_from_column_chunks(self, chunks: List[dict]) -> pd.DataFrame:
+        if not chunks:
+            return self._empty_trip_options_df()
+
+        columns = {}
+        for column in self._PREPROCESSING_CSV_COLUMNS:
+            arrays = [chunk[column] for chunk in chunks if len(chunk[column]) > 0]
+            if arrays:
+                columns[column] = np.concatenate(arrays).astype(
+                    self._PREPROCESSING_CSV_DTYPES[column],
+                    copy=False,
+                )
+            else:
+                columns[column] = np.asarray([], dtype=self._PREPROCESSING_CSV_DTYPES[column])
+        return self._normalize_trip_options_df(pd.DataFrame(columns, columns=self._PREPROCESSING_CSV_COLUMNS))
+
+    @staticmethod
+    def _trip_option_from_row(row) -> TripOption:
+        return TripOption(
+            float(row.value),
+            int(row.mt_pickup_node),
+            int(row.mt_drop_off_node),
+            int(row.mt_pickup_line_edge_index),
+            int(row.mt_drop_off_line_edge_index),
+            float(row.first_mile_cost),
+            float(row.last_mile_cost),
+            float(row.mt_cost),
+        )
+
+    def _rebuild_trip_option_index(self) -> None:
+        self._line_position_cache = {}
+        if self.optimal_trip_options.empty:
+            self._trip_option_keys = np.asarray([], dtype=np.int64)
+            return
+        passengers = self.optimal_trip_options["passenger_idx"].to_numpy(dtype=np.int64, copy=False)
+        lines = self.optimal_trip_options["line_idx"].to_numpy(dtype=np.int64, copy=False)
+        self._trip_option_keys = passengers * int(self.nb_lines) + lines
+
+    def _trip_option_row_position(self, passenger_idx: int, line_idx: int) -> Optional[int]:
+        if self._trip_option_keys.size == 0:
+            return None
+        key = int(passenger_idx) * int(self.nb_lines) + int(line_idx)
+        pos = int(np.searchsorted(self._trip_option_keys, key))
+        if pos >= self._trip_option_keys.size or int(self._trip_option_keys[pos]) != key:
+            return None
+        return pos
+
+    def has_trip_option_on_line(self, passenger_idx: int, line_idx: int) -> bool:
+        return self._trip_option_row_position(passenger_idx, line_idx) is not None
+
     def trip_option_on_line(self, passenger_idx: int, line_idx: int) -> Optional[TripOption]:
         """Feasible mass-transit option for (passenger, candidate line), or None if infeasible."""
-        return self.optimal_trip_options[passenger_idx].get(line_idx)
+        pos = self._trip_option_row_position(passenger_idx, line_idx)
+        if pos is None:
+            return None
+        row = self.optimal_trip_options.iloc[pos]
+        return TripOption(
+            float(row["value"]),
+            int(row["mt_pickup_node"]),
+            int(row["mt_drop_off_node"]),
+            int(row["mt_pickup_line_edge_index"]),
+            int(row["mt_drop_off_line_edge_index"]),
+            float(row["first_mile_cost"]),
+            float(row["last_mile_cost"]),
+            float(row["mt_cost"]),
+        )
 
     def trip_value_on_line(self, passenger_idx: int, line_idx: int) -> float:
-        opt = self.trip_option_on_line(passenger_idx, line_idx)
-        return float(opt.value) if opt is not None else 0.0
+        pos = self._trip_option_row_position(passenger_idx, line_idx)
+        if pos is None:
+            return 0.0
+        return float(self.optimal_trip_options.iat[pos, self.optimal_trip_options.columns.get_loc("value")])
+
+    def trip_mod_cost_on_line(self, passenger_idx: int, line_idx: int) -> float:
+        pos = self._trip_option_row_position(passenger_idx, line_idx)
+        if pos is None:
+            return 0.0
+        df = self.optimal_trip_options
+        return float(df.iat[pos, df.columns.get_loc("first_mile_cost")]) + float(
+            df.iat[pos, df.columns.get_loc("last_mile_cost")]
+        )
+
+    def set_trip_mod_cost_on_line(
+        self,
+        passenger_idx: int,
+        line_idx: int,
+        first_mile_cost: float,
+        last_mile_cost: float,
+    ) -> None:
+        self.set_trip_costs_on_line(passenger_idx, line_idx, first_mile_cost, last_mile_cost)
+
+    def set_trip_costs_on_line(
+        self,
+        passenger_idx: int,
+        line_idx: int,
+        first_mile_cost: float,
+        last_mile_cost: float,
+        mt_cost: Optional[float] = None,
+    ) -> None:
+        pos = self._trip_option_row_position(passenger_idx, line_idx)
+        if pos is None:
+            raise KeyError(f"No trip option for passenger_idx={passenger_idx}, line_idx={line_idx}")
+        df = self.optimal_trip_options
+        df.iat[pos, df.columns.get_loc("first_mile_cost")] = float(first_mile_cost)
+        df.iat[pos, df.columns.get_loc("last_mile_cost")] = float(last_mile_cost)
+        if mt_cost is not None:
+            df.iat[pos, df.columns.get_loc("mt_cost")] = float(mt_cost)
+
+    def iter_trip_options_for_passenger(self, passenger_idx: int):
+        if self._trip_option_keys.size == 0:
+            return
+        start_key = int(passenger_idx) * int(self.nb_lines)
+        end_key = (int(passenger_idx) + 1) * int(self.nb_lines)
+        lo, hi = np.searchsorted(self._trip_option_keys, [start_key, end_key])
+        for row in self.optimal_trip_options.iloc[int(lo):int(hi)].itertuples(index=False):
+            yield int(row.line_idx), self._trip_option_from_row(row)
+
+    def trip_option_lines_for_passenger(self, passenger_idx: int) -> List[int]:
+        if self._trip_option_keys.size == 0:
+            return []
+        start_key = int(passenger_idx) * int(self.nb_lines)
+        end_key = (int(passenger_idx) + 1) * int(self.nb_lines)
+        lo, hi = np.searchsorted(self._trip_option_keys, [start_key, end_key])
+        return [
+            int(line_idx)
+            for line_idx in self.optimal_trip_options["line_idx"].iloc[int(lo):int(hi)].to_numpy(copy=False)
+        ]
+
+    def positive_trip_value_pairs(self) -> List[Tuple[int, int]]:
+        if self.optimal_trip_options.empty:
+            return []
+        rows = self.optimal_trip_options.loc[
+            self.optimal_trip_options["value"] > 0,
+            ["line_idx", "passenger_idx"],
+        ].itertuples(index=False)
+        return [(int(row.line_idx), int(row.passenger_idx)) for row in rows]
+
+    def line_length(self, line_idx: int) -> int:
+        return len(self.candidate_set_of_lines[int(line_idx)]) - 1
+
+    def first_passenger_on_line(self, line_idx: int) -> Optional[int]:
+        passengers = self.line_passengers(line_idx)
+        if passengers.size == 0:
+            return None
+        return int(passengers[0])
+
+    def _line_option_positions(self, line_idx: int) -> np.ndarray:
+        rho = int(line_idx)
+        cached = self._line_position_cache.get(rho)
+        if cached is not None:
+            return cached
+        if self.optimal_trip_options.empty:
+            positions = np.asarray([], dtype=np.int32)
+        else:
+            line_values = self.optimal_trip_options["line_idx"].to_numpy(copy=False)
+            positions = np.flatnonzero(line_values == rho)
+            if positions.size == 0 or int(positions[-1]) <= np.iinfo(np.int32).max:
+                positions = positions.astype(np.int32, copy=False)
+        self._line_position_cache[rho] = positions
+        return positions
+
+    def line_passengers(self, line_idx: int) -> np.ndarray:
+        positions = self._line_option_positions(line_idx)
+        if positions.size == 0:
+            return np.asarray([], dtype=np.int32)
+        passengers = self.optimal_trip_options["passenger_idx"].to_numpy(copy=False)[positions]
+        return np.asarray(passengers, dtype=np.int32)
+
+    def edge_passengers(self, line_idx: int, edge_idx: int) -> np.ndarray:
+        positions = self._line_option_positions(line_idx)
+        if positions.size == 0:
+            return np.asarray([], dtype=np.int32)
+        df = self.optimal_trip_options
+        pickup_edges = df["mt_pickup_line_edge_index"].to_numpy(copy=False)[positions]
+        drop_off_edges = df["mt_drop_off_line_edge_index"].to_numpy(copy=False)[positions]
+        edge = int(edge_idx)
+        mask = (pickup_edges <= edge) & (edge < drop_off_edges)
+        if not bool(mask.any()):
+            return np.asarray([], dtype=np.int32)
+        passengers = df["passenger_idx"].to_numpy(copy=False)[positions[mask]]
+        return np.asarray(passengers, dtype=np.int32)
 
     def _aggregates_from_line_trip_options(
         self,
-        optimal_trip_options_per_line: List[Dict[int, TripOption]],
+        optimal_trip_options_per_line: pd.DataFrame,
         candidate_set_of_lines,
         nb_pass: int,
         nb_lines: int,
     ) -> Tuple[list, list, list, List[List[List[int]]]]:
         """
-        Build set_of_lines, pass_to_lines, lines_to_passengers, edge_to_passengers from
-        feasible per-line trip options only (no direct / no-MT row).
-        """
-        pass_to_lines = [sorted(optimal_trip_options_per_line[p].keys()) for p in range(nb_pass)]
-        lines_to_passengers: List[List[int]] = [[] for _ in range(nb_lines)]
-        for p in range(nb_pass):
-            for rho in optimal_trip_options_per_line[p]:
-                lines_to_passengers[rho].append(p)
-        for rho in range(nb_lines):
-            lines_to_passengers[rho].sort()
+        Build only lightweight legacy compatibility structures.
 
-        set_of_lines = []
+        The trip-option DataFrame is the canonical store. Passenger/line and
+        edge-passenger views are exposed through accessors such as
+        :meth:`line_passengers` and :meth:`edge_passengers`, so this method avoids
+        materializing the formerly large nested Python lists.
+        """
+        set_of_lines = [
+            [len(candidate_set_of_lines[line]) - 1, []]
+            for line in range(nb_lines)
+        ]
+        pass_to_lines: List[List[int]] = []
+        lines_to_passengers: List[List[int]] = []
         edge_to_passengers: List[List[List[int]]] = []
-        for line in tqdm(range(nb_lines), desc="Building line instance data structures"):
-            line_length = len(candidate_set_of_lines[line]) - 1
-            pass_covered = []
-            edge_to_passengers.append([[] for _ in range(line_length)])
-            for p in range(nb_pass):
-                optimal_trip_option = optimal_trip_options_per_line[p].get(line)
-                if optimal_trip_option is None:
-                    continue
-                pass_covered.append(
-                    [
-                        p,
-                        [
-                            optimal_trip_option.mt_pickup_node,
-                            optimal_trip_option.mt_drop_off_node,
-                        ],
-                        optimal_trip_option.value,
-                    ]
-                )
-                for line_edge in range(
-                    optimal_trip_option.mt_pickup_line_edge_index,
-                    optimal_trip_option.mt_drop_off_line_edge_index,
-                ):
-                    edge_to_passengers[line][line_edge].append(p)
-            set_of_lines.append([line_length, pass_covered])
         return set_of_lines, pass_to_lines, lines_to_passengers, edge_to_passengers
 
     def _get_preprocessing_cache_path(
@@ -372,32 +609,45 @@ class line_instance:
             logging.warning("Missing key in preprocessing cache %s: %s", json_path, exc)
             return None
 
-        optimal_trip_options: List[Dict[int, TripOption]] = []
+        optimal_trip_option_records = []
         direct_trip_options: List[TripOption] = []
         try:
-            for options in optimal_trip_options_raw:
+            for passenger_idx, options in enumerate(optimal_trip_options_raw):
                 if len(options) < 2:
                     logging.warning("Invalid passenger entry in legacy cache %s", json_path)
                     return None
                 row_list = [self._deserialize_trip_option(opt) for opt in options]
                 direct_trip_options.append(row_list[-1])
-                by_line: Dict[int, TripOption] = {}
                 for rho, opt in enumerate(row_list[:-1]):
                     if opt.mt_pickup_node != -1:
-                        by_line[rho] = opt
-                optimal_trip_options.append(by_line)
+                        optimal_trip_option_records.append(
+                            (
+                                passenger_idx,
+                                rho,
+                                opt.value,
+                                opt.mt_pickup_node,
+                                opt.mt_drop_off_node,
+                                opt.mt_pickup_line_edge_index,
+                                opt.mt_drop_off_line_edge_index,
+                                opt.first_mile_cost,
+                                opt.last_mile_cost,
+                                opt.mt_cost,
+                            )
+                        )
         except (KeyError, TypeError, ValueError) as exc:
             logging.warning("Invalid trip option in legacy cache %s: %s", json_path, exc)
             return None
 
-        if len(optimal_trip_options) != nb_pass:
+        if len(direct_trip_options) != nb_pass:
             logging.warning(
                 "Legacy cache %s: expected %d passengers, got %d",
                 json_path,
                 nb_pass,
-                len(optimal_trip_options),
+                len(direct_trip_options),
             )
             return None
+
+        optimal_trip_options = self._trip_options_df_from_records(optimal_trip_option_records)
 
         (
             set_of_lines,
@@ -429,7 +679,7 @@ class line_instance:
     ):
         if cache_path.exists():
             try:
-                df = pd.read_csv(cache_path)
+                df = pd.read_csv(cache_path, dtype=self._PREPROCESSING_CSV_DTYPES)
             except (OSError, ValueError) as exc:
                 logging.warning("Failed to read preprocessing cache %s: %s", cache_path, exc)
                 return None
@@ -441,57 +691,26 @@ class line_instance:
                 )
                 return None
 
-            df = df.sort_values(["passenger_idx", "line_idx"])
-            optimal_trip_options: List[Dict[int, TripOption]] = [{} for _ in range(nb_pass)]
             try:
-                col_zip = zip(
-                    df["passenger_idx"].to_numpy(copy=False),
-                    df["line_idx"].to_numpy(copy=False),
-                    df["value"].to_numpy(copy=False),
-                    df["mt_pickup_node"].to_numpy(copy=False),
-                    df["mt_drop_off_node"].to_numpy(copy=False),
-                    df["mt_pickup_line_edge_index"].to_numpy(copy=False),
-                    df["mt_drop_off_line_edge_index"].to_numpy(copy=False),
-                    df["first_mile_cost"].to_numpy(copy=False),
-                    df["last_mile_cost"].to_numpy(copy=False),
-                    df["mt_cost"].to_numpy(copy=False),
+                bad_range = (
+                    (df["passenger_idx"] < 0)
+                    | (df["passenger_idx"] >= nb_pass)
+                    | (df["line_idx"] < 0)
+                    | (df["line_idx"] >= nb_lines)
                 )
-                for (
-                    p,
-                    line_idx,
-                    value,
-                    mt_pickup_node,
-                    mt_drop_off_node,
-                    mt_pickup_line_edge_index,
-                    mt_drop_off_line_edge_index,
-                    first_mile_cost,
-                    last_mile_cost,
-                    mt_cost,
-                ) in tqdm(col_zip, total=len(df), desc="Loading preprocessing cache"):
-                    p_i = int(p)
-                    rho = int(line_idx)
-                    if rho < 0 or rho >= nb_lines or p_i < 0 or p_i >= nb_pass:
-                        raise ValueError(f"out-of-range passenger_idx={p_i} or line_idx={rho}")
-                    if int(mt_pickup_node) == -1:
-                        continue
-                    opt = TripOption(
-                        float(value),
-                        int(mt_pickup_node),
-                        int(mt_drop_off_node),
-                        int(mt_pickup_line_edge_index),
-                        int(mt_drop_off_line_edge_index),
-                        float(first_mile_cost),
-                        float(last_mile_cost),
-                        float(mt_cost),
+                if bool(bad_range.any()):
+                    bad = df.loc[bad_range, ["passenger_idx", "line_idx"]].iloc[0]
+                    raise ValueError(
+                        f"out-of-range passenger_idx={int(bad.passenger_idx)} "
+                        f"or line_idx={int(bad.line_idx)}"
                     )
-                    if rho in optimal_trip_options[p_i]:
-                        logging.warning(
-                            "Duplicate (passenger_idx=%d, line_idx=%d) in %s; keeping last row",
-                            p_i,
-                            rho,
-                            cache_path,
-                        )
-                    optimal_trip_options[p_i][rho] = opt
+                duplicated = df.duplicated(["passenger_idx", "line_idx"], keep=False)
+                if bool(duplicated.any()):
+                    logging.warning(
+                        "Duplicate (passenger_idx, line_idx) rows in %s; keeping last row",
+                        cache_path,
+                    )
+                optimal_trip_options = self._normalize_trip_options_df(df)
             except (ValueError, TypeError, KeyError) as exc:
                 logging.warning("Invalid row in preprocessing cache %s: %s", cache_path, exc)
                 return None
@@ -539,28 +758,11 @@ class line_instance:
     def _save_preprocessing_cache(
         self,
         cache_path: Path,
-        optimal_trip_options: List[Dict[int, TripOption]],
+        optimal_trip_options: pd.DataFrame,
     ) -> None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        rows = []
-        for p, by_line in enumerate(optimal_trip_options):
-            for line_idx in sorted(by_line.keys()):
-                opt = by_line[line_idx]
-                rows.append(
-                    {
-                        "passenger_idx": p,
-                        "line_idx": line_idx,
-                        "value": opt.value,
-                        "mt_pickup_node": opt.mt_pickup_node,
-                        "mt_drop_off_node": opt.mt_drop_off_node,
-                        "mt_pickup_line_edge_index": opt.mt_pickup_line_edge_index,
-                        "mt_drop_off_line_edge_index": opt.mt_drop_off_line_edge_index,
-                        "first_mile_cost": opt.first_mile_cost,
-                        "last_mile_cost": opt.last_mile_cost,
-                        "mt_cost": opt.mt_cost,
-                    }
-                )
-        df = pd.DataFrame(rows, columns=self._PREPROCESSING_CSV_COLUMNS)
+        df = self._normalize_trip_options_df(optimal_trip_options)
+        logging.info("Saving preprocessing cache to %s", cache_path)
         try:
             df.to_csv(cache_path, index=False)
         except OSError as exc:
@@ -577,7 +779,7 @@ class line_instance:
     def manhattan_instance(self, maximum_detour) -> Tuple[
         list,
         list,
-        List[Dict[int, TripOption]],
+        pd.DataFrame,
         List[TripOption],
         list,
         List[List[List[int]]],
@@ -741,19 +943,25 @@ class line_instance:
 
     def preprocessing(
         self, candidate_set_of_lines, passengers: List[List[int]], travel_times_on_lines, distances, maximum_detour, nb_pass
-    ) -> Tuple[list, list, List[Dict[int, TripOption]], List[TripOption], list, List[List[List[int]]]]:
+    ) -> Tuple[list, list, pd.DataFrame, List[TripOption], list, List[List[List[int]]]]:
         logging.info('Preprocessing optimal trip options')
         nb_lines = len(candidate_set_of_lines)
 
-        optimal_trip_options: List[Dict[int, TripOption]] = [{} for _ in range(nb_pass)]
+        optimal_trip_option_buffers = self._new_trip_option_column_buffers()
+        passengers_np = np.asarray(passengers, dtype=np.int64)
 
         for line in tqdm(range(nb_lines), desc='Processing lines'):
-            for p in range(nb_pass):
-                optimal_trip_option = self.get_optimal_trip(
-                    passengers[p], candidate_set_of_lines[line], travel_times_on_lines[line], distances, maximum_detour
-                )
-                if optimal_trip_option.mt_pickup_node != -1:
-                    optimal_trip_options[p][line] = optimal_trip_option
+            self._append_optimal_trip_columns_for_line(
+                optimal_trip_option_buffers,
+                line,
+                candidate_set_of_lines[line],
+                travel_times_on_lines[line],
+                passengers_np,
+                distances,
+                maximum_detour,
+            )
+
+        optimal_trip_options = self._trip_options_df_from_column_buffers(optimal_trip_option_buffers)
 
         (
             set_of_lines,
@@ -788,6 +996,147 @@ class line_instance:
             lines_to_passengers,
             edge_to_passengers,
         )
+
+    def _append_optimal_trip_columns_for_line(
+        self,
+        buffers: dict,
+        line_idx: int,
+        line,
+        travel_times_on_line,
+        passengers: np.ndarray,
+        distances: np.ndarray,
+        maximum_detour,
+        chunk_size: int = 4096,
+    ) -> None:
+        line_nodes = np.asarray(line, dtype=np.int64)
+        line_length = int(line_nodes.size)
+        if line_length < 2:
+            return
+
+        pickup_indices, drop_off_indices = np.triu_indices(line_length, k=1)
+        if pickup_indices.size == 0:
+            return
+
+        travel_times = np.asarray(travel_times_on_line)
+        mt_pair_costs = travel_times[pickup_indices, drop_off_indices]
+        nb_pass = int(passengers.shape[0])
+
+        for chunk_start in range(0, nb_pass, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, nb_pass)
+            chunk = passengers[chunk_start:chunk_end]
+            origins = chunk[:, 0].astype(np.int64, copy=False)
+            destinations = chunk[:, 1].astype(np.int64, copy=False)
+            direct = distances[origins, destinations]
+            direct_int = direct.astype(np.int64, copy=False)
+
+            first_mile = distances[origins[:, None], line_nodes[None, :]]
+            last_mile = distances[line_nodes[None, :], destinations[:, None]]
+            chunk_len = int(chunk.shape[0])
+
+            best_value = np.zeros(chunk_len, dtype=np.int64)
+            best_mt_cost = np.zeros(chunk_len, dtype=np.float64)
+            best_pickup_idx = np.full(chunk_len, -1, dtype=np.int32)
+            best_drop_off_idx = np.full(chunk_len, -1, dtype=np.int32)
+            best_first_mile = np.zeros(chunk_len, dtype=np.float64)
+            best_last_mile = np.zeros(chunk_len, dtype=np.float64)
+
+            for pair_pos, pickup_idx in enumerate(pickup_indices):
+                drop_off_idx = int(drop_off_indices[pair_pos])
+                pickup_idx = int(pickup_idx)
+                mt_cost = float(mt_pair_costs[pair_pos])
+
+                fm = first_mile[:, pickup_idx]
+                lm = last_mile[:, drop_off_idx]
+                mod_travel_time = fm + lm
+                value = direct_int - mod_travel_time.astype(np.int64, copy=False)
+                total_travel_time = mod_travel_time + mt_cost
+                feasible = total_travel_time <= float(maximum_detour) * direct
+                better = feasible & (
+                    (value > best_value)
+                    | ((value == best_value) & (mt_cost < best_mt_cost))
+                )
+                if not bool(better.any()):
+                    continue
+
+                best_value[better] = value[better]
+                best_mt_cost[better] = mt_cost
+                best_pickup_idx[better] = pickup_idx
+                best_drop_off_idx[better] = drop_off_idx
+                best_first_mile[better] = fm[better]
+                best_last_mile[better] = lm[better]
+
+            valid = best_pickup_idx != -1
+            if not bool(valid.any()):
+                continue
+
+            valid_pos = np.flatnonzero(valid)
+            best_pickups = best_pickup_idx[valid_pos]
+            best_drop_offs = best_drop_off_idx[valid_pos]
+            n_valid = int(valid_pos.size)
+            self._append_trip_option_column_values(buffers, "passenger_idx", chunk_start + valid_pos)
+            self._append_trip_option_column_values(buffers, "line_idx", np.full(n_valid, line_idx, dtype=np.int32))
+            self._append_trip_option_column_values(buffers, "value", best_value[valid_pos])
+            self._append_trip_option_column_values(buffers, "mt_pickup_node", line_nodes[best_pickups])
+            self._append_trip_option_column_values(buffers, "mt_drop_off_node", line_nodes[best_drop_offs])
+            self._append_trip_option_column_values(buffers, "mt_pickup_line_edge_index", best_pickups)
+            self._append_trip_option_column_values(buffers, "mt_drop_off_line_edge_index", best_drop_offs)
+            self._append_trip_option_column_values(buffers, "first_mile_cost", best_first_mile[valid_pos])
+            self._append_trip_option_column_values(buffers, "last_mile_cost", best_last_mile[valid_pos])
+            self._append_trip_option_column_values(buffers, "mt_cost", best_mt_cost[valid_pos])
+
+    def _optimal_trip_column_chunks_for_line(
+        self,
+        line_idx: int,
+        line,
+        travel_times_on_line,
+        passengers: np.ndarray,
+        distances: np.ndarray,
+        maximum_detour,
+        chunk_size: int = 4096,
+    ) -> List[dict]:
+        buffers = self._new_trip_option_column_buffers()
+        self._append_optimal_trip_columns_for_line(
+            buffers,
+            line_idx,
+            line,
+            travel_times_on_line,
+            passengers,
+            distances,
+            maximum_detour,
+            chunk_size=chunk_size,
+        )
+        if len(buffers["passenger_idx"]) == 0:
+            return []
+        return [
+            {
+                column: np.frombuffer(buffers[column], dtype=self._PREPROCESSING_CSV_DTYPES[column])
+                for column in self._PREPROCESSING_CSV_COLUMNS
+            }
+        ]
+
+    def _optimal_trip_records_for_line(
+        self,
+        line_idx: int,
+        line,
+        travel_times_on_line,
+        passengers: np.ndarray,
+        distances: np.ndarray,
+        maximum_detour,
+        chunk_size: int = 4096,
+    ) -> List[tuple]:
+        records = []
+        for chunk in self._optimal_trip_column_chunks_for_line(
+            line_idx,
+            line,
+            travel_times_on_line,
+            passengers,
+            distances,
+            maximum_detour,
+            chunk_size=chunk_size,
+        ):
+            for row in zip(*(chunk[column] for column in self._PREPROCESSING_CSV_COLUMNS)):
+                records.append(tuple(row))
+        return records
 
     def get_optimal_trip(self, passenger: List[int], line, travel_times_on_line, distances, maximum_detour) -> TripOption:
         """

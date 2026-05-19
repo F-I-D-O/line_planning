@@ -124,7 +124,7 @@ for p in range(line_inst.nb_pass):
         skipped_no_direct += 1
         continue
 
-    valid = [o for o in line_inst.optimal_trip_options[p].values() if _is_valid_mt_option(o)]
+    valid = [o for _, o in line_inst.iter_trip_options_for_passenger(p) if _is_valid_mt_option(o)]
     if not valid:
         skipped_no_mt += 1
         continue

@@ -307,7 +307,6 @@ def build_darp_request_pool(
 
     dm = line_instance.dm
     requests_od = line_instance.requests
-    set_of_lines = line_instance.set_of_lines
     lengths_travel_times = line_instance.lengths_travel_times
 
     rows: List[DarpPoolRow] = []
@@ -332,8 +331,7 @@ def build_darp_request_pool(
         )
         pool_id += 1
 
-        opts = line_instance.optimal_trip_options[r]
-        for rho in sorted(opts.keys()):
+        for rho in line_instance.trip_option_lines_for_passenger(r):
             opt = line_instance.trip_option_on_line(r, rho)
             if opt is None:
                 continue
@@ -356,7 +354,7 @@ def build_darp_request_pool(
             first_mile_time = float(dm[o_r][sb]) if dm is not None and sb >= 0 else 0.0
             t_board = t_r + first_mile_time + td
 
-            line_length = int(set_of_lines[rho][0])
+            line_length = int(line_instance.line_length(rho))
             if line_length > 0 and lengths_travel_times is not None:
                 segment_edges = max(0, opt.mt_drop_off_line_edge_index - opt.mt_pickup_line_edge_index)
                 segment_time = float(lengths_travel_times[rho]) * (segment_edges / line_length)
@@ -608,7 +606,9 @@ def _old_mod_leg_cost_on_instance(
         opt = line_instance.direct_trip_options[p]
         return float(opt.first_mile_cost) + float(opt.last_mile_cost)
     assert pool_row.route_idx is not None
-    opt = line_instance.optimal_trip_options[p][int(pool_row.route_idx)]
+    opt = line_instance.trip_option_on_line(p, int(pool_row.route_idx))
+    if opt is None:
+        raise KeyError(f"No trip option for passenger_idx={p}, line_idx={int(pool_row.route_idx)}")
     if pool_row.leg_kind == "first_mile":
         return float(opt.first_mile_cost)
     if pool_row.leg_kind == "last_mile":
@@ -1078,7 +1078,6 @@ def solution_to_darp_requests(
 
     dm = line_instance.dm
     requests_od = line_instance.requests
-    set_of_lines = line_instance.set_of_lines
     lengths_travel_times = line_instance.lengths_travel_times
 
     darp_requests = []
@@ -1127,7 +1126,7 @@ def solution_to_darp_requests(
         t_board = t_r + first_mile_time + transfer_delay
 
         # Segment travel time on line (boarding to unboarding)
-        line_length = set_of_lines[route][0]
+        line_length = line_instance.line_length(route)
         if line_length > 0 and lengths_travel_times is not None:
             segment_edges = max(0, opt.mt_drop_off_line_edge_index - opt.mt_pickup_line_edge_index)
             segment_time = lengths_travel_times[route] * (segment_edges / line_length)
@@ -1565,7 +1564,9 @@ def _get_current_costs_for_assignments(
         if kind == "no_MT" or line_idx is None:
             opt = line_instance.direct_trip_options[original_id]
         else:
-            opt = line_instance.optimal_trip_options[original_id][int(line_idx)]
+            opt = line_instance.trip_option_on_line(original_id, int(line_idx))
+            if opt is None:
+                raise KeyError(f"No trip option for passenger_idx={original_id}, line_idx={int(line_idx)}")
         costs[original_id] = (float(opt.first_mile_cost), float(opt.last_mile_cost))
     return costs
 
@@ -1628,13 +1629,13 @@ def _scale_all_mod_costs_in_model(
         )
 
     # Scale all line-based options for every request / route
-    for p, opts_by_route in enumerate(line_instance.optimal_trip_options):
-        # opts_by_route is a dict: route_index -> TripOption
-        for rho, opt in list(opts_by_route.items()):
-            opts_by_route[rho] = opt._replace(
-                first_mile_cost=float(opt.first_mile_cost) * factor,
-                last_mile_cost=float(opt.last_mile_cost) * factor,
-            )
+    if not line_instance.optimal_trip_options.empty:
+        line_instance.optimal_trip_options["first_mile_cost"] = (
+            line_instance.optimal_trip_options["first_mile_cost"].astype(float) * factor
+        )
+        line_instance.optimal_trip_options["last_mile_cost"] = (
+            line_instance.optimal_trip_options["last_mile_cost"].astype(float) * factor
+        )
 
 
 @dataclass(frozen=True)
@@ -1816,7 +1817,7 @@ def _apply_cluster_factors_to_all_mod_costs(
         )
 
     for p in range(line_instance.nb_pass):
-        for rho, opt in list(line_instance.optimal_trip_options[p].items()):
+        for rho, opt in line_instance.iter_trip_options_for_passenger(p):
             irho = int(rho)
             pid_fm = key_to_pid[(p, irho, "first_mile")]
             pid_lm = key_to_pid[(p, irho, "last_mile")]
@@ -1824,9 +1825,11 @@ def _apply_cluster_factors_to_all_mod_costs(
             cl = float(factor_per_cluster.get(pool_id_to_cluster[pid_lm], 1.0))
             if cf == 1.0 and cl == 1.0:
                 continue
-            line_instance.optimal_trip_options[p][rho] = opt._replace(
-                first_mile_cost=float(opt.first_mile_cost) * cf,
-                last_mile_cost=float(opt.last_mile_cost) * cl,
+            line_instance.set_trip_mod_cost_on_line(
+                p,
+                rho,
+                float(opt.first_mile_cost) * cf,
+                float(opt.last_mile_cost) * cl,
             )
 
 
@@ -1994,16 +1997,11 @@ def apply_mod_cost_rows_to_instance(
                 mt_cost=mc,
             )
         else:
-            if p < 0 or p >= len(line_inst.optimal_trip_options):
+            if p < 0 or p >= int(line_inst.nb_pass):
                 continue
-            if rho not in line_inst.optimal_trip_options[p]:
+            if not line_inst.has_trip_option_on_line(p, rho):
                 continue
-            t = line_inst.optimal_trip_options[p][rho]
-            line_inst.optimal_trip_options[p][rho] = t._replace(
-                first_mile_cost=fm,
-                last_mile_cost=lm,
-                mt_cost=mc,
-            )
+            line_inst.set_trip_costs_on_line(p, rho, fm, lm, mc)
 
 
 def export_mod_costs_csv(
@@ -2031,12 +2029,14 @@ def export_mod_costs_csv(
                 "mt_cost": opt.mt_cost,
             }
         )
-    for p in range(line_inst.nb_pass):
-        for rho in sorted(line_inst.optimal_trip_options[p].keys()):
-            opt = line_inst.optimal_trip_options[p][rho]
+    for row in line_inst.optimal_trip_options.itertuples(index=False):
+        rho = int(row.line_idx)
+        opt = line_inst.trip_option_on_line(int(row.passenger_idx), rho)
+        if opt is None:
+            continue
             rows.append(
                 {
-                    "passenger_idx": p,
+                    "passenger_idx": int(row.passenger_idx),
                     "line_idx": rho,
                     "first_mile_cost": opt.first_mile_cost,
                     "last_mile_cost": opt.last_mile_cost,
@@ -2131,7 +2131,7 @@ def main() -> None:
         expected_pool = 0
         for r in range(line_inst.nb_pass):
             expected_pool += 1
-            for rho in line_inst.optimal_trip_options[r]:
+            for rho in line_inst.trip_option_lines_for_passenger(r):
                 if line_inst.trip_option_on_line(r, rho) is not None:
                     expected_pool += 2
         if len(pool_rows) != expected_pool:

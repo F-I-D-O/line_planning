@@ -213,12 +213,12 @@ class LinePlanningSolver:
                 self.line_instance.direct_trip_options[original_request_id] = new_option
             else:
                 route_index = line_idx
-                old_option = self.line_instance.optimal_trip_options[original_request_id][route_index]
-                new_option = old_option._replace(
-                    first_mile_cost=first_mile_cost,
-                    last_mile_cost=last_mile_cost,
+                self.line_instance.set_trip_mod_cost_on_line(
+                    original_request_id,
+                    route_index,
+                    first_mile_cost,
+                    last_mile_cost,
                 )
-                self.line_instance.optimal_trip_options[original_request_id][route_index] = new_option
 
         logging.info("Updated MoD costs for %d requests", len(new_costs))
 
@@ -470,8 +470,8 @@ class LinePlanningSolver:
         # generate initial sets with one passenger covered per line (if no passenger covered, add empty set)
         for l in range(len(lines_to_sets)):
             route = l // self.max_frequency
-            if len(self.line_instance.set_of_lines[route][1]) != 0:
-                p = self.line_instance.set_of_lines[route][1][0][0]
+            p = self.line_instance.first_passenger_on_line(route)
+            if p is not None:
                 sets.append([p])
                 lines_to_sets[l].append(l)
                 passengers_to_sets[p][l].append(l)
@@ -481,7 +481,7 @@ class LinePlanningSolver:
 
         lines_to_passengers = []
         for l in range(len(lines_to_sets)):
-            lines_to_passengers.append(self.line_instance.lines_to_passengers[l//self.max_frequency])
+            lines_to_passengers.append(self.line_instance.line_passengers(l // self.max_frequency))
 
         covered_average = 0
         iter = 0
@@ -582,7 +582,8 @@ class LinePlanningSolver:
                 if nb_new_lines <= max_nb_new_lines:
                     t_temp = time.time()
                     f_l = l%self.max_frequency + 1
-                    length = self.line_instance.set_of_lines[l//self.max_frequency][0]
+                    route = l // self.max_frequency
+                    length = self.line_instance.line_length(route)
 
                     single_line = Model("SLP") #single line sub-problem
                     single_line.ModelSense = -1 #maximize
@@ -599,7 +600,7 @@ class LinePlanningSolver:
 
                     for k in range(length):
                         coef = []
-                        edge_ps = set(self.line_instance.edge_to_passengers[l // self.max_frequency][k])
+                        edge_ps = set(self.line_instance.edge_passengers(route, k))
                         for p in lines_to_passengers[l]:
                             coef.append(1 if p in edge_ps else 0)
                         single_line.addConstr(LinExpr(coef,var) <= capacity * f_l, name="one_set_per_line[%d]"%l)
@@ -730,11 +731,12 @@ class LinePlanningSolver:
         capacity_constraints = {}
         for l in range(self.line_count_total):
             f_l = l%self.max_frequency + 1
-            length = self.line_instance.set_of_lines[l//self.max_frequency][0]
+            route = l // self.max_frequency
+            length = self.line_instance.line_length(route)
             for k in range(length):
                 var = []
                 coef = []
-                for p in self.line_instance.edge_to_passengers[l//self.max_frequency][k]:
+                for p in self.line_instance.edge_passengers(route, k):
                     var.append(x[l,p])
                     coef.append(1)
                 capacity_constraints[l,k] = master.addConstr(LinExpr(coef,var) <= bus_capacity * f_l * y[l], name="capacity_constraints[%d][%d]"%(l,k))
@@ -836,12 +838,8 @@ class LinePlanningSolver:
         line_costs_expression = frequency_vars.prod(per_route_mt_cost_coeff)
 
         # Binary assignment x_{ρp}; omit pairs with zero trip value on the route.
-        potential_line_passenger_combinations = [
-            (rho, p)
-            for rho in tqdm(range(nb_lines), desc="Computing potential line-passenger combinations")
-            for p in range(request_count)
-            if self.line_instance.trip_value_on_line(p, rho) > 0
-        ]
+        logging.info("Computing potential line-passenger combinations")
+        potential_line_passenger_combinations = self.line_instance.positive_trip_value_pairs()
         passenger_vars = master.addVars(
             potential_line_passenger_combinations,
             vtype=GRB.BINARY,
@@ -863,11 +861,11 @@ class LinePlanningSolver:
 
         # Bus capacity: load on edge ≤ C_MT · y_ρ
         for rho in range(nb_lines):
-            length = self.line_instance.set_of_lines[rho][0]
+            length = self.line_instance.line_length(rho)
             for k in range(length):
                 vars_list = []
                 coefs_list = []
-                for p in self.line_instance.edge_to_passengers[rho][k]:
+                for p in self.line_instance.edge_passengers(rho, k):
                     if (rho, p) in passenger_vars:
                         vars_list.append(passenger_vars[rho, p])
                         coefs_list.append(1)
@@ -880,8 +878,7 @@ class LinePlanningSolver:
         # Budget constraint
         mod_costs: Dict[Any, float] = {}
         for rho, p in potential_line_passenger_combinations:
-            opt = self.line_instance.optimal_trip_options[p][rho]
-            mod_costs[rho, p] = float(opt.first_mile_cost + opt.last_mile_cost)
+            mod_costs[rho, p] = self.line_instance.trip_mod_cost_on_line(p, rho)
         for p in range(request_count):
             mod_costs[no_mt_key, p] = float(self._direct_trip_mod_cost(p))
         mod_cost_expression = passenger_vars.prod(mod_costs)
@@ -1008,8 +1005,7 @@ class LinePlanningSolver:
         request_count: int = state["request_count"]
         mod_costs_for_obj: Dict[Any, float] = {}
         for rho, p in state["potential_line_passenger_combinations"]:
-            opt = self.line_instance.optimal_trip_options[p][rho]
-            mod_costs_for_obj[(rho, p)] = float(opt.first_mile_cost + opt.last_mile_cost)
+            mod_costs_for_obj[(rho, p)] = self.line_instance.trip_mod_cost_on_line(p, rho)
         for p in range(request_count):
             mod_costs_for_obj[no_mt_key, p] = float(self._direct_trip_mod_cost(p))
         mod_cost_expression = passenger_vars.prod(mod_costs_for_obj)
@@ -1056,19 +1052,11 @@ class LinePlanningSolver:
             name="y",
         )
 
-        potential_line_passenger_combinations = [
-            (rho, p)
-            for rho in range(nb_lines)
-            for p in range(request_count)
-            if self.line_instance.trip_value_on_line(p, rho) > 0
-        ]
+        potential_line_passenger_combinations = self.line_instance.positive_trip_value_pairs()
 
         logging.info("Computing total mod costs for each trip option")
         mod_costs_line = {
-            (rho, p): (
-                self.line_instance.optimal_trip_options[p][rho].first_mile_cost
-                + self.line_instance.optimal_trip_options[p][rho].last_mile_cost
-            )
+            (rho, p): self.line_instance.trip_mod_cost_on_line(p, rho)
             for (rho, p) in tqdm(potential_line_passenger_combinations, desc="Computing trip option mod costs")
         }
         passenger_vars = master.addVars(
@@ -1114,11 +1102,11 @@ class LinePlanningSolver:
             )
 
         for rho in range(nb_lines):
-            length = self.line_instance.set_of_lines[rho][0]
+            length = self.line_instance.line_length(rho)
             for k in range(length):
                 vars_list = []
                 coefs_list = []
-                for p in self.line_instance.edge_to_passengers[rho][k]:
+                for p in self.line_instance.edge_passengers(rho, k):
                     if (rho, p) in passenger_vars:
                         vars_list.append(passenger_vars[rho, p])
                         coefs_list.append(1)
@@ -1286,8 +1274,7 @@ class LinePlanningSolver:
             line_obj_val = float(line_costs_expression.getValue())
             mod_costs_post: Dict[Any, float] = {}
             for rho, p in state["potential_line_passenger_combinations"]:
-                opt = self.line_instance.optimal_trip_options[p][rho]
-                mod_costs_post[(rho, p)] = float(opt.first_mile_cost + opt.last_mile_cost)
+                mod_costs_post[(rho, p)] = self.line_instance.trip_mod_cost_on_line(p, rho)
             for p in range(request_count):
                 mod_costs_post[no_mt_key, p] = float(self._direct_trip_mod_cost(p))
             mod_obj_val = float(
@@ -1389,9 +1376,11 @@ class LinePlanningSolver:
 
         # binary variables indicating if passenger p is assigned to line l. If first mile + last mile costs are
         # higher than the no_MT MoD cost, the line-passenger combination is not considered at all
+        route_passenger_pairs = self.line_instance.positive_trip_value_pairs()
         potential_line_passenger_combinations = [
-            (l, p) for l in range(self.line_count_total) for p in range(request_count)
-            if self.line_instance.trip_value_on_line(p, l // self.max_frequency) > 0
+            (rho * self.max_frequency + f, p)
+            for rho, p in route_passenger_pairs
+            for f in range(self.max_frequency)
         ]
         passenger_vars = master.addVars(potential_line_passenger_combinations, vtype=GRB.BINARY, obj=1, name="x")
         # add no MT variables for each passenger
@@ -1459,11 +1448,12 @@ class LinePlanningSolver:
         capacity_constraints = {}
         for l in range(self.line_count_total):
             f_l = l%self.max_frequency + 1
-            length = self.line_instance.set_of_lines[l//self.max_frequency][0]
+            route = l // self.max_frequency
+            length = self.line_instance.line_length(route)
             for k in range(length):
                 vars = []
                 coefs = []
-                for p in self.line_instance.edge_to_passengers[l//self.max_frequency][k]:
+                for p in self.line_instance.edge_passengers(route, k):
                     vars.append(passenger_vars[l,p])
                     coefs.append(1)
                 capacity_constraints[l,k] = master.addConstr(LinExpr(coefs,vars) <= bus_capacity * f_l * line_vars[l], name="capacity_constraints[%d][%d]"%(l,k))

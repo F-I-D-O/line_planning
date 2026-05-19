@@ -254,7 +254,7 @@ def _compute_metrics_row(
     for p in range(inst.nb_pass):
         direct = float(inst.direct_trip_options[p].first_mile_cost)
 
-        valid = [o for o in inst.optimal_trip_options[p].values() if _is_valid_mt_option(o)]
+        valid = [o for _, o in inst.iter_trip_options_for_passenger(p) if _is_valid_mt_option(o)]
         if not valid:
             n_no_valid_mt += 1
             continue
@@ -328,7 +328,7 @@ def _histogram_percent_diffs(inst: line_instance) -> list[float]:
     percent_diffs: list[float] = []
     for p in range(inst.nb_pass):
         direct = float(inst.direct_trip_options[p].first_mile_cost)
-        valid = [o for o in inst.optimal_trip_options[p].values() if _is_valid_mt_option(o)]
+        valid = [o for _, o in inst.iter_trip_options_for_passenger(p) if _is_valid_mt_option(o)]
         if not valid:
             continue
         best_mt = min(_mod_cost(o) for o in valid)
