@@ -413,6 +413,10 @@ class line_instance:
     def has_trip_option_on_line(self, passenger_idx: int, line_idx: int) -> bool:
         return self._trip_option_row_position(passenger_idx, line_idx) is not None
 
+    def trip_option_position(self, passenger_idx: int, line_idx: int) -> Optional[int]:
+        """Zero-based row position of the feasible trip option in ``optimal_trip_options``."""
+        return self._trip_option_row_position(passenger_idx, line_idx)
+
     def trip_option_on_line(self, passenger_idx: int, line_idx: int) -> Optional[TripOption]:
         """Feasible mass-transit option for (passenger, candidate line), or None if infeasible."""
         pos = self._trip_option_row_position(passenger_idx, line_idx)
@@ -633,6 +637,7 @@ class line_instance:
         nb_lines: int,
     ):
         if cache_path.exists():
+            logging.info("Loading preprocessing cache from %s", cache_path)
             try:
                 df = pd.read_csv(cache_path, dtype=self._PREPROCESSING_CSV_DTYPES)
             except (OSError, ValueError) as exc:
