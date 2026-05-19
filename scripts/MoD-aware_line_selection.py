@@ -529,6 +529,10 @@ def load_node_latlng_from_map_nodes_csv(area_root: Path) -> Dict[int, Tuple[floa
     return out
 
 
+def _h3_cell_uint(lat: float, lng: float, resolution: int) -> np.uint64:
+    return np.uint64(h3.str_to_int(h3.latlng_to_cell(float(lat), float(lng), int(resolution))))
+
+
 def fit_hex_od_pool_cluster_labels(
     pool_df: pd.DataFrame,
     node_id_to_latlng: Dict[int, Tuple[float, float]],
@@ -543,35 +547,38 @@ def fit_hex_od_pool_cluster_labels(
     if n_samples == 0:
         return np.zeros(0, dtype=int)
     res = int(hex_resolution)
-    keys: List[Tuple[str, str]] = []
-    hexagonal_clusters_used = set()
-    pool_ids = pool_df["pool_id"].to_numpy(copy=False)
-    origins = pool_df["origin"].to_numpy(copy=False)
-    destinations = pool_df["destination"].to_numpy(copy=False)
-    for pool_id, origin, destination in tqdm(
-        zip(pool_ids, origins, destinations),
-        total=n_samples,
-        desc="Fitting DARP request pool to hexagonal clusters",
-    ):
-        for nid, role in ((int(origin), "origin"), (int(destination), "destination")):
-            if nid not in node_id_to_latlng:
-                raise ValueError(
-                    f"Node id {nid} ({role} of pool_id={int(pool_id)}) missing from "
-                    f"map/nodes.csv for this area"
-                )
-        lat_o, lng_o = node_id_to_latlng[int(origin)]
-        lat_d, lng_d = node_id_to_latlng[int(destination)]
-        h_o = h3.latlng_to_cell(lat_o, lng_o, res)
-        h_d = h3.latlng_to_cell(lat_d, lng_d, res)
-        keys.append((h_o, h_d))
-        hexagonal_clusters_used.add(h_o)
-        hexagonal_clusters_used.add(h_d)
+    origins = pool_df["origin"].to_numpy(dtype=np.int64, copy=False)
+    destinations = pool_df["destination"].to_numpy(dtype=np.int64, copy=False)
+    unique_nodes, encoded_nodes = np.unique(
+        np.concatenate([origins, destinations]),
+        return_inverse=True,
+    )
+    missing_nodes = [int(nid) for nid in unique_nodes if int(nid) not in node_id_to_latlng]
+    if missing_nodes:
+        sample = missing_nodes[:10]
+        suffix = "" if len(missing_nodes) <= len(sample) else f" (and {len(missing_nodes) - len(sample)} more)"
+        raise ValueError(
+            f"Node ids missing from map/nodes.csv for hex OD clustering: {sample}{suffix}"
+        )
 
-    logging.info(f"Hexagonal clusters used: {len(hexagonal_clusters_used)}")
-    sorted_unique = sorted(set(keys))
-    key_to_label = {k: i for i, k in enumerate(sorted_unique)}
-    labels = np.array([key_to_label[k] for k in keys], dtype=int)
-    return labels
+    node_h3 = np.empty(len(unique_nodes), dtype=np.uint64)
+    for i, node_id in enumerate(
+        tqdm(unique_nodes, desc="Computing H3 cell for pool nodes")
+    ):
+        lat, lng = node_id_to_latlng[int(node_id)]
+        node_h3[i] = _h3_cell_uint(lat, lng, res)
+
+    origin_h3 = node_h3[encoded_nodes[:n_samples]]
+    destination_h3 = node_h3[encoded_nodes[n_samples:]]
+    pairs = np.empty(n_samples, dtype=[("origin_h3", np.uint64), ("destination_h3", np.uint64)])
+    pairs["origin_h3"] = origin_h3
+    pairs["destination_h3"] = destination_h3
+    unique_pairs, inverse = np.unique(pairs, return_inverse=True)
+
+    hexagonal_clusters_used = len(np.unique(np.concatenate([origin_h3, destination_h3])))
+    logging.info("Hexagonal clusters used: %s", hexagonal_clusters_used)
+    logging.info("Hexagonal OD clusters used: %s", len(unique_pairs))
+    return inverse.astype(np.int32, copy=False)
 
 
 def select_darp_requests_from_pool(

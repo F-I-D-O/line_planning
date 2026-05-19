@@ -74,6 +74,32 @@ def main() -> None:
     assert len(reqs2) == 1
     assert exp2[0] == 0
 
+    node_id_to_latlng = {
+        10: (40.0, -73.0),
+        20: (40.0, -73.0),
+        30: (40.01, -73.01),
+        40: (40.02, -73.02),
+    }
+    labels = mod.fit_hex_od_pool_cluster_labels(pool_df, node_id_to_latlng, 8)
+    labels_again = mod.fit_hex_od_pool_cluster_labels(pool_df, node_id_to_latlng, 8)
+    assert labels.dtype == "int32"
+    assert labels.tolist() == labels_again.tolist()
+
+    duplicate_pool_df = mod._normalize_pool_df(
+        pd.concat([pool_df, pool_df.iloc[[1]].assign(pool_id=3)], ignore_index=True)
+    )
+    duplicate_labels = mod.fit_hex_od_pool_cluster_labels(duplicate_pool_df, node_id_to_latlng, 8)
+    assert duplicate_labels[1] == duplicate_labels[3]
+    assert len(set(int(x) for x in duplicate_labels)) >= 2
+
+    missing_pool_df = mod._normalize_pool_df(pool_df.assign(origin=[999, 10, 40]))
+    try:
+        mod.fit_hex_od_pool_cluster_labels(missing_pool_df, node_id_to_latlng, 8)
+    except ValueError as exc:
+        assert "999" in str(exc)
+    else:
+        raise AssertionError("missing node id should raise ValueError")
+
     with tempfile.TemporaryDirectory() as tmp:
         p = Path(tmp) / "darp_pool_export_map.json"
         mod.write_darp_pool_export_map(p, exp_map)
