@@ -339,7 +339,7 @@ def _pool_rows_feature_matrix(
 
 def build_darp_request_pool(
     line_instance: "lineplanning.instance.line_instance",
-    transfer_delay: Union[int, float] = 0,
+    transfer_delay: int = 0,
 ) -> pd.DataFrame:
     """
     Full pool of DARP legs for every passenger direct trip and every feasible line option.
@@ -407,26 +407,20 @@ def build_darp_request_pool(
         origin[last] = drop_off_nodes
         destination[last] = request_destinations
 
-        if dm is not None:
-            first_mile_time = np.asarray(dm[request_origins, pickup_nodes], dtype=np.float32)
-        else:
-            first_mile_time = np.zeros(n_options, dtype=np.float32)
-        if lengths_travel_times is not None:
-            route_lengths = np.asarray(
-                [line_instance.line_length(rho) for rho in range(line_instance.nb_lines)],
-                dtype=np.float32,
-            )
-            route_total_times = np.asarray(lengths_travel_times, dtype=np.float32)
-            line_lengths = route_lengths[opt_routes]
-            segment_edges = np.maximum(0.0, drop_off_edges - pickup_edges)
-            segment_time = np.divide(
-                route_total_times[opt_routes] * segment_edges,
-                line_lengths,
-                out=np.zeros(n_options, dtype=np.float32),
-                where=line_lengths > 0,
-            )
-        else:
-            segment_time = np.zeros(n_options, dtype=np.float32)
+        first_mile_time = np.asarray(dm[request_origins, pickup_nodes], dtype=np.float32)
+        route_lengths = np.asarray(
+            [line_instance.line_length(rho) for rho in range(line_instance.nb_lines)],
+            dtype=np.float32,
+        )
+        route_total_times = np.asarray(lengths_travel_times, dtype=np.float32)
+        line_lengths = route_lengths[opt_routes]
+        segment_edges = np.maximum(0.0, drop_off_edges - pickup_edges)
+        segment_time = np.divide(
+            route_total_times[opt_routes] * segment_edges,
+            line_lengths,
+            out=np.zeros(n_options, dtype=np.float32),
+            where=line_lengths > 0,
+        )
         time_values[last] = option_times + first_mile_time + transfer_delay + segment_time
 
     return pd.DataFrame(
@@ -692,7 +686,7 @@ def _sanity_check_pool_export_matches_solution_to_darp(
     request_assignments: List[Tuple[str, Optional[int]]],
     pool_export_requests: List[dict],
     *,
-    transfer_delay: float,
+    transfer_delay: int,
 ) -> None:
     legacy = solution_to_darp_requests(
         line_instance,
@@ -829,7 +823,7 @@ class ModAwareLineSelectionConfig:
     maximum_detour: Any
     line_mod_aggregate_prune: bool
     darp_benchmark_executable: Path
-    transfer_delay: float
+    transfer_delay: int
     darp_vehicle_capacity: int
     max_travel_time_delay_seconds: int
     mod_cost_recomputation_strategy: str
@@ -955,7 +949,13 @@ def build_mod_aware_line_selection_config(
         else:
             darp_benchmark_executable = darp_benchmark_executable.resolve()
 
-    transfer_delay = float(darp.get("transfer_delay", 0))
+    transfer_delay_raw = darp.get("transfer_delay", 0)
+    if isinstance(transfer_delay_raw, bool) or not isinstance(transfer_delay_raw, int):
+        raise ValueError(
+            f"{experiment_yaml_path}: darp.transfer_delay must be an integer, "
+            f"got {transfer_delay_raw!r}."
+        )
+    transfer_delay = transfer_delay_raw
 
     darp_vehicle_capacity, max_travel_time_delay_seconds = _parse_darp_vehicles_and_max_delay(
         raw,
@@ -1122,7 +1122,7 @@ def _load_demand_and_dm_from_instance_config(instance_dir_path: Path) -> Tuple[P
 def solution_to_darp_requests(
     line_instance: "lineplanning.instance.line_instance",
     request_assignments: List[Tuple[str, Optional[int]]],
-    transfer_delay: Union[int, float] = 0,
+    transfer_delay: int = 0,
 ) -> List[dict]:
     """
     Build the set of MoD requests R_MoD for the conventional model (section 4.2.1).
@@ -1193,7 +1193,7 @@ def solution_to_darp_requests(
         request_id += 1
 
         # t_board ≈ t_r + ftt(o_r, s^b) + δ_transfer (equation 10; using dm as travel time)
-        first_mile_time = float(dm[o_r][sb]) if dm is not None and sb >= 0 else 0.0
+        first_mile_time = float(dm[o_r][sb])
         t_board = t_r + first_mile_time + transfer_delay
 
         # Segment travel time on line (boarding to unboarding)
@@ -1663,7 +1663,7 @@ def _avg_cost_per_traveltime_across_requests(
     n = 0
     for original_id, (c1, c2) in costs.items():
         o, d = reqs[original_id][0], reqs[original_id][1]
-        tt = float(dm[o][d]) if dm is not None else 0.0
+        tt = float(dm[o][d])
         if tt <= 0.0:
             continue
         total_cost = float(c1) + float(c2)
