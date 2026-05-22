@@ -178,8 +178,7 @@ class LinePlanningSolver:
         This is what the MoD-aware ILP and exports should use so DARP recomputation can
         change direct costs without rewriting ``dm``.
         """
-        opt = self.line_instance.direct_trip_options[passenger_idx]
-        return float(opt.first_mile_cost) + float(opt.last_mile_cost)
+        return self.line_instance.direct_trip_mod_cost(passenger_idx)
 
     def update_mod_costs(
         self,
@@ -205,12 +204,11 @@ class LinePlanningSolver:
                 continue
 
             if kind == "no_MT" or line_idx is None:
-                old_option = self.line_instance.direct_trip_options[original_request_id]
-                new_option = old_option._replace(
-                    first_mile_cost=first_mile_cost,
-                    last_mile_cost=last_mile_cost,
+                self.line_instance.set_direct_trip_costs(
+                    original_request_id,
+                    first_mile_cost,
+                    last_mile_cost,
                 )
-                self.line_instance.direct_trip_options[original_request_id] = new_option
             else:
                 route_index = line_idx
                 self.line_instance.set_trip_mod_cost_on_line(
@@ -255,8 +253,7 @@ class LinePlanningSolver:
                         else line_idx // self.max_frequency
                     )
                     line_repr = route_index
-                    trip_option = self.line_instance.trip_option_on_line(passenger_idx, route_index)
-                    mod_cost = trip_option.first_mile_cost + trip_option.last_mile_cost
+                    mod_cost = self.line_instance.trip_mod_cost_on_line(passenger_idx, route_index)
                 rows.append(
                     {
                         "passenger": passenger_idx,
@@ -368,11 +365,12 @@ class LinePlanningSolver:
                 if pd.isna(route_index):
                     continue
                 route_index = int(route_index)
-                trip_option = self.line_instance.trip_option_on_line(passenger_idx, route_index)
-                if trip_option is None:
+                if not self.line_instance.has_trip_option_on_line(passenger_idx, route_index):
                     continue
-                pickup = trip_option.mt_pickup_node
-                drop_off = trip_option.mt_drop_off_node
+                pickup, drop_off = self.line_instance.trip_pickup_dropoff_on_line(
+                    passenger_idx,
+                    route_index,
+                )
                 required_flow[(origin, pickup)] += 1
                 required_flow[(drop_off, destination)] += 1
                 used_nodes.update([pickup, drop_off])
@@ -1404,10 +1402,10 @@ class LinePlanningSolver:
             used_nodes.add(request_to)
             for l in range(self.line_count_total):
                 if (l, p) in passenger_vars:
-                    optimal_trip_option = self.line_instance.trip_option_on_line(p, l // self.max_frequency)
-                    assert optimal_trip_option is not None
-                    mt_pickup_node = optimal_trip_option.mt_pickup_node
-                    mt_drop_off_node = optimal_trip_option.mt_drop_off_node
+                    mt_pickup_node, mt_drop_off_node = self.line_instance.trip_pickup_dropoff_on_line(
+                        p,
+                        l // self.max_frequency,
+                    )
                     used_nodes.add(mt_pickup_node)
                     used_nodes.add(mt_drop_off_node)
 

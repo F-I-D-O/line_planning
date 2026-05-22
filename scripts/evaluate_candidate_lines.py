@@ -23,7 +23,7 @@ and histogram under a single run folder.
 **Metrics "best" MT option:** minimizes ``first_mile + last_mile`` (ignores ``mt_cost``).
 
 **Histogram:** same criterion — best MT by minimum ``first_mile + last_mile`` vs direct OD time
-in ``direct_trip_options[p].first_mile_cost``.
+in ``direct_trip_row(p)["first_mile_cost"]``.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ from lineplanning.candidate_lines import (
     DEFAULT_MIN_START_END_DISTANCE,
     generate_candidate_lines,
 )
-from lineplanning.instance import TripOption, line_instance, preprocessing_csv_path
+from lineplanning.instance import line_instance, preprocessing_csv_path
 
 _EVAL_COMPLETE = ".line_eval_complete"
 
@@ -225,16 +225,19 @@ def _evaluation_complete(
     return cache_csv.is_file()
 
 
-def _is_valid_mt_option(opt: TripOption) -> bool:
-    return opt.mt_pickup_node != -1
+def _valid_mt_options_df(inst: line_instance, passenger_idx: int):
+    options = inst.trip_options_for_passenger(passenger_idx)
+    if options.empty:
+        return options
+    return options.loc[options["mt_pickup_node"] != -1]
 
 
-def _mod_cost(opt: TripOption) -> float:
-    return float(opt.first_mile_cost + opt.last_mile_cost)
+def _mod_cost(row) -> float:
+    return float(row["first_mile_cost"] + row["last_mile_cost"])
 
 
-def _total_time(opt: TripOption) -> float:
-    return float(opt.first_mile_cost + opt.last_mile_cost + opt.mt_cost)
+def _total_time(row) -> float:
+    return float(row["first_mile_cost"] + row["last_mile_cost"] + row["mt_cost"])
 
 
 def _compute_metrics_row(
@@ -252,14 +255,15 @@ def _compute_metrics_row(
     mean_direct_vals: list[float] = []
 
     for p in range(inst.nb_pass):
-        direct = float(inst.direct_trip_options[p].first_mile_cost)
+        direct = float(inst.direct_trip_row(p)["first_mile_cost"])
 
-        valid = [o for _, o in inst.iter_trip_options_for_passenger(p) if _is_valid_mt_option(o)]
-        if not valid:
+        valid = _valid_mt_options_df(inst, p)
+        if valid.empty:
             n_no_valid_mt += 1
             continue
 
-        best_mt = min(valid, key=_mod_cost)
+        best_idx = (valid["first_mile_cost"] + valid["last_mile_cost"]).idxmin()
+        best_mt = valid.loc[best_idx]
         mod_b = _mod_cost(best_mt)
         tot_b = _total_time(best_mt)
         mod_costs_best.append(mod_b)
@@ -270,9 +274,8 @@ def _compute_metrics_row(
         if mod_b > direct:
             n_mod_worse += 1
 
-        by_mod = sorted(valid, key=_mod_cost)
-        top = by_mod[:10]
-        avg_mod = float(np.mean([_mod_cost(o) for o in top]))
+        mod_costs = valid["first_mile_cost"] + valid["last_mile_cost"]
+        avg_mod = float(mod_costs.nsmallest(10).mean())
         rel_diffs_top10.append((avg_mod - direct) / direct)
 
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -327,11 +330,11 @@ def _histogram_percent_diffs(inst: line_instance) -> list[float]:
     """Same selection as plot_mt_vs_direct_cost_histogram.py (min FM+LM among valid MT)."""
     percent_diffs: list[float] = []
     for p in range(inst.nb_pass):
-        direct = float(inst.direct_trip_options[p].first_mile_cost)
-        valid = [o for _, o in inst.iter_trip_options_for_passenger(p) if _is_valid_mt_option(o)]
-        if not valid:
+        direct = float(inst.direct_trip_row(p)["first_mile_cost"])
+        valid = _valid_mt_options_df(inst, p)
+        if valid.empty:
             continue
-        best_mt = min(_mod_cost(o) for o in valid)
+        best_mt = float((valid["first_mile_cost"] + valid["last_mile_cost"]).min())
         percent_diffs.append((best_mt - direct) / direct * 100.0)
     return percent_diffs
 

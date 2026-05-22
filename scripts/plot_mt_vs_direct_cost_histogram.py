@@ -4,7 +4,7 @@ Loads a ``line_instance`` (``lineplanning.instance``), which reads preprocessing
 from ``<instance_dir>/preprocessing/*.csv`` when the cache exists (same as a normal
 solve). For each request, compares total travel time of the **best** mass-transit
 option (min over candidate lines of first-mile + on-line + last-mile) to the
-**non-MT** option (direct O--D time on ``direct_trip_options[p]``).
+**non-MT** option (direct O--D time on ``direct_trip_row(p)``).
 
 Histogram: x = percent cost difference ``(best_MT - direct) / direct * 100`` (negative
 means MT is faster), y = number of requests; bins are 10 percentage points wide.
@@ -106,31 +106,27 @@ line_inst = lineplanning.instance.line_instance(
 # %% Compute percent differences (best MT vs direct)
 
 
-def _mt_total_time(opt: lineplanning.instance.TripOption) -> float:
-    return float(opt.first_mile_cost + opt.last_mile_cost + opt.mt_cost)
-
-
-def _is_valid_mt_option(opt: lineplanning.instance.TripOption) -> bool:
-    return opt.mt_pickup_node != -1
-
-
 percent_diffs: list[float] = []
 skipped_no_direct = 0
 skipped_no_mt = 0
 
 for p in range(line_inst.nb_pass):
-    direct = float(line_inst.direct_trip_options[p].first_mile_cost)
+    direct = float(line_inst.direct_trip_row(p)["first_mile_cost"])
     if direct <= 0:
         skipped_no_direct += 1
         continue
 
-    valid = [o for _, o in line_inst.iter_trip_options_for_passenger(p) if _is_valid_mt_option(o)]
-    if not valid:
+    valid = line_inst.trip_options_for_passenger(p)
+    if valid.empty:
+        skipped_no_mt += 1
+        continue
+    valid = valid.loc[valid["mt_pickup_node"] != -1]
+    if valid.empty:
         skipped_no_mt += 1
         continue
 
     # best_mt = min(_mt_total_time(o) for o in valid)
-    best_mt = min(opt.first_mile_cost + opt.last_mile_cost for opt in valid)
+    best_mt = float((valid["first_mile_cost"] + valid["last_mile_cost"]).min())
     pct = (best_mt - direct) / direct * 100.0
     percent_diffs.append(pct)
 

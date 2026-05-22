@@ -673,16 +673,16 @@ def _old_mod_leg_cost_on_instance(
     p = int(row.passenger_idx)
     leg_kind = int(row.leg_kind)
     if leg_kind == DARP_POOL_LEG_NO_MT:
-        opt = line_instance.direct_trip_options[p]
-        return float(opt.first_mile_cost) + float(opt.last_mile_cost)
+        return line_instance.direct_trip_mod_cost(p)
     route_idx = int(row.route_idx)
-    opt = line_instance.trip_option_on_line(p, route_idx)
-    if opt is None:
+    if not line_instance.has_trip_option_on_line(p, route_idx):
         raise KeyError(f"No trip option for passenger_idx={p}, line_idx={route_idx}")
     if leg_kind == DARP_POOL_LEG_FIRST_MILE:
-        return float(opt.first_mile_cost)
+        first_mile_cost, _, _ = line_instance.trip_costs_on_line(p, route_idx)
+        return first_mile_cost
     if leg_kind == DARP_POOL_LEG_LAST_MILE:
-        return float(opt.last_mile_cost)
+        _, last_mile_cost, _ = line_instance.trip_costs_on_line(p, route_idx)
+        return last_mile_cost
     raise AssertionError(f"unexpected leg_kind {leg_kind!r}")
 
 
@@ -1175,11 +1175,9 @@ def solution_to_darp_requests(
 
         # Assigned to route ρ (candidate line index); MoD-aware ILP uses route-aggregated variables (§4.1.1)
         route = line_idx
-        opt = line_instance.trip_option_on_line(r, route)
-        if opt is None:
+        if not line_instance.has_trip_option_on_line(r, route):
             raise ValueError(f"Request {r} has no feasible trip data for route {route}")
-        sb = opt.mt_pickup_node
-        su = opt.mt_drop_off_node
+        sb, su = line_instance.trip_pickup_dropoff_on_line(r, route)
 
         # First-mile request: (o_r, s^b_ℓr, t_r)
         darp_requests.append({
@@ -1198,7 +1196,8 @@ def solution_to_darp_requests(
         # Segment travel time on line (boarding to unboarding)
         line_length = line_instance.line_length(route)
         if line_length > 0 and lengths_travel_times is not None:
-            segment_edges = max(0, opt.mt_drop_off_line_edge_index - opt.mt_pickup_line_edge_index)
+            pickup_edge, drop_off_edge = line_instance.trip_line_edge_indices(r, route)
+            segment_edges = max(0, drop_off_edge - pickup_edge)
             segment_time = lengths_travel_times[route] * (segment_edges / line_length)
         else:
             segment_time = 0.0
@@ -1632,12 +1631,12 @@ def _get_current_costs_for_assignments(
         if kind == "rejected":
             continue
         if kind == "no_MT" or line_idx is None:
-            opt = line_instance.direct_trip_options[original_id]
+            fm, lm, _ = line_instance.direct_trip_costs(original_id)
         else:
-            opt = line_instance.trip_option_on_line(original_id, int(line_idx))
-            if opt is None:
+            if not line_instance.has_trip_option_on_line(original_id, int(line_idx)):
                 raise KeyError(f"No trip option for passenger_idx={original_id}, line_idx={int(line_idx)}")
-        costs[original_id] = (float(opt.first_mile_cost), float(opt.last_mile_cost))
+            fm, lm, _ = line_instance.trip_costs_on_line(original_id, int(line_idx))
+        costs[original_id] = (float(fm), float(lm))
     return costs
 
 
@@ -1692,10 +1691,12 @@ def _scale_all_mod_costs_in_model(
     logging.info("Scaling MoD costs in the model by %s", factor)
 
     # Scale direct trips (no_MT) for every request
-    for p, opt in enumerate(line_instance.direct_trip_options):
-        line_instance.direct_trip_options[p] = opt._replace(
-            first_mile_cost=float(opt.first_mile_cost) * factor,
-            last_mile_cost=float(opt.last_mile_cost) * factor,
+    if not line_instance.direct_trip_options.empty:
+        line_instance.direct_trip_options["first_mile_cost"] = (
+            line_instance.direct_trip_options["first_mile_cost"].astype(float) * factor
+        )
+        line_instance.direct_trip_options["last_mile_cost"] = (
+            line_instance.direct_trip_options["last_mile_cost"].astype(float) * factor
         )
 
     # Scale all line-based options for every request / route
@@ -1874,31 +1875,50 @@ def _apply_cluster_factors_to_all_mod_costs(
     """Multiply stored MoD leg costs by per-cluster factors (FM/LM may differ for line options)."""
     n_options = _pool_option_count(pool_df, int(line_instance.nb_pass))
 
-    for p in range(line_instance.nb_pass):
-        c = int(pool_cluster_labels[p])
-        f = float(factor_per_cluster.get(c, 1.0))
-        if f == 1.0:
-            continue
-        opt = line_instance.direct_trip_options[p]
-        line_instance.direct_trip_options[p] = opt._replace(
-            first_mile_cost=float(opt.first_mile_cost) * f,
-            last_mile_cost=float(opt.last_mile_cost) * f,
+    if not line_instance.direct_trip_options.empty:
+        direct_factors = np.asarray(
+            [
+                float(factor_per_cluster.get(int(pool_cluster_labels[p]), 1.0))
+                for p in range(line_instance.nb_pass)
+            ],
+            dtype=float,
+        )
+        line_instance.direct_trip_options["first_mile_cost"] = (
+            line_instance.direct_trip_options["first_mile_cost"].astype(float).to_numpy(copy=False)
+            * direct_factors
+        )
+        line_instance.direct_trip_options["last_mile_cost"] = (
+            line_instance.direct_trip_options["last_mile_cost"].astype(float).to_numpy(copy=False)
+            * direct_factors
         )
 
-    for opt_pos, row in enumerate(line_instance.optimal_trip_options.itertuples(index=False)):
-        p = int(row.passenger_idx)
-        rho = int(row.line_idx)
-        pid_fm = int(line_instance.nb_pass) + opt_pos
-        pid_lm = int(line_instance.nb_pass) + n_options + opt_pos
-        cf = float(factor_per_cluster.get(int(pool_cluster_labels[pid_fm]), 1.0))
-        cl = float(factor_per_cluster.get(int(pool_cluster_labels[pid_lm]), 1.0))
-        if cf == 1.0 and cl == 1.0:
-            continue
-        line_instance.set_trip_mod_cost_on_line(
-            p,
-            rho,
-            float(row.first_mile_cost) * cf,
-            float(row.last_mile_cost) * cl,
+    if not line_instance.optimal_trip_options.empty:
+        first_factor = np.asarray(
+            [
+                float(factor_per_cluster.get(int(pool_cluster_labels[int(line_instance.nb_pass) + pos]), 1.0))
+                for pos in range(n_options)
+            ],
+            dtype=float,
+        )
+        last_factor = np.asarray(
+            [
+                float(
+                    factor_per_cluster.get(
+                        int(pool_cluster_labels[int(line_instance.nb_pass) + n_options + pos]),
+                        1.0,
+                    )
+                )
+                for pos in range(n_options)
+            ],
+            dtype=float,
+        )
+        line_instance.optimal_trip_options["first_mile_cost"] = (
+            line_instance.optimal_trip_options["first_mile_cost"].astype(float).to_numpy(copy=False)
+            * first_factor
+        )
+        line_instance.optimal_trip_options["last_mile_cost"] = (
+            line_instance.optimal_trip_options["last_mile_cost"].astype(float).to_numpy(copy=False)
+            * last_factor
         )
 
 
@@ -2012,67 +2032,70 @@ _MOD_COST_CSV_FIELDNAMES = (
     "mt_cost",
 )
 
+_MOD_COST_CSV_DTYPES = {
+    "passenger_idx": np.int32,
+    "line_idx": np.int32,
+    "first_mile_cost": np.float64,
+    "last_mile_cost": np.float64,
+    "mt_cost": np.float64,
+}
+
 
 def read_mod_costs_csv(path: Path) -> List[Dict[str, Any]]:
     """Load rows written by :func:`export_mod_costs_csv`."""
     path = Path(path)
-    with path.open(newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        if reader.fieldnames is None:
-            raise ValueError(f"Empty or invalid CSV: {path}")
-        missing = set(_MOD_COST_CSV_FIELDNAMES) - set(reader.fieldnames)
-        if missing:
-            raise ValueError(
-                f"{path} missing columns {sorted(missing)}; "
-                f"expected {list(_MOD_COST_CSV_FIELDNAMES)}"
-            )
-        rows: List[Dict[str, Any]] = []
-        for line_no, row in enumerate(reader, start=2):
-            try:
-                rows.append(
-                    {
-                        "passenger_idx": int(row["passenger_idx"]),
-                        "line_idx": int(row["line_idx"]),
-                        "first_mile_cost": float(row["first_mile_cost"]),
-                        "last_mile_cost": float(row["last_mile_cost"]),
-                        "mt_cost": float(row["mt_cost"]),
-                    }
-                )
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"{path} line {line_no}: invalid row {row!r}") from exc
-        return rows
+    try:
+        df = pd.read_csv(path, dtype=_MOD_COST_CSV_DTYPES)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"Failed to read MoD costs CSV {path}: {exc}") from exc
+    return df.loc[:, _MOD_COST_CSV_FIELDNAMES].to_dict("records")
 
 
 def apply_mod_cost_rows_to_instance(
     line_inst: "lineplanning.instance.line_instance",
-    rows: List[Dict[str, Any]],
+    rows: Union[pd.DataFrame, List[Dict[str, Any]]],
 ) -> None:
     """
     Apply per-option MoD cost columns from CSV rows.
     ``line_idx == -1`` denotes the direct (no line) option for that passenger; otherwise
     ``line_idx`` is a candidate line index, matching ``preprocessing`` cache rows.
     """
-    for row in rows:
-        p = int(row["passenger_idx"])
-        rho = int(row["line_idx"])
-        fm = float(row["first_mile_cost"])
-        lm = float(row["last_mile_cost"])
-        mc = float(row["mt_cost"])
-        if rho < 0:
-            if p < 0 or p >= len(line_inst.direct_trip_options):
-                continue
-            t = line_inst.direct_trip_options[p]
-            line_inst.direct_trip_options[p] = t._replace(
-                first_mile_cost=fm,
-                last_mile_cost=lm,
-                mt_cost=mc,
-            )
-        else:
-            if p < 0 or p >= int(line_inst.nb_pass):
-                continue
-            if not line_inst.has_trip_option_on_line(p, rho):
-                continue
-            line_inst.set_trip_costs_on_line(p, rho, fm, lm, mc)
+    costs = rows.copy() if isinstance(rows, pd.DataFrame) else pd.DataFrame.from_records(rows)
+    if costs.empty:
+        return
+    costs = costs.loc[:, _MOD_COST_CSV_FIELDNAMES]
+
+    cost_cols = ["first_mile_cost", "last_mile_cost", "mt_cost"]
+    direct_rows = costs.loc[
+        (costs["line_idx"] < 0)
+        & (costs["passenger_idx"] >= 0)
+        & (costs["passenger_idx"] < len(line_inst.direct_trip_options)),
+        ["passenger_idx", *cost_cols],
+    ]
+    if not direct_rows.empty:
+        direct_indexed = line_inst.direct_trip_options.set_index("passenger_idx", drop=False)
+        updates = direct_rows.set_index("passenger_idx")
+        common = direct_indexed.index.intersection(updates.index)
+        direct_indexed.loc[common, cost_cols] = updates.loc[common, cost_cols].to_numpy()
+        line_inst.direct_trip_options = direct_indexed.reset_index(drop=True)
+
+    line_rows = costs.loc[
+        (costs["line_idx"] >= 0)
+        & (costs["passenger_idx"] >= 0)
+        & (costs["passenger_idx"] < int(line_inst.nb_pass)),
+        ["passenger_idx", "line_idx", *cost_cols],
+    ]
+    if line_rows.empty or line_inst.optimal_trip_options.empty:
+        return
+
+    option_indexed = line_inst.optimal_trip_options.set_index(["passenger_idx", "line_idx"], drop=False)
+    updates = line_rows.set_index(["passenger_idx", "line_idx"])
+    common = option_indexed.index.intersection(updates.index)
+    if len(common) == 0:
+        return
+    option_indexed.loc[common, cost_cols] = updates.loc[common, cost_cols].to_numpy()
+    line_inst.optimal_trip_options = option_indexed.reset_index(drop=True)
+    line_inst._rebuild_trip_option_index()
 
 
 def export_mod_costs_csv(
@@ -2088,41 +2111,13 @@ def export_mod_costs_csv(
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    rows: List[Dict[str, Any]] = []
-    for p in range(line_inst.nb_pass):
-        opt = line_inst.direct_trip_options[p]
-        rows.append(
-            {
-                "passenger_idx": p,
-                "line_idx": -1,
-                "first_mile_cost": opt.first_mile_cost,
-                "last_mile_cost": opt.last_mile_cost,
-                "mt_cost": opt.mt_cost,
-            }
-        )
-    for row in line_inst.optimal_trip_options.itertuples(index=False):
-        rho = int(row.line_idx)
-        opt = line_inst.trip_option_on_line(int(row.passenger_idx), rho)
-        if opt is None:
-            continue
-            rows.append(
-                {
-                    "passenger_idx": int(row.passenger_idx),
-                    "line_idx": rho,
-                    "first_mile_cost": opt.first_mile_cost,
-                    "last_mile_cost": opt.last_mile_cost,
-                    "mt_cost": opt.mt_cost,
-                }
-            )
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=_MOD_COST_CSV_FIELDNAMES,
-            lineterminator="\n",
-        )
-        writer.writeheader()
-        writer.writerows(rows)
-    logging.info("Wrote MoD costs CSV %s (%d rows)", path, len(rows))
+    frames = [
+        line_inst.direct_trip_options.loc[:, _MOD_COST_CSV_FIELDNAMES],
+        line_inst.optimal_trip_options.loc[:, _MOD_COST_CSV_FIELDNAMES],
+    ]
+    df = pd.concat(frames, ignore_index=True)
+    df.to_csv(path, index=False)
+    logging.info("Wrote MoD costs CSV %s (%d rows)", path, len(df))
 
 
 def main() -> None:
