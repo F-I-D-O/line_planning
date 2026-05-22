@@ -339,7 +339,6 @@ def _pool_rows_feature_matrix(
 
 def build_darp_request_pool(
     line_instance: "lineplanning.instance.line_instance",
-    request_times: Optional[List[Union[int, float]]] = None,
     transfer_delay: Union[int, float] = 0,
 ) -> pd.DataFrame:
     """
@@ -348,13 +347,17 @@ def build_darp_request_pool(
     Row timing and geometry match :func:`solution_to_darp_requests` for the same inputs.
     """
     nb_pass = line_instance.nb_pass
-    if request_times is None:
-        request_times = [0] * nb_pass
-    if len(request_times) != nb_pass:
-        request_times = list(request_times) + [0] * (nb_pass - len(request_times))
 
     dm = line_instance.dm
     requests_od = line_instance.requests
+    demand_df = line_instance.demand
+    if "time" not in demand_df.columns:
+        raise ValueError("line_instance.demand must contain a 'time' column")
+    if len(demand_df) != nb_pass:
+        raise ValueError(
+            f"line_instance.demand has {len(demand_df)} rows, expected nb_pass={nb_pass}"
+        )
+    demand_times = demand_df["time"].to_numpy(dtype=np.float32, copy=False)
     lengths_travel_times = line_instance.lengths_travel_times
 
     options_df = line_instance.optimal_trip_options
@@ -369,8 +372,6 @@ def build_darp_request_pool(
     time_values = np.empty(total_rows, dtype=np.float32)
 
     requests_od = np.asarray(requests_od, dtype=np.int32)
-    request_times_arr = np.asarray(request_times, dtype=np.float32)
-    td = float(transfer_delay)
 
     direct = slice(0, nb_pass)
     passenger_idx[direct] = np.arange(nb_pass, dtype=np.int32)
@@ -378,7 +379,7 @@ def build_darp_request_pool(
     leg_kind[direct] = DARP_POOL_LEG_NO_MT
     origin[direct] = requests_od[:, 0]
     destination[direct] = requests_od[:, 1]
-    time_values[direct] = request_times_arr[:nb_pass]
+    time_values[direct] = demand_times[:nb_pass]
 
     if n_options:
         opt_passengers = options_df["passenger_idx"].to_numpy(dtype=np.int32, copy=False)
@@ -389,7 +390,7 @@ def build_darp_request_pool(
         drop_off_edges = options_df["mt_drop_off_line_edge_index"].to_numpy(dtype=np.float32, copy=False)
         request_origins = requests_od[opt_passengers, 0]
         request_destinations = requests_od[opt_passengers, 1]
-        option_times = request_times_arr[opt_passengers]
+        option_times = demand_times[opt_passengers]
 
         first = slice(nb_pass, nb_pass + n_options)
         passenger_idx[first] = opt_passengers
@@ -426,7 +427,7 @@ def build_darp_request_pool(
             )
         else:
             segment_time = np.zeros(n_options, dtype=np.float32)
-        time_values[last] = option_times + first_mile_time + np.float32(td) + segment_time
+        time_values[last] = option_times + first_mile_time + transfer_delay + segment_time
 
     return pd.DataFrame(
         {
@@ -696,7 +697,6 @@ def _sanity_check_pool_export_matches_solution_to_darp(
     legacy = solution_to_darp_requests(
         line_instance,
         request_assignments,
-        request_times=None,
         transfer_delay=transfer_delay,
     )
 
@@ -1122,7 +1122,6 @@ def _load_demand_and_dm_from_instance_config(instance_dir_path: Path) -> Tuple[P
 def solution_to_darp_requests(
     line_instance: "lineplanning.instance.line_instance",
     request_assignments: List[Tuple[str, Optional[int]]],
-    request_times: Optional[List[Union[int, float]]] = None,
     transfer_delay: Union[int, float] = 0,
 ) -> List[dict]:
     """
@@ -1141,10 +1140,14 @@ def solution_to_darp_requests(
     Format matches https://github.com/aicenter/Ridesharing_DARP_instances (requests.csv) plus original_request_id.
     """
     nb_pass = line_instance.nb_pass
-    if request_times is None:
-        request_times = [0] * nb_pass
-    if len(request_times) != nb_pass:
-        request_times = request_times + [0] * (nb_pass - len(request_times))
+    demand_df = line_instance.demand
+    if "time" not in demand_df.columns:
+        raise ValueError("line_instance.demand must contain a 'time' column")
+    if len(demand_df) != nb_pass:
+        raise ValueError(
+            f"line_instance.demand has {len(demand_df)} rows, expected nb_pass={nb_pass}"
+        )
+    demand_times = demand_df["time"].to_numpy(dtype=np.float32, copy=False)
 
     dm = line_instance.dm
     requests_od = line_instance.requests
@@ -1156,7 +1159,7 @@ def solution_to_darp_requests(
     for r in range(nb_pass):
         o_r = requests_od[r][0]
         d_r = requests_od[r][1]
-        t_r = float(request_times[r])
+        t_r = float(demand_times[r])
 
         kind, line_idx = request_assignments[r]
         if kind == "rejected":
@@ -1218,7 +1221,6 @@ def solution_to_darp_requests(
 
 def line_planning_original_requests_as_mod_darp_requests(
     line_instance: "lineplanning.instance.line_instance",
-    request_times: Optional[List[Union[int, float]]] = None,
 ) -> List[dict]:
     """
     Build one direct-MoD DARP row per original line-planning passenger (o_r, d_r, t_r).
@@ -1227,10 +1229,14 @@ def line_planning_original_requests_as_mod_darp_requests(
     (columns for :func:`write_darp_requests_csv` / :func:`write_darp_vehicles_csv`).
     """
     nb_pass = line_instance.nb_pass
-    if request_times is None:
-        request_times = [0] * nb_pass
-    if len(request_times) != nb_pass:
-        request_times = list(request_times) + [0] * (nb_pass - len(request_times))
+    demand_df = line_instance.demand
+    if "time" not in demand_df.columns:
+        raise ValueError("line_instance.demand must contain a 'time' column")
+    if len(demand_df) != nb_pass:
+        raise ValueError(
+            f"line_instance.demand has {len(demand_df)} rows, expected nb_pass={nb_pass}"
+        )
+    demand_times = demand_df["time"].to_numpy(dtype=np.float32, copy=False)
 
     requests_od = line_instance.requests
     darp_requests: List[dict] = []
@@ -1238,7 +1244,7 @@ def line_planning_original_requests_as_mod_darp_requests(
     for r in range(nb_pass):
         o_r = requests_od[r][0]
         d_r = requests_od[r][1]
-        t_r = float(request_times[r])
+        t_r = float(demand_times[r])
         darp_requests.append(
             {
                 "id": request_id,
@@ -2191,7 +2197,6 @@ def main() -> None:
     if cfg.mod_cost_recomputation_strategy == "clustered_avg":
         pool_df = build_darp_request_pool(
             line_inst,
-            request_times=None,
             transfer_delay=cfg.transfer_delay,
         )
         expected_pool = int(line_inst.nb_pass) + 2 * len(line_inst.optimal_trip_options)
@@ -2340,7 +2345,6 @@ def main() -> None:
                     darp_requests = solution_to_darp_requests(
                         line_inst,
                         request_assignments,
-                        request_times=None,
                         transfer_delay=cfg.transfer_delay,
                     )
                 write_darp_requests_csv(darp_requests, requests_csv_path, time_format="seconds")

@@ -250,7 +250,6 @@ def run_first_iteration_pipeline(
     darp_requests = mod.solution_to_darp_requests(
         line_inst,
         request_assignments,
-        request_times=None,
         transfer_delay=0,
     )
     requests_csv_path = results_dir_path_per_iteration / "requests.csv"

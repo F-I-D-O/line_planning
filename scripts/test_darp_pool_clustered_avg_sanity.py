@@ -12,6 +12,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -62,6 +63,38 @@ def main() -> None:
     assert mod._pool_id_for_leg(line_inst, pool_df, 0, None, mod.DARP_POOL_LEG_NO_MT) == 0
     assert mod._pool_id_for_leg(line_inst, pool_df, 0, 0, mod.DARP_POOL_LEG_FIRST_MILE) == 1
     assert mod._pool_id_for_leg(line_inst, pool_df, 0, 0, mod.DARP_POOL_LEG_LAST_MILE) == 2
+
+    class FakePoolLineInstance(FakeLineInstance):
+        nb_pass = 1
+        nb_lines = 1
+        requests = np.asarray([[10, 20]], dtype=np.int32)
+        demand = pd.DataFrame(
+            {
+                "origin": np.asarray([10], dtype=np.int32),
+                "destination": np.asarray([20], dtype=np.int32),
+                "time": np.asarray([12.5], dtype=np.float32),
+            }
+        )
+        dm = np.zeros((50, 50), dtype=np.float32)
+        dm[10, 30] = 4.0
+        lengths_travel_times = [10.0]
+        optimal_trip_options = pd.DataFrame(
+            {
+                "passenger_idx": np.asarray([0], dtype=np.int32),
+                "line_idx": np.asarray([0], dtype=np.int32),
+                "mt_pickup_node": np.asarray([30], dtype=np.int32),
+                "mt_drop_off_node": np.asarray([40], dtype=np.int32),
+                "mt_pickup_line_edge_index": np.asarray([0], dtype=np.int16),
+                "mt_drop_off_line_edge_index": np.asarray([2], dtype=np.int16),
+            }
+        )
+
+        @staticmethod
+        def line_length(line_idx):
+            return 4
+
+    built_pool = mod.build_darp_request_pool(FakePoolLineInstance(), transfer_delay=1)
+    assert built_pool["time"].tolist() == [12.5, 12.5, 22.5]
 
     assignments = [("line", 0)]
     reqs, exp_map = mod.select_darp_requests_from_pool(pool_df, assignments, line_inst)

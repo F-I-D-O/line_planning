@@ -26,7 +26,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import yaml
 
@@ -54,12 +54,12 @@ def _resolve_instance_dir(instance_dir: Path) -> Path:
     return d
 
 
-def _load_original_od_pairs(demand_file: Path) -> List[Tuple[int, int]]:
+def _load_original_requests(demand_file: Path) -> List[Tuple[int, int, float]]:
     """
-    Load (origin, destination) per passenger from the line-planning demand file.
+    Load (origin, destination, time) per passenger from the line-planning demand file.
 
     Same rules as ``lineplanning.instance.line_instance.manhattan_instance``: ``.txt`` rows are
-    whitespace-split; otherwise CSV is read via ``_load_demand_from_csv``.
+    whitespace-split; otherwise CSV is read via strict ``requests.csv`` columns.
     """
     from lineplanning.instance import _load_demand_from_csv
 
@@ -67,48 +67,45 @@ def _load_original_od_pairs(demand_file: Path) -> List[Tuple[int, int]]:
     if demand_file.suffix.lower() == ".txt":
         with demand_file.open("r", encoding="utf-8") as f:
             my_list = [line.split() for line in f if line.strip()]
-        pairs_arr = None
+        requests_arr = None
     else:
-        pairs_arr = _load_demand_from_csv(demand_file)
+        demand_df = _load_demand_from_csv(demand_file)
+        requests_arr = demand_df.loc[:, ["origin", "destination", "time"]].to_numpy(copy=False)
         my_list = []
 
-    pairs: List[Tuple[int, int]] = []
-    if pairs_arr is not None:
-        for o, d in pairs_arr:
-            pairs.append((int(o), int(d)))
+    requests: List[Tuple[int, int, float]] = []
+    if requests_arr is not None:
+        for o, d, t in requests_arr:
+            requests.append((int(o), int(d), float(t)))
     else:
-        for row in my_list:
-            if len(row) < 2:
-                continue
+        for line_no, row in enumerate(my_list, start=1):
+            if len(row) != 3:
+                raise ValueError(
+                    f"Demand text file {demand_file} line {line_no} must contain origin, destination and time"
+                )
             o = int(float(row[0].strip()))
             d = int(float(row[1].strip()))
-            pairs.append((o, d))
-    return pairs
+            t = float(row[2].strip())
+            requests.append((o, d, t))
+    return requests
 
 
-def _original_od_pairs_to_mod_darp_requests(
-    od_pairs: List[Tuple[int, int]],
-    request_times: Optional[List[float]] = None,
+def _original_requests_to_mod_darp_requests(
+    requests: List[Tuple[int, int, float]],
 ) -> List[dict]:
     """
     One DARP row per original passenger — same dict shape as
     ``line_planning_original_requests_as_mod_darp_requests`` in ``MoD-aware_line_selection.py``.
     """
-    n = len(od_pairs)
-    if request_times is None:
-        times = [0.0] * n
-    else:
-        times = list(request_times) + [0.0] * (n - len(request_times))
-
     out: List[dict] = []
-    for r, (o_r, d_r) in enumerate(od_pairs):
+    for r, (o_r, d_r, t_r) in enumerate(requests):
         out.append(
             {
                 "id": r,
                 "original_request_id": r,
                 "origin": o_r,
                 "destination": d_r,
-                "time": float(times[r]),
+                "time": float(t_r),
             }
         )
     return out
@@ -159,11 +156,11 @@ def main() -> None:
     with (experiment_dir / "experiment_used.yaml").open("w", encoding="utf-8") as f:
         yaml.safe_dump(raw, f, default_flow_style=False, sort_keys=False)
 
-    od_pairs = _load_original_od_pairs(inst.demand_file)
-    if not od_pairs:
+    original_requests = _load_original_requests(inst.demand_file)
+    if not original_requests:
         raise ValueError(f"No demand rows loaded from {inst.demand_file}")
 
-    darp_requests = _original_od_pairs_to_mod_darp_requests(od_pairs, request_times=None)
+    darp_requests = _original_requests_to_mod_darp_requests(original_requests)
 
     mod.write_darp_requests_csv(
         darp_requests,

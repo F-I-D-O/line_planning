@@ -25,46 +25,76 @@ import lineplanning.log
 # ox.config(log_console=True, use_cache=True)
 
 
-def _load_demand_from_csv(demand_file: Path) -> np.ndarray:
+_REQUESTS_CSV_REQUIRED_COLUMNS = ("origin", "destination", "time")
+_REQUESTS_CSV_OPTIONAL_COLUMNS = ("id",)
+
+
+def _strict_numeric_column(
+    df: pd.DataFrame,
+    column: str,
+    dtype,
+    demand_file: Path,
+    integral: bool = False,
+) -> pd.Series:
+    try:
+        values = pd.to_numeric(df[column], errors="raise")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Column {column!r} in {demand_file} must be numeric: {exc}")
+
+    numeric = values.to_numpy(dtype=np.float64, copy=False)
+    if not np.isfinite(numeric).all():
+        raise ValueError(f"Column {column!r} in {demand_file} contains NaN or infinite values")
+    if integral and not np.equal(numeric, np.trunc(numeric)).all():
+        raise ValueError(f"Column {column!r} in {demand_file} must contain integer values")
+    try:
+        return values.astype(dtype, copy=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Column {column!r} in {demand_file} cannot be converted to {dtype}: {exc}")
+
+
+def _load_demand_from_csv(demand_file: Path) -> pd.DataFrame:
     """
-    Load demand data from a CSV file.
+    Load demand data from a Ridesharing_DARP_instances requests.csv file.
     
     Args:
         demand_file: Path to the CSV file
         
     Returns:
-        NumPy array with shape (n_requests, 2), columns [origin, dest].
+        DataFrame with strict ``origin``, ``destination`` and ``time`` columns.
     """
     logging.info('Loading demand from CSV file %s', demand_file)
     try:
-        df = pd.read_csv(demand_file, delimiter='\t')
+        df = pd.read_csv(demand_file)
     except Exception as exc:
         raise ValueError(f"Failed to read CSV file {demand_file}: {exc}")
-    
-    # Try to find origin and dest columns (case-insensitive, with common variations)
-    origin_col = None
-    dest_col = None
-    
-    # Check for common column name variations
-    for col in df.columns:
-        col_lower = col.lower().strip()
-        if col_lower in ['origin', 'orig', 'o', 'from', 'pickup', 'pick_up', 'pickup_node']:
-            origin_col = col
-        elif col_lower in ['dest', 'destination', 'd', 'to', 'dropoff', 'drop_off', 'dropoff_node', 'dest_node']:
-            dest_col = col
-    
-    if origin_col is None:
-        raise ValueError(f"Could not find 'origin' column in CSV file {demand_file}. Available columns: {list(df.columns)}")
-    if dest_col is None:
-        raise ValueError(f"Could not find 'dest' column in CSV file {demand_file}. Available columns: {list(df.columns)}")
-    
-    logging.info('Found origin column: %s, dest column: %s', origin_col, dest_col)
-    
-    try:
-        demand = df[[origin_col, dest_col]].astype(np.int32, copy=False).to_numpy(copy=True)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"Failed to convert demand columns in {demand_file} to integers: {exc}")
-    
+
+    if df.columns.has_duplicates:
+        duplicated = df.columns[df.columns.duplicated()].tolist()
+        raise ValueError(f"Invalid requests CSV columns in {demand_file}: duplicate columns {duplicated}")
+
+    allowed_columns = set(_REQUESTS_CSV_REQUIRED_COLUMNS) | set(_REQUESTS_CSV_OPTIONAL_COLUMNS)
+    actual_columns = list(df.columns)
+    missing_columns = [column for column in _REQUESTS_CSV_REQUIRED_COLUMNS if column not in df.columns]
+    unexpected_columns = [column for column in actual_columns if column not in allowed_columns]
+    if missing_columns or unexpected_columns:
+        raise ValueError(
+            f"Invalid requests CSV columns in {demand_file}. "
+            f"Expected required columns {list(_REQUESTS_CSV_REQUIRED_COLUMNS)} "
+            f"and optional columns {list(_REQUESTS_CSV_OPTIONAL_COLUMNS)}; "
+            f"missing={missing_columns}, unexpected={unexpected_columns}, actual={actual_columns}"
+        )
+
+    demand = pd.DataFrame(
+        {
+            "origin": _strict_numeric_column(df, "origin", np.int32, demand_file, integral=True),
+            "destination": _strict_numeric_column(df, "destination", np.int32, demand_file, integral=True),
+            "time": _strict_numeric_column(df, "time", np.float32, demand_file),
+        },
+        index=df.index,
+    )
+    if "id" in df.columns:
+        demand["id"] = _strict_numeric_column(df, "id", np.int32, demand_file, integral=True)
+
     logging.info('Loaded %d demand records from CSV', len(demand))
     return demand
 
@@ -202,6 +232,7 @@ class line_instance:
         self._line_position_cache = {}
         self.direct_trip_options: pd.DataFrame = self._empty_trip_options_df()
         self.dm: Optional[np.ndarray] = None  # dm.
+        self.demand: pd.DataFrame = pd.DataFrame(columns=list(_REQUESTS_CSV_REQUIRED_COLUMNS))
         if preprocessing_dir is not None:
             self.preprocessing_dir = Path(preprocessing_dir)
         elif demand_file is not None:
@@ -236,7 +267,8 @@ class line_instance:
             self.candidate_set_of_lines,
             self.lengths_travel_times,
             self.dm,
-            self.requests
+            self.requests,
+            self.demand,
         ) = self.manhattan_instance(maximum_detour)
         self._rebuild_trip_option_index()
 
@@ -651,6 +683,7 @@ class line_instance:
         list,
         np.ndarray,
         np.ndarray,
+        pd.DataFrame,
     ]:
         # TODO handle the case where remaining stops pop in skeleton method
 
@@ -664,18 +697,31 @@ class line_instance:
 
         logging.info('Loading demand')
         if self.demand_file.suffix == '.txt':
+            rows = []
+            time_list = []
             with open(self.demand_file, 'r') as f:
-                passengers = np.asarray(
-                    [
-                        [int(float(i.strip())) for i in line.split()[:2]]
-                        for line in f
-                        if line.strip()
-                    ],
-                    dtype=np.int32,
-                )
+                for line_no, line in enumerate(f, start=1):
+                    if not line.strip():
+                        continue
+                    parts = line.split()
+                    if len(parts) != 3:
+                        raise ValueError(
+                            f"Demand text file {self.demand_file} line {line_no} must contain "
+                            "origin, destination and time"
+                        )
+                    rows.append([int(float(parts[0].strip())), int(float(parts[1].strip()))])
+                    time_list.append(float(parts[2].strip()))
+            demand = pd.DataFrame(
+                {
+                    "origin": np.asarray([row[0] for row in rows], dtype=np.int32),
+                    "destination": np.asarray([row[1] for row in rows], dtype=np.int32),
+                    "time": np.asarray(time_list, dtype=np.float32),
+                }
+            )
         else:
-            passengers = _load_demand_from_csv(self.demand_file)
+            demand = _load_demand_from_csv(self.demand_file)
 
+        passengers = demand.loc[:, ["origin", "destination"]].to_numpy(dtype=np.int32, copy=False)
         self.nb_pass = len(passengers)
         logging.info('Demand loaded')
 
@@ -783,7 +829,8 @@ class line_instance:
             candidate_set_of_lines,
             lengths_travel_times,
             distances,
-            passengers
+            passengers,
+            demand,
         )
 
     def preprocessing(
