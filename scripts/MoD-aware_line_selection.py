@@ -2357,7 +2357,7 @@ def main() -> None:
                 write_darp_config_yaml(
                     output_dir=results_dir_path_per_iteration,
                     dm_filepath=dm_file,
-                    max_travel_time_delay_seconds=cfg.max_travel_time_delay_seconds,
+                    max_travel_time_delay_seconds=cfg.max_travel_time_delay_seconds / 2,
                     vehicle_capacity=cfg.darp_vehicle_capacity,
                     darp_method=cfg.darp_benchmark_method,
                     darp_experiment_parameters=cfg.darp_benchmark_experiment_parameters,
