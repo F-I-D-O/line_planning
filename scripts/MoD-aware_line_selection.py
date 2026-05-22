@@ -9,7 +9,8 @@ Run::
 Configuration is read entirely from the experiment YAML (same layout as ``lineplanning.line_planning.run_experiment``
 where applicable: ``instance``, ``results_dir``, ``solver``, ``mass_transport``, optional ``budget``),
 plus MoD-specific keys. The ``ilp_with_mod_costs`` method maximizes served requests under a joint
-line+MoD budget; ``non_budget_ilp`` minimizes total generalized cost (different objective sense).
+line+MoD budget; ``non_budget_ilp`` and ``peak_batch_max_headway_ilp`` minimize total generalized
+cost (different objective sense).
 
 Example ``experiment.yaml``::
 
@@ -20,7 +21,8 @@ Example ``experiment.yaml``::
 
     solver:
       time_limit: 1500
-      # Line-planning ILP: non_budget_ilp (default, MoD-aware §4.1) or ilp_with_mod_costs (budget ILP).
+      # Line-planning ILP: non_budget_ilp (default, MoD-aware §4.1),
+      # peak_batch_max_headway_ilp (§4.2.1), or ilp_with_mod_costs (budget ILP).
       method: non_budget_ilp
       rejection_cost: 1000
       use_request_line_valid_inequalities: true
@@ -97,7 +99,9 @@ from gurobipy import GRB
 
 
 # ``solver.method`` values supported by this script (extend the registry when adding runners).
-MOD_AWARE_LINE_SELECTION_SOLVER_METHODS = frozenset({"non_budget_ilp", "ilp_with_mod_costs"})
+MOD_AWARE_LINE_SELECTION_SOLVER_METHODS = frozenset(
+    {"non_budget_ilp", "peak_batch_max_headway_ilp", "ilp_with_mod_costs"}
+)
 
 
 # Defaults for code that imports this module without running ``main()`` (e.g. test scripts).
@@ -847,9 +851,10 @@ def _run_mod_line_selection_ilp(
     """
     Run the configured line-planning ILP for one MoD-aware iteration.
 
-    ``cfg.solver_method`` selects between MoD-aware (``non_budget_ilp``) and budget ILP
-    (``ilp_with_mod_costs``). ``line_instance.B`` must already follow ``run_experiment`` rules
-    except that this function sets ``B = _ilp_budget_rhs(cfg.budget)`` immediately before
+    ``cfg.solver_method`` selects between MoD-aware (``non_budget_ilp``), peak-batch
+    max-headway (``peak_batch_max_headway_ilp``), and budget ILP (``ilp_with_mod_costs``).
+    ``line_instance.B`` must already follow ``run_experiment`` rules except that this
+    function sets ``B = _ilp_budget_rhs(cfg.budget)`` immediately before
     ``solve_modified_ILP``, matching :func:`lineplanning.line_planning.run_experiment`.
     """
     if cfg.solver_method == "non_budget_ilp":
@@ -862,6 +867,15 @@ def _run_mod_line_selection_ilp(
             rejection_cost=cfg.rejection_cost,
             use_request_line_valid_inequalities=cfg.use_request_line_valid_inequalities,
             reuse_model=cfg.reuse_model,
+        )
+    if cfg.solver_method == "peak_batch_max_headway_ilp":
+        return solver.solve_peak_batch_max_headway_ILP(
+            export_model=True,
+            export_solution=True,
+            output_dir=output_dir,
+            gurobi_log_file=output_dir / "gurobi.log",
+            max_route_frequency=cfg.max_frequency,
+            max_wait_time=cfg.max_travel_time_delay_seconds,
         )
     if cfg.solver_method == "ilp_with_mod_costs":
         solver.line_instance.B = _ilp_budget_rhs(cfg.budget)
@@ -1099,8 +1113,9 @@ def load_mod_aware_line_selection_config(
     MoD cost update: ``mod_cost_recomputation`` with ``strategy`` and optional nested ``smoothing``
     (``strategy``, ``under_relaxation_alpha``).
 
-    Line-planning ILP: optional ``solver.method`` (``non_budget_ilp`` default, or ``ilp_with_mod_costs``)
-    and optional top-level ``budget`` (same semantics as :func:`lineplanning.line_planning.run_experiment`).
+    Line-planning ILP: optional ``solver.method`` (``non_budget_ilp`` default,
+    ``peak_batch_max_headway_ilp``, or ``ilp_with_mod_costs``) and optional top-level
+    ``budget`` (same semantics as :func:`lineplanning.line_planning.run_experiment`).
 
     Other keys default to the previous script defaults documented in the module docstring.
 
@@ -1290,7 +1305,6 @@ def load_request_assignments_csv(
     - an integer (route index ρ) if assigned to a line
     - "no_MT" if assigned to MoD-only
     - "rejected" if not served (§4.1.2) or unserved in the budget ILP
-    - "Dropped" if dropped (legacy export); treated as ``rejected`` here
 
     Returns a list of (kind, route_index) tuples where kind is "no_MT", "line", or "rejected";
     for "line", the second entry is the route index ρ (0 .. nb_lines-1).
@@ -1307,10 +1321,13 @@ def load_request_assignments_csv(
             request_assignments.append(("no_MT", None))
         elif line_value == "rejected":
             request_assignments.append(("rejected", None))
-        elif str(line_value) == "Dropped":
-            request_assignments.append(("rejected", None))
         else:
-            route_index = int(line_value)
+            try:
+                route_index = int(line_value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Invalid assignment value in {path} for passenger {row['passenger']}: {line_value!r}"
+                ) from exc
             request_assignments.append(("line", route_index))
     return request_assignments
 
@@ -2187,9 +2204,10 @@ def main() -> None:
         cfg.solver_method,
         cfg.budget,
     )
-    if cfg.solver_method == "ilp_with_mod_costs" and cfg.reuse_model:
+    if cfg.solver_method != "non_budget_ilp" and cfg.reuse_model:
         logging.debug(
-            "solver.method=ilp_with_mod_costs does not use reuse_model; incremental reuse applies only to non_budget_ilp.",
+            "solver.method=%s does not use reuse_model; incremental reuse applies only to non_budget_ilp.",
+            cfg.solver_method,
         )
 
     pool_df = pd.DataFrame(columns=DARP_POOL_COLUMNS)
@@ -2313,6 +2331,9 @@ def main() -> None:
                     "experiment_config": str(cfg.experiment_yaml_path),
                     "solver_method": cfg.solver_method,
                     "max_route_frequency": cfg.max_frequency,
+                    "max_wait_time": cfg.max_travel_time_delay_seconds
+                    if cfg.solver_method == "peak_batch_max_headway_ilp"
+                    else None,
                     "solver_time_limit": cfg.solver_time_limit,
                     "rejection_cost": cfg.rejection_cost,
                     "mod_cost_recomputation_strategy": cfg.mod_cost_recomputation_strategy,

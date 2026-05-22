@@ -1,0 +1,7 @@
+sandbox_mode = "workspace-write"
+
+[sandbox_workspace_write]
+writable_roots = [
+    "C:/Workspaces/Cornell/line_planning",
+    "C:/Workspaces/Cornell/MoD-aware-MT-design",
+]

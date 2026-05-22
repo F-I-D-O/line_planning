@@ -8,6 +8,7 @@ import time
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -29,6 +30,12 @@ from lineplanning.instance_config import (
 import lineplanning.log
 
 EPS = 1.e-5
+
+
+class NoAssignmentHandling(Enum):
+    NO_MT = "no_mt"
+    REJECT = "reject"
+    RAISE = "raise"
 
 
 @dataclass(frozen=True)
@@ -80,6 +87,7 @@ VALID_SOLVER_METHODS = frozenset(
         "ilp_with_mod_costs",
         "ilp_with_empty_trips",
         "non_budget_ilp",
+        "peak_batch_max_headway_ilp",
     }
 )
 
@@ -220,105 +228,113 @@ class LinePlanningSolver:
 
         logging.info("Updated MoD costs for %d requests", len(new_costs))
 
-    def _export_passenger_assignments(
+    def _assignments_from_passenger_vars(
         self,
-        output_dir: Path,
         passenger_vars,
-        no_assignment_means_no_mt_option: bool = False,
-        no_assignment_means_rejected: bool = False,
         no_mt_line_key: Optional[int] = None,
         line_var_is_route_index: bool = False,
         rejection_vars: Optional[Dict[int, Any]] = None,
-        rejection_unit_cost: Optional[float] = None,
-    ) -> pd.DataFrame:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        csv_path = output_dir / "passenger_assignments.csv"
-
+    ) -> Dict[int, Tuple[str, Optional[int]]]:
+        """Extract assigned passengers from Gurobi assignment variables."""
         no_mt_key = self.line_count_total if no_mt_line_key is None else no_mt_line_key
+        assignments: Dict[int, Tuple[str, Optional[int]]] = {}
 
-        rows = []
-        assigned_passengers = set()
+        if rejection_vars is not None:
+            for passenger_idx, var in rejection_vars.items():
+                if var.X > EPS:
+                    assignments[int(passenger_idx)] = ("rejected", None)
 
         for (line_idx, passenger_idx), var in passenger_vars.items():
             if var.X > 0:
+                passenger_idx = int(passenger_idx)
+                if assignments.get(passenger_idx) == ("rejected", None):
+                    continue
                 is_no_mt = line_idx == no_mt_key
                 if is_no_mt:
-                    line_repr: Union[int, str] = "no_MT"
-                    mod_cost = self._direct_trip_mod_cost(passenger_idx)
-                    route_index: Optional[int] = None
+                    assignments[passenger_idx] = ("no_MT", None)
                 else:
                     route_index = (
                         int(line_idx)
                         if line_var_is_route_index
                         else line_idx // self.max_frequency
                     )
-                    line_repr = route_index
-                    mod_cost = self.line_instance.trip_mod_cost_on_line(passenger_idx, route_index)
-                rows.append(
-                    {
-                        "passenger": passenger_idx,
-                        "line_index": int(line_idx),
-                        "route_index": route_index if route_index is not None else np.nan,
-                        "line_repr": line_repr,
-                        "mod_cost": mod_cost,
-                        "is_no_mt": is_no_mt,
-                    }
-                )
-                assigned_passengers.add(passenger_idx)
+                    assignments[passenger_idx] = ("line", int(route_index))
+        return assignments
 
+    def _resolve_and_export_request_assignments(
+        self,
+        output_dir: Path,
+        request_assignments: Union[
+            Dict[int, Tuple[str, Optional[int]]],
+            List[Tuple[str, Optional[int]]],
+            Tuple[Tuple[str, Optional[int]], ...],
+        ],
+        no_assignment_handling: NoAssignmentHandling = NoAssignmentHandling.RAISE,
+        no_mt_line_key: Optional[int] = None,
+    ) -> Tuple[List[Tuple[str, Optional[int]]], pd.DataFrame]:
+        """
+        Resolve missing passenger assignments, export passenger_assignments.csv, and return
+        both the canonical assignment list and the richer internal DataFrame.
+        """
+        output_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = output_dir / "passenger_assignments.csv"
+        no_mt_key = self.line_count_total if no_mt_line_key is None else no_mt_line_key
+
+        if isinstance(request_assignments, dict):
+            partial = {int(k): v for k, v in request_assignments.items()}
+        else:
+            partial = {idx: value for idx, value in enumerate(request_assignments)}
+
+        full_assignments: List[Tuple[str, Optional[int]]] = []
         for passenger_idx in range(self.line_instance.nb_pass):
-            if passenger_idx in assigned_passengers:
-                continue
-            if (
-                rejection_vars is not None
-                and passenger_idx in rejection_vars
-                and rejection_vars[passenger_idx].X > EPS
-            ):
-                rows.append(
-                    {
-                        "passenger": passenger_idx,
-                        "line_index": -2,
-                        "route_index": np.nan,
-                        "line_repr": "rejected",
-                        "mod_cost": float(rejection_unit_cost) if rejection_unit_cost is not None else 0.0,
-                        "is_no_mt": False,
-                    }
-                )
-                assigned_passengers.add(passenger_idx)
-                continue
-            if no_assignment_means_rejected:
-                rows.append(
-                    {
-                        "passenger": passenger_idx,
-                        "line_index": -2,
-                        "route_index": np.nan,
-                        "line_repr": "rejected",
-                        "mod_cost": 0.0,
-                        "is_no_mt": False,
-                    }
-                )
-            elif no_assignment_means_no_mt_option:
-                rows.append(
-                    {
-                        "passenger": passenger_idx,
-                        "line_index": no_mt_key,
-                        "route_index": np.nan,
-                        "line_repr": "no_MT",
-                        "mod_cost": self._direct_trip_mod_cost(passenger_idx),
-                        "is_no_mt": True,
-                    }
-                )
+            assignment = partial.get(passenger_idx)
+            if assignment is None:
+                if no_assignment_handling == NoAssignmentHandling.NO_MT:
+                    assignment = ("no_MT", None)
+                elif no_assignment_handling == NoAssignmentHandling.REJECT:
+                    assignment = ("rejected", None)
+                elif no_assignment_handling == NoAssignmentHandling.RAISE:
+                    raise ValueError(f"Missing assignment for passenger {passenger_idx}")
+                else:
+                    raise ValueError(f"Unknown no-assignment handling: {no_assignment_handling!r}")
+            kind, route_index = assignment
+            if kind == "line" and route_index is None:
+                raise ValueError(f"Line assignment for passenger {passenger_idx} has no route index")
+            if kind not in ("line", "no_MT", "rejected"):
+                raise ValueError(f"Unknown assignment kind for passenger {passenger_idx}: {kind!r}")
+            full_assignments.append((kind, int(route_index) if route_index is not None else None))
+
+        rows = []
+        for passenger_idx, (kind, route_index) in enumerate(full_assignments):
+            if kind == "line":
+                assert route_index is not None
+                line_repr: Union[int, str] = int(route_index)
+                line_index = int(route_index)
+                route_repr: Union[int, float] = int(route_index)
+                mod_cost = self.line_instance.trip_mod_cost_on_line(passenger_idx, int(route_index))
+                is_no_mt = False
+            elif kind == "no_MT":
+                line_repr = "no_MT"
+                line_index = no_mt_key
+                route_repr = np.nan
+                mod_cost = self._direct_trip_mod_cost(passenger_idx)
+                is_no_mt = True
             else:
-                rows.append(
-                    {
-                        "passenger": passenger_idx,
-                        "line_index": -1,
-                        "route_index": np.nan,
-                        "line_repr": "Dropped",
-                        "mod_cost": 0.0,
-                        "is_no_mt": False,
-                    }
-                )
+                line_repr = "rejected"
+                line_index = -2
+                route_repr = np.nan
+                mod_cost = 0.0
+                is_no_mt = False
+            rows.append(
+                {
+                    "passenger": passenger_idx,
+                    "line_index": line_index,
+                    "route_index": route_repr,
+                    "line_repr": line_repr,
+                    "mod_cost": mod_cost,
+                    "is_no_mt": is_no_mt,
+                }
+            )
 
         assignments_df = pd.DataFrame(rows)
         if not assignments_df.empty:
@@ -337,7 +353,7 @@ class LinePlanningSolver:
         except OSError as exc:
             logging.warning("Unable to write passenger assignments CSV %s: %s", csv_path, exc)
 
-        return assignments_df
+        return full_assignments, assignments_df
 
     def _solve_and_export_flows(
         self,
@@ -350,7 +366,7 @@ class LinePlanningSolver:
             line_index = int(row.line_index)
             passenger_idx = int(row.passenger)
 
-            # skip dropped requests
+            # skip rejected requests
             if line_index < 0:
                 continue
 
@@ -774,10 +790,13 @@ class LinePlanningSolver:
             line_costs=lines_cost
         )
 
-        assignments = self._export_passenger_assignments(
-            output_dir=export_dir,
+        partial_assignments = self._assignments_from_passenger_vars(
             passenger_vars=x,
-            no_assignment_means_no_mt_option=True
+        )
+        _request_assignments, assignments = self._resolve_and_export_request_assignments(
+            output_dir=export_dir,
+            request_assignments=partial_assignments,
+            no_assignment_handling=NoAssignmentHandling.NO_MT,
         )
 
         self._solve_and_export_flows(
@@ -914,12 +933,16 @@ class LinePlanningSolver:
             per_route_mt_cost_coeff=per_route_mt_cost_coeff,
         )
 
-        assignments = self._export_passenger_assignments(
-            output_dir=output_dir_path,
+        partial_assignments = self._assignments_from_passenger_vars(
             passenger_vars=passenger_vars,
-            no_assignment_means_rejected=True,
             no_mt_line_key=no_mt_key,
             line_var_is_route_index=True,
+        )
+        request_assignments_list, assignments = self._resolve_and_export_request_assignments(
+            output_dir=output_dir_path,
+            request_assignments=partial_assignments,
+            no_assignment_handling=NoAssignmentHandling.REJECT,
+            no_mt_line_key=no_mt_key,
         )
 
         # self._solve_and_export_flows(
@@ -930,21 +953,6 @@ class LinePlanningSolver:
         selected_lines: List[int] = [
             rho for rho in range(nb_lines) if frequency_vars[rho].X > EPS
         ]
-
-        request_assignments_list: List[Tuple[str, Optional[int]]] = []
-        for p in range(request_count):
-            if passenger_vars[no_mt_key, p].X > EPS:
-                request_assignments_list.append(("no_MT", None))
-                continue
-            assigned_route: Optional[int] = None
-            for rho in range(nb_lines):
-                if (rho, p) in passenger_vars and passenger_vars[rho, p].X > EPS:
-                    assigned_route = rho
-                    break
-            if assigned_route is not None:
-                request_assignments_list.append(("line", assigned_route))
-            else:
-                request_assignments_list.append(("rejected", None))
 
         line_obj_val: Optional[float] = None
         mod_obj_val: Optional[float] = None
@@ -1146,6 +1154,255 @@ class LinePlanningSolver:
             "potential_line_passenger_combinations": potential_line_passenger_combinations,
         }
 
+    def _peak_batch_request_indices(self, max_wait_time: float) -> Tuple[List[int], int]:
+        beta = float(max_wait_time)
+        if beta <= 0 or not np.isfinite(beta):
+            raise ValueError(f"max_wait_time must be a positive finite number, got {max_wait_time!r}")
+
+        demand_df = self.line_instance.demand
+        request_count = self.line_instance.nb_pass
+        if "time" not in demand_df.columns:
+            raise ValueError("line_instance.demand must contain a 'time' column")
+        if len(demand_df) != request_count:
+            raise ValueError(
+                f"line_instance.demand has {len(demand_df)} rows, expected nb_pass={request_count}"
+            )
+
+        demand_times = demand_df["time"].to_numpy(dtype=np.float64, copy=False)
+        if not np.isfinite(demand_times).all():
+            raise ValueError("line_instance.demand['time'] contains NaN or infinite values")
+        batch_ids = np.floor(demand_times / beta).astype(np.int64, copy=False)
+        unique_batches, counts = np.unique(batch_ids, return_counts=True)
+        if unique_batches.size == 0:
+            return [], 0
+        peak_batch_id = int(unique_batches[int(np.argmax(counts))])
+        peak_indices = np.flatnonzero(batch_ids == peak_batch_id).astype(np.int32, copy=False)
+        return [int(p) for p in peak_indices], peak_batch_id
+
+    def _assign_remaining_requests_to_selected_routes(
+        self,
+        selected_routes: List[int],
+        fixed_assignments: Dict[int, Tuple[str, Optional[int]]],
+    ) -> List[Tuple[str, Optional[int]]]:
+        """
+        Build full-demand assignments after a peak-batch solve.
+
+        Requests fixed by the ILP keep their assignment. Other requests choose the cheapest
+        MoD-cost option among direct MoD and feasible options on selected routes. Equal costs
+        keep the earlier option, so direct MoD wins ties and route ties go to the lower index.
+        """
+        selected_routes_sorted = sorted(int(rho) for rho in selected_routes)
+        request_assignments: List[Tuple[str, Optional[int]]] = []
+        for p in range(self.line_instance.nb_pass):
+            fixed = fixed_assignments.get(p)
+            if fixed is not None:
+                request_assignments.append(fixed)
+                continue
+
+            best_assignment: Tuple[str, Optional[int]] = ("no_MT", None)
+            best_cost = float(self._direct_trip_mod_cost(p))
+            for rho in selected_routes_sorted:
+                if not self.line_instance.has_trip_option_on_line(p, rho):
+                    continue
+                route_cost = float(self.line_instance.trip_mod_cost_on_line(p, rho))
+                if route_cost < best_cost - EPS:
+                    best_cost = route_cost
+                    best_assignment = ("line", rho)
+            request_assignments.append(best_assignment)
+        return request_assignments
+
+    def solve_peak_batch_max_headway_ILP(
+        self,
+        export_model: bool = False,
+        export_solution: bool = False,
+        output_dir: Union[Path, str] = Path("."),
+        gurobi_log_file: Union[Path, str, None] = None,
+        max_route_frequency: Optional[int] = None,
+        max_wait_time: float = 300.0,
+    ) -> LineSelectionSolveResult:
+        """
+        Solve the peak-batch max-headway route-aggregated ILP from manuscript §4.2.1.
+
+        The ILP is built only over the largest request-time batch where the batch width is
+        ``max_wait_time``. After solving, requests outside the peak batch are assigned to
+        direct MoD or the cheapest feasible selected route by MoD cost, so downstream DARP
+        evaluation still receives one assignment per original request.
+        """
+        freq_ub = max_route_frequency if max_route_frequency is not None else self.max_frequency
+        max_wait_time = float(max_wait_time)
+
+        nb_lines = self.line_instance.nb_lines
+        request_count = self.line_instance.nb_pass
+        bus_capacity = self.line_instance.capacity
+        no_mt_key = nb_lines
+        peak_requests, peak_batch_id = self._peak_batch_request_indices(max_wait_time)
+        peak_request_set = set(peak_requests)
+
+        logging.info(
+            "Building peak-batch max-headway ILP (batch_id=%s, peak_size=%s, max_wait_time=%s)",
+            peak_batch_id,
+            len(peak_requests),
+            max_wait_time,
+        )
+
+        master = Model("Peak-batch max-headway ILP")
+        master.ModelSense = GRB.MINIMIZE
+        master.Params.timeLimit = self.time_limit
+
+        per_route_mt_cost_coeff = [
+            self.cost_coefficient * self.line_instance.lengths_travel_times[rho] for rho in range(nb_lines)
+        ]
+        frequency_vars = master.addVars(
+            nb_lines,
+            vtype=GRB.INTEGER,
+            lb=0,
+            ub=freq_ub,
+            name="y",
+        )
+
+        potential_line_passenger_combinations = [
+            (rho, p)
+            for (rho, p) in self.line_instance.positive_trip_value_pairs()
+            if p in peak_request_set
+        ]
+        passenger_vars = master.addVars(
+            potential_line_passenger_combinations,
+            vtype=GRB.BINARY,
+            obj=0,
+            name="x",
+        )
+        for p in peak_requests:
+            passenger_vars[no_mt_key, p] = master.addVar(
+                vtype=GRB.BINARY,
+                obj=0,
+                name="x[no_MT,%d]" % p,
+            )
+        master.update()
+
+        line_costs_expression = frequency_vars.prod(per_route_mt_cost_coeff)
+        mod_costs_for_obj: Dict[Any, float] = {
+            (rho, p): self.line_instance.trip_mod_cost_on_line(p, rho)
+            for (rho, p) in potential_line_passenger_combinations
+        }
+        for p in peak_requests:
+            mod_costs_for_obj[no_mt_key, p] = float(self._direct_trip_mod_cost(p))
+        mod_cost_expression = passenger_vars.prod(mod_costs_for_obj)
+        master.setObjective(line_costs_expression + mod_cost_expression, GRB.MINIMIZE)
+
+        master.addConstrs(
+            (passenger_vars.sum("*", p) == 1 for p in peak_requests),
+            name="one_option_per_peak_passenger",
+        )
+
+        route_travel_times = [
+            float(self.line_instance.lengths_travel_times[rho]) for rho in range(nb_lines)
+        ]
+        for rho, p in potential_line_passenger_combinations:
+            nu_rho = route_travel_times[rho] / max_wait_time
+            master.addConstr(
+                frequency_vars[rho] >= nu_rho * passenger_vars[rho, p],
+                name=f"max_headway[{rho},{p}]",
+            )
+
+        for rho in range(nb_lines):
+            length = self.line_instance.line_length(rho)
+            for k in range(length):
+                vars_list = []
+                coefs_list = []
+                for p in self.line_instance.edge_passengers(rho, k):
+                    if p in peak_request_set and (rho, int(p)) in passenger_vars:
+                        vars_list.append(passenger_vars[rho, int(p)])
+                        coefs_list.append(1)
+                if vars_list:
+                    master.addConstr(
+                        LinExpr(coefs_list, vars_list) <= bus_capacity * frequency_vars[rho],
+                        name="capacity_peak[%d][%d]" % (rho, k),
+                    )
+        master.update()
+
+        output_dir_path = Path(output_dir)
+        output_dir_path.mkdir(parents=True, exist_ok=True)
+
+        if gurobi_log_file is not None:
+            gurobi_log_path = Path(gurobi_log_file)
+            gurobi_log_path.parent.mkdir(parents=True, exist_ok=True)
+            master.Params.LogFile = str(gurobi_log_path)
+
+        if export_model:
+            master.write(str(output_dir_path / "Peak_batch_max_headway_ILP.lp"))
+
+        t0 = time.time()
+        master.optimize()
+        t1 = time.time()
+
+        logging.info("Execution time: %s", t1 - t0)
+        logging.info("Final solution (peak-batch total cost): %s", master.ObjVal)
+
+        if export_solution:
+            master.write(str(output_dir_path / "Peak_batch_max_headway_ILP.sol"))
+
+        selected_lines = [
+            rho for rho in range(nb_lines) if frequency_vars[rho].X > EPS
+        ]
+
+        fixed_assignments: Dict[int, Tuple[str, Optional[int]]] = {}
+        for p in peak_requests:
+            if passenger_vars[no_mt_key, p].X > EPS:
+                fixed_assignments[p] = ("no_MT", None)
+                continue
+            assigned_route: Optional[int] = None
+            for rho in range(nb_lines):
+                if (rho, p) in passenger_vars and passenger_vars[rho, p].X > EPS:
+                    assigned_route = rho
+                    break
+            fixed_assignments[p] = ("line", assigned_route) if assigned_route is not None else ("no_MT", None)
+
+        request_assignments_list = self._assign_remaining_requests_to_selected_routes(
+            selected_lines,
+            fixed_assignments,
+        )
+
+        self._export_used_lines_route_agg(
+            output_dir=output_dir_path,
+            frequency_vars=frequency_vars,
+            per_route_mt_cost_coeff=per_route_mt_cost_coeff,
+        )
+        request_assignments_list, _assignments = self._resolve_and_export_request_assignments(
+            output_dir=output_dir_path,
+            request_assignments=request_assignments_list,
+            no_assignment_handling=NoAssignmentHandling.RAISE,
+            no_mt_line_key=no_mt_key,
+        )
+
+        peak_info = {
+            "peak_batch_id": peak_batch_id,
+            "peak_batch_size": len(peak_requests),
+            "max_wait_time": max_wait_time,
+            "batch_request_indices": peak_requests,
+        }
+        try:
+            (output_dir_path / "peak_batch_info.json").write_text(json.dumps(peak_info, indent=2))
+        except OSError as exc:
+            logging.warning("Unable to write peak batch info JSON: %s", exc)
+
+        line_obj_val: Optional[float] = None
+        mod_obj_val: Optional[float] = None
+        try:
+            line_obj_val = float(line_costs_expression.getValue())
+            mod_obj_val = float(mod_cost_expression.getValue())
+            obj_v = float(master.ObjVal)
+        except (GurobiError, AttributeError, TypeError, ValueError):
+            obj_v = float("nan")
+
+        return LineSelectionSolveResult(
+            objective_value=obj_v,
+            run_time_seconds=float(t1 - t0),
+            selected_lines=selected_lines,
+            request_assignments=tuple(request_assignments_list),
+            line_objective_component=line_obj_val,
+            mod_objective_component=mod_obj_val,
+        )
+
     def solve_MoD_aware_ILP(
         self,
         export_model: bool = False,
@@ -1306,13 +1563,19 @@ class LinePlanningSolver:
         )
 
         rej_vars_map = {p: rej_vars[p] for p in range(request_count)} if rej_vars is not None else None
-        assignments = self._export_passenger_assignments(
-            output_dir=output_dir_path,
+        partial_assignments = self._assignments_from_passenger_vars(
             passenger_vars=passenger_vars,
             no_mt_line_key=no_mt_key,
             line_var_is_route_index=True,
             rejection_vars=rej_vars_map,
-            rejection_unit_cost=rej_penalty if allow_rejection else None,
+        )
+        request_assignments_list, assignments = self._resolve_and_export_request_assignments(
+            output_dir=output_dir_path,
+            request_assignments=partial_assignments,
+            no_assignment_handling=NoAssignmentHandling.REJECT
+            if allow_rejection
+            else NoAssignmentHandling.RAISE,
+            no_mt_line_key=no_mt_key,
         )
 
         # self._solve_and_export_flows(
@@ -1323,20 +1586,6 @@ class LinePlanningSolver:
         selected_lines = [
             rho for rho in range(nb_lines) if frequency_vars[rho].X > EPS
         ]
-        request_assignments_list: List[Tuple[str, Optional[int]]] = []
-        for p in range(request_count):
-            if allow_rejection and rej_vars is not None and rej_vars[p].X > EPS:
-                request_assignments_list.append(("rejected", None))
-            elif passenger_vars[no_mt_key, p].X > EPS:
-                request_assignments_list.append(("no_MT", None))
-            else:
-                assigned_route = None
-                for rho in range(nb_lines):
-                    if (rho, p) in passenger_vars and passenger_vars[rho, p].X > EPS:
-                        assigned_route = rho
-                        break
-                request_assignments_list.append(("line", assigned_route))
-
         try:
             obj_v = float(master.ObjVal)
         except (GurobiError, TypeError, ValueError):
@@ -1523,9 +1772,13 @@ class LinePlanningSolver:
             line_costs=line_costs,
         )
 
-        assignments = self._export_passenger_assignments(
-            output_dir=output_dir_path,
+        partial_assignments = self._assignments_from_passenger_vars(
             passenger_vars=passenger_vars,
+        )
+        _request_assignments, assignments = self._resolve_and_export_request_assignments(
+            output_dir=output_dir_path,
+            request_assignments=partial_assignments,
+            no_assignment_handling=NoAssignmentHandling.REJECT,
         )
 
         flows = {
@@ -1674,6 +1927,25 @@ def _ilp_budget_rhs(budget: Optional[float]) -> float:
     return float(budget)
 
 
+def _parse_max_travel_time_delay_seconds(raw: Dict[str, Any], experiment_config_path: Path) -> int:
+    mtd = raw.get("max_travel_time_delay")
+    if isinstance(mtd, dict) and mtd:
+        mode_raw = mtd.get("mode", "absolute")
+        mode = str(mode_raw).strip().lower()
+        if mode != "absolute":
+            raise ValueError(
+                f"{experiment_config_path}: max_travel_time_delay.mode must be 'absolute', got {mode_raw!r}."
+            )
+        sec_raw = mtd.get("seconds")
+        if sec_raw is None:
+            raise ValueError(
+                f"{experiment_config_path}: max_travel_time_delay.seconds is required when "
+                "max_travel_time_delay is set."
+            )
+        return int(sec_raw)
+    return 300
+
+
 def run_experiment(experiment_config_path: Path) -> None:
     """
     Run one line-planning experiment from a YAML file.
@@ -1693,7 +1965,8 @@ def run_experiment(experiment_config_path: Path) -> None:
     skipped if that file already exists).
 
     The ``solver`` block must set ``method`` to exactly one of:
-    ``approximation``, ``ilp``, ``ilp_with_mod_costs``, ``ilp_with_empty_trips``, ``non_budget_ilp``.
+    ``approximation``, ``ilp``, ``ilp_with_mod_costs``, ``ilp_with_empty_trips``,
+    ``non_budget_ilp``, ``peak_batch_max_headway_ilp``.
     Optional ``solver.time_limit`` (seconds) is passed to ``LinePlanningSolver`` (Gurobi time limit;
     default ``86400``).
 
@@ -1717,6 +1990,7 @@ def run_experiment(experiment_config_path: Path) -> None:
     use_request_line_valid_inequalities = _parse_yaml_bool(
         solver_cfg.get("use_request_line_valid_inequalities"), default=False
     )
+    max_travel_time_delay_seconds = _parse_max_travel_time_delay_seconds(exp, experiment_config_path)
 
     solver_method = _resolve_solver_method(solver_cfg)
 
@@ -1833,6 +2107,24 @@ def run_experiment(experiment_config_path: Path) -> None:
             run_time_sec = lsr.run_time_seconds
             line_obj_component = lsr.line_objective_component
             mod_obj_component = lsr.mod_objective_component
+        elif solver_method == "peak_batch_max_headway_ilp":
+            logging.info(
+                "Running solver.method=peak_batch_max_headway_ilp (max_wait_time=%s, max_route_frequency=%s)",
+                max_travel_time_delay_seconds,
+                max_frequency,
+            )
+            lsr = solver.solve_peak_batch_max_headway_ILP(
+                export_model=True,
+                export_solution=True,
+                output_dir=base_results_directory,
+                gurobi_log_file=gurobi_log_path,
+                max_route_frequency=max_frequency,
+                max_wait_time=max_travel_time_delay_seconds,
+            )
+            obj_val = lsr.objective_value
+            run_time_sec = lsr.run_time_seconds
+            line_obj_component = lsr.line_objective_component
+            mod_obj_component = lsr.mod_objective_component
         else:
             raise AssertionError("unreachable solver_method")
     finally:
@@ -1858,6 +2150,8 @@ def run_experiment(experiment_config_path: Path) -> None:
             results_payload["rejection_cost"] = rejection_cost_cfg
         if use_request_line_valid_inequalities:
             results_payload["use_request_line_valid_inequalities"] = True
+    if solver_method == "peak_batch_max_headway_ilp":
+        results_payload["max_wait_time"] = max_travel_time_delay_seconds
     if budget is not None:
         results_payload["budget"] = budget
     results_file = base_results_directory / "metrics.json"

@@ -36,7 +36,7 @@ Computed trip-option preprocessing (CSV) is stored under a ``preprocessing`` fol
     - `line_mod_aggregate_prune`: if true, prune line-mod aggregate trip options. Default is false.
 
 - `solver`: solver driver configuration.
-    - `method` (required): one of `approximation`, `ilp`, `ilp_with_mod_costs`, `ilp_with_empty_trips`, `non_budget_ilp`.
+    - `method` (required): one of `approximation`, `ilp`, `ilp_with_mod_costs`, `ilp_with_empty_trips`, `non_budget_ilp`, `peak_batch_max_headway_ilp`.
     - `time_limit` (seconds): Gurobi time limit (default `86400`).
     - `approximation_subproblem_method` (optional int): Gurobi `Method` for each column-generation sub-MIP when `method` is `approximation`; omit or `0` for default.
     - `rejection_cost`: cost of rejecting a passenger. Applicable only when `method` is `non_budget_ilp`. Default is 0, which means that all passengers must be served.
@@ -52,6 +52,7 @@ Supported `solver.method` values:
 - `ilp_with_mod_costs`: ILP with MoD cost model (stage 1).
 - `ilp_with_empty_trips`: ILP with empty-vehicle trips (stage 2).
 - `non_budget_ilp`: MoD-aware route-aggregated ILP without a line budget (same formulation as in `scripts/MoD-aware_line_selection.py`).
+- `peak_batch_max_headway_ilp`: MoD-aware peak-batch max-headway ILP (§4.2.1); uses `max_travel_time_delay.seconds` as the MT maximum wait / batch size and assigns non-peak requests after the ILP to direct MoD or the cheapest selected route by MoD cost.
 
 ## MoD-aware Line Selection Experiment Files
 MoD-aware line selection experiment files are `yaml` files used to configure the iterative line selection process. Because each iteration encompases solving both the line selection and DARP problem, the experiment is an extension of the [Experiment Files](#experiment-files) described above. The extension fields are:
