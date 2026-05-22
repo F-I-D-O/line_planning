@@ -67,16 +67,22 @@ def _load_original_od_pairs(demand_file: Path) -> List[Tuple[int, int]]:
     if demand_file.suffix.lower() == ".txt":
         with demand_file.open("r", encoding="utf-8") as f:
             my_list = [line.split() for line in f if line.strip()]
+        pairs_arr = None
     else:
-        my_list = _load_demand_from_csv(demand_file)
+        pairs_arr = _load_demand_from_csv(demand_file)
+        my_list = []
 
     pairs: List[Tuple[int, int]] = []
-    for row in my_list:
-        if len(row) < 2:
-            continue
-        o = int(float(row[0].strip()))
-        d = int(float(row[1].strip()))
-        pairs.append((o, d))
+    if pairs_arr is not None:
+        for o, d in pairs_arr:
+            pairs.append((int(o), int(d)))
+    else:
+        for row in my_list:
+            if len(row) < 2:
+                continue
+            o = int(float(row[0].strip()))
+            d = int(float(row[1].strip()))
+            pairs.append((o, d))
     return pairs
 
 

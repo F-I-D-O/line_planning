@@ -25,7 +25,7 @@ import lineplanning.log
 # ox.config(log_console=True, use_cache=True)
 
 
-def _load_demand_from_csv(demand_file: Path) -> List[List[str]]:
+def _load_demand_from_csv(demand_file: Path) -> np.ndarray:
     """
     Load demand data from a CSV file.
     
@@ -33,7 +33,7 @@ def _load_demand_from_csv(demand_file: Path) -> List[List[str]]:
         demand_file: Path to the CSV file
         
     Returns:
-        List of lists where each inner list contains [origin, dest] as strings
+        NumPy array with shape (n_requests, 2), columns [origin, dest].
     """
     logging.info('Loading demand from CSV file %s', demand_file)
     try:
@@ -60,11 +60,13 @@ def _load_demand_from_csv(demand_file: Path) -> List[List[str]]:
     
     logging.info('Found origin column: %s, dest column: %s', origin_col, dest_col)
     
-    # Extract origin and dest columns, convert to string, and return as list of lists
-    my_list = [[str(row[origin_col]), str(row[dest_col])] for _, row in df.iterrows()]
+    try:
+        demand = df[[origin_col, dest_col]].astype(np.int32, copy=False).to_numpy(copy=True)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Failed to convert demand columns in {demand_file} to integers: {exc}")
     
-    logging.info('Loaded %d demand records from CSV', len(my_list))
-    return my_list
+    logging.info('Loaded %d demand records from CSV', len(demand))
+    return demand
 
 
 def preprocessing_csv_path(
@@ -325,15 +327,15 @@ class line_instance:
 
     def _direct_trip_options_df_from_distances(
         self,
-        passengers: List[List[int]],
+        passengers: np.ndarray,
         distances: np.ndarray,
     ) -> pd.DataFrame:
         nb_pass = len(passengers)
         if nb_pass == 0:
             return self._empty_trip_options_df()
         passenger_idx = np.arange(nb_pass, dtype=self._PREPROCESSING_CSV_DTYPES["passenger_idx"])
-        origins = np.asarray([p[0] for p in passengers], dtype=np.int64)
-        destinations = np.asarray([p[1] for p in passengers], dtype=np.int64)
+        origins = passengers[:, 0].astype(np.int64, copy=False)
+        destinations = passengers[:, 1].astype(np.int64, copy=False)
         direct_costs = distances[origins, destinations].astype(
             self._PREPROCESSING_CSV_DTYPES["first_mile_cost"],
             copy=False,
@@ -605,7 +607,7 @@ class line_instance:
     def _load_preprocessing_cache(
         self,
         cache_path: Path,
-        passengers: List[List[int]],
+        passengers: np.ndarray,
         distances: np.ndarray,
         nb_pass: int,
         nb_lines: int,
@@ -648,7 +650,7 @@ class line_instance:
         list,
         list,
         np.ndarray,
-        List[List[int]],
+        np.ndarray,
     ]:
         # TODO handle the case where remaining stops pop in skeleton method
 
@@ -662,11 +664,18 @@ class line_instance:
 
         logging.info('Loading demand')
         if self.demand_file.suffix == '.txt':
-            my_list = [line.split(' ') for line in open(self.demand_file, 'r')]  # use the demand file provided
+            with open(self.demand_file, 'r') as f:
+                passengers = np.asarray(
+                    [
+                        [int(float(i.strip())) for i in line.split()[:2]]
+                        for line in f
+                        if line.strip()
+                    ],
+                    dtype=np.int32,
+                )
         else:
-            my_list = _load_demand_from_csv(self.demand_file)
+            passengers = _load_demand_from_csv(self.demand_file)
 
-        passengers: List[List[int]] = [[int(float(i.strip())) for i in my_list[j]] for j in range(len(my_list))]
         self.nb_pass = len(passengers)
         logging.info('Demand loaded')
 
@@ -778,7 +787,7 @@ class line_instance:
         )
 
     def preprocessing(
-        self, candidate_set_of_lines, passengers: List[List[int]], travel_times_on_lines, distances, maximum_detour, nb_pass
+        self, candidate_set_of_lines, passengers: np.ndarray, travel_times_on_lines, distances, maximum_detour, nb_pass
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         logging.info('Preprocessing optimal trip options')
         nb_lines = len(candidate_set_of_lines)
