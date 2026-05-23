@@ -1,11 +1,13 @@
+import json
 import logging
 import random
 import re
 import hashlib
 from array import array
 from copy import deepcopy
+from numbers import Real
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Any, Dict, Optional, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -129,21 +131,98 @@ def preprocessing_csv_path(
     return cache_dir / filename
 
 
-def line_mod_aggregate_prune_csv_path(
+def trip_option_pruning_csv_path(
     base_preprocessing_csv: Path,
-    cost_coefficient: float,
-    rejection_cost: Optional[float] = None,
+    pruning_specs: List[Dict[str, Any]],
 ) -> Path:
-    """
-    Path to the trip-options CSV after ``line mod aggregate`` pruning (see
-    :func:`prune_trip_options_line_mod_aggregate`). The hash includes the base cache path
-    and cost coefficient so changing either selects a distinct cache file.
-    """
     base = Path(base_preprocessing_csv).resolve()
-    rej_key = "none" if rejection_cost is None else repr(float(rejection_cost))
-    key = f"{base}|line_mod_agg_prune_v2|cc={cost_coefficient!r}|rej={rej_key}"
-    short_hash = hashlib.md5(key.encode()).hexdigest()[:12]
-    return base.with_name(f"{base.stem}_modagg_pruned_{short_hash}.csv")
+    key = json.dumps(pruning_specs, sort_keys=True, separators=(",", ":"))
+    short_hash = hashlib.md5(f"{base}|trip_option_pruning_v1|{key}".encode()).hexdigest()[:12]
+    return base.with_name(f"{base.stem}_pruned_{short_hash}.csv")
+
+
+def normalize_trip_option_pruning_specs(
+    pruning_specs: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    if pruning_specs is None:
+        return []
+    if not isinstance(pruning_specs, list):
+        raise ValueError("trip_option_pruning must be a list of pruning method objects")
+
+    normalized = []
+    for idx, raw_spec in enumerate(pruning_specs):
+        if not isinstance(raw_spec, dict):
+            raise ValueError(f"trip_option_pruning[{idx}] must be an object")
+        method = raw_spec.get("method")
+        if not isinstance(method, str) or not method.strip():
+            raise ValueError(f"trip_option_pruning[{idx}].method must be a non-empty string")
+        method = method.strip()
+
+        if method == "mt_time_share":
+            if "min_share" not in raw_spec:
+                raise ValueError(f"trip_option_pruning[{idx}].min_share is required for mt_time_share")
+            min_share = raw_spec["min_share"]
+            if isinstance(min_share, bool) or not isinstance(min_share, Real):
+                raise ValueError(f"trip_option_pruning[{idx}].min_share must be a float in [0, 1]")
+            min_share = float(min_share)
+            if not (0.0 <= min_share <= 1.0):
+                raise ValueError(f"trip_option_pruning[{idx}].min_share must be in [0, 1], got {min_share}")
+            normalized.append({"method": method, "min_share": min_share})
+            continue
+
+        if method == "line_mod_aggregate":
+            if "cost_coefficient" not in raw_spec:
+                raise ValueError(
+                    f"trip_option_pruning[{idx}].cost_coefficient is required for line_mod_aggregate"
+                )
+            cost_coefficient = raw_spec["cost_coefficient"]
+            if isinstance(cost_coefficient, bool) or not isinstance(cost_coefficient, Real):
+                raise ValueError(f"trip_option_pruning[{idx}].cost_coefficient must be numeric")
+            cost_coefficient = float(cost_coefficient)
+
+            rejection_cost = raw_spec.get("rejection_cost")
+            if rejection_cost is not None:
+                if isinstance(rejection_cost, bool) or not isinstance(rejection_cost, Real):
+                    raise ValueError(f"trip_option_pruning[{idx}].rejection_cost must be numeric or null")
+                rejection_cost = float(rejection_cost)
+            normalized.append(
+                {
+                    "method": method,
+                    "cost_coefficient": cost_coefficient,
+                    "rejection_cost": rejection_cost,
+                }
+            )
+            continue
+
+        raise ValueError(f"Unknown trip option pruning method {method!r} at index {idx}")
+
+    return normalized
+
+
+def prune_trip_options_mt_time_share(
+    optimal_trip_options: pd.DataFrame,
+    min_share: float,
+) -> Tuple[pd.DataFrame, int]:
+    if optimal_trip_options.empty:
+        return optimal_trip_options.copy(), 0
+
+    mt_time = optimal_trip_options["mt_cost"].to_numpy(dtype=np.float64, copy=False)
+    total_time = (
+        optimal_trip_options["first_mile_cost"].to_numpy(dtype=np.float64, copy=False)
+        + mt_time
+        + optimal_trip_options["last_mile_cost"].to_numpy(dtype=np.float64, copy=False)
+    )
+    share = np.divide(
+        mt_time,
+        total_time,
+        out=np.zeros(len(optimal_trip_options), dtype=np.float64),
+        where=total_time > 0.0,
+    )
+    keep = share >= float(min_share)
+    if bool(keep.all()):
+        return optimal_trip_options.copy(), 0
+    pruned = optimal_trip_options.loc[keep].copy()
+    return pruned.reset_index(drop=True), int((~keep).sum())
 
 
 def prune_trip_options_line_mod_aggregate(
@@ -218,9 +297,7 @@ class line_instance:
         demand_file=None,
         preprocessing_dir=None,
         dm_file=None,
-        line_mod_aggregate_prune: bool = False,
-        line_mod_aggregate_prune_cost_coefficient: float = 1.0,
-        line_mod_aggregate_prune_rejection_cost: Optional[float] = None,
+        trip_option_pruning: Optional[List[Dict[str, Any]]] = None,
     ):
         self.B = None
         self.candidate_set_of_lines = None  # candidate_set_of_lines[l] contains the nodes served by line l (only useful when building instance from real network)
@@ -241,13 +318,7 @@ class line_instance:
             self.preprocessing_dir = Path(candidate_lines_file).parent / "preprocessing"
         self.dm_file = Path(dm_file) if dm_file is not None else Path("dm.h5")
         self.nb_pass: Optional[int] = None
-        self._line_mod_aggregate_prune = bool(line_mod_aggregate_prune)
-        self._line_mod_aggregate_prune_cost_coefficient = float(line_mod_aggregate_prune_cost_coefficient)
-        self._line_mod_aggregate_prune_rejection_cost = (
-            None
-            if line_mod_aggregate_prune_rejection_cost is None
-            else float(line_mod_aggregate_prune_rejection_cost)
-        )
+        self.trip_option_pruning = normalize_trip_option_pruning_specs(trip_option_pruning)
 
         # Store candidate line file path
         self.candidate_line_file = Path(candidate_lines_file)
@@ -676,6 +747,51 @@ class line_instance:
             return
         logging.info("Stored preprocessing data to cache %s", cache_path)
 
+    def _apply_trip_option_pruning(
+        self,
+        optimal_trip_options: pd.DataFrame,
+        direct_trip_options: pd.DataFrame,
+        lengths_travel_times: List[float],
+        nb_lines: int,
+    ) -> pd.DataFrame:
+        for spec in self.trip_option_pruning:
+            method = spec["method"]
+            before = len(optimal_trip_options)
+            if method == "mt_time_share":
+                optimal_trip_options, removed_count = prune_trip_options_mt_time_share(
+                    optimal_trip_options,
+                    spec["min_share"],
+                )
+                logging.info(
+                    "MT-time-share prune removed %s/%s trip options with min_share=%s",
+                    removed_count,
+                    before,
+                    spec["min_share"],
+                )
+            elif method == "line_mod_aggregate":
+                line_opening_costs = [
+                    spec["cost_coefficient"] * float(lengths_travel_times[l])
+                    for l in range(nb_lines)
+                ]
+                optimal_trip_options, removed_routes = prune_trip_options_line_mod_aggregate(
+                    optimal_trip_options,
+                    direct_trip_options,
+                    nb_lines,
+                    line_opening_costs,
+                    rejection_cost=spec["rejection_cost"],
+                )
+                logging.info(
+                    "Line-mod-aggregate prune removed %s routes and %s/%s trip options",
+                    len(removed_routes),
+                    before - len(optimal_trip_options),
+                    before,
+                )
+                if removed_routes:
+                    logging.info("Line-mod-aggregate pruned routes: %s", removed_routes)
+            else:
+                raise AssertionError(f"Unexpected pruning method {method!r}")
+        return optimal_trip_options
+
     def manhattan_instance(self, maximum_detour) -> Tuple[
         pd.DataFrame,
         pd.DataFrame,
@@ -775,12 +891,9 @@ class line_instance:
             for l in range(len(candidate_set_of_lines))
         ]
 
-        if self._line_mod_aggregate_prune:
-            prune_path = line_mod_aggregate_prune_csv_path(
-                cache_path,
-                self._line_mod_aggregate_prune_cost_coefficient,
-                rejection_cost=self._line_mod_aggregate_prune_rejection_cost,
-            )
+        if self.trip_option_pruning:
+            prune_path = trip_option_pruning_csv_path(cache_path, self.trip_option_pruning)
+            pruned_bundle = None
             if prune_path.exists():
                 pruned_bundle = self._load_preprocessing_cache(
                     prune_path,
@@ -791,7 +904,7 @@ class line_instance:
                 )
                 if pruned_bundle is None:
                     logging.warning(
-                        "Failed to load line-mod-aggregate pruned cache %s; using unpruned trip options",
+                        "Failed to load trip-option pruning cache %s; recomputing pruning",
                         prune_path,
                     )
                 else:
@@ -800,27 +913,21 @@ class line_instance:
                         direct_trip_options,
                     ) = pruned_bundle
                     logging.info(
-                        "Loaded line-mod-aggregate pruned trip options from %s",
+                        "Loaded pruned trip options from %s",
                         prune_path,
                     )
-            else:
-                line_opening_costs = [
-                    self._line_mod_aggregate_prune_cost_coefficient * float(lengths_travel_times[l])
-                    for l in range(nb_lines)
-                ]
-                optimal_trip_options, removed_routes = prune_trip_options_line_mod_aggregate(
+            if pruned_bundle is None:
+                optimal_trip_options = self._apply_trip_option_pruning(
                     optimal_trip_options,
                     direct_trip_options,
+                    lengths_travel_times,
                     nb_lines,
-                    line_opening_costs,
-                    rejection_cost=self._line_mod_aggregate_prune_rejection_cost,
                 )
-                if removed_routes:
-                    logging.info(
-                        "Line-mod-aggregate prune discarded routes %s (saving %s)",
-                        removed_routes,
-                        prune_path,
-                    )
+                logging.info(
+                    "Saving pruned trip options after %s pruning steps to %s",
+                    len(self.trip_option_pruning),
+                    prune_path,
+                )
                 self._save_preprocessing_cache(prune_path, optimal_trip_options)
 
         return (

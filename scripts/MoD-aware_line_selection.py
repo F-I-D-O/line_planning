@@ -37,7 +37,9 @@ Example ``experiment.yaml``::
       max_frequency: 20
       capacity: 30
       maximum_detour: 3
-      line_mod_aggregate_prune: false
+      pruning:
+        - method: mt_time_share
+          min_share: 0.3
 
     darp:
       benchmark_executable: C:/path/to/DARP-benchmark  # optional; default: DARP_BENCHMARK_PATH / env
@@ -825,7 +827,7 @@ class ModAwareLineSelectionConfig:
     max_frequency: int
     capacity: int
     maximum_detour: Any
-    line_mod_aggregate_prune: bool
+    trip_option_pruning: List[Dict[str, Any]]
     darp_benchmark_executable: Path
     transfer_delay: int
     darp_vehicle_capacity: int
@@ -950,7 +952,10 @@ def build_mod_aware_line_selection_config(
     max_frequency_cfg = int(mt.get("max_frequency", 20))
     capacity = int(mt.get("capacity", 30))
     maximum_detour = mt.get("maximum_detour", 3)
-    line_mod_aggregate_prune = _parse_yaml_bool(mt.get("line_mod_aggregate_prune"), default=False)
+    try:
+        trip_option_pruning = lineplanning.instance.normalize_trip_option_pruning_specs(mt.get("pruning"))
+    except ValueError as exc:
+        raise ValueError(f"{experiment_yaml_path}: invalid mass_transport.pruning: {exc}") from exc
 
     darp_exe = darp.get("benchmark_executable")
     if darp_exe is None or (isinstance(darp_exe, str) and not str(darp_exe).strip()):
@@ -1059,7 +1064,7 @@ def build_mod_aware_line_selection_config(
         max_frequency=max_frequency_cfg,
         capacity=capacity,
         maximum_detour=maximum_detour,
-        line_mod_aggregate_prune=line_mod_aggregate_prune,
+        trip_option_pruning=trip_option_pruning,
         darp_benchmark_executable=darp_benchmark_executable,
         transfer_delay=transfer_delay,
         darp_vehicle_capacity=darp_vehicle_capacity,
@@ -2167,7 +2172,6 @@ def main() -> None:
     logging.info("Results directory: %s", cfg.results_dir)
     logging.info("DARP benchmark executable: %s", cfg.darp_benchmark_executable)
 
-    prune_rej = cfg.rejection_cost if cfg.rejection_cost > 0 else None
     line_inst = lineplanning.instance.line_instance(
         candidate_lines_file=inst.lines_file,
         capacity=cfg.capacity,
@@ -2175,9 +2179,7 @@ def main() -> None:
         demand_file=demand_file,
         preprocessing_dir=preprocessing_dir,
         dm_file=dm_file,
-        line_mod_aggregate_prune=cfg.line_mod_aggregate_prune,
-        line_mod_aggregate_prune_cost_coefficient=cfg.cost_coefficient,
-        line_mod_aggregate_prune_rejection_cost=prune_rej,
+        trip_option_pruning=cfg.trip_option_pruning,
     )
 
     if cfg.initial_mod_cost_scale != 1.0:

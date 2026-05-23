@@ -1958,11 +1958,8 @@ def run_experiment(experiment_config_path: Path) -> None:
 
     ``mass_transport.cost_coefficient`` scales line operating cost in the ILP (default ``1``).
     ``mass_transport.max_frequency`` is the per-route replication / frequency cap (default ``1``).
-    Optional ``mass_transport.line_mod_aggregate_prune`` (default ``false``): after base trip-option
-    preprocessing, drop any route ρ where the sum of first+last mile costs over passengers with an
-    option on ρ plus ``cost_coefficient * line_length`` exceeds the sum of direct OD costs for those
-    passengers; pruned trip options are cached next to the base preprocessing CSV (separate file;
-    skipped if that file already exists).
+    Optional ``mass_transport.pruning`` is an ordered list of trip-option pruning method objects.
+    Supported methods are ``mt_time_share`` and ``line_mod_aggregate``.
 
     The ``solver`` block must set ``method`` to exactly one of:
     ``approximation``, ``ilp``, ``ilp_with_mod_costs``, ``ilp_with_empty_trips``,
@@ -1997,9 +1994,10 @@ def run_experiment(experiment_config_path: Path) -> None:
     mt = dict(exp.get("mass_transport") or {})
     cost_coefficient = float(mt.get("cost_coefficient", 1))
     max_frequency = int(mt.get("max_frequency", 1))
-    line_mod_aggregate_prune = _parse_yaml_bool(
-        mt.get("line_mod_aggregate_prune"), default=False
-    )
+    try:
+        trip_option_pruning = lineplanning.instance.normalize_trip_option_pruning_specs(mt.get("pruning"))
+    except ValueError as exc:
+        raise ValueError(f"{experiment_config_path}: invalid mass_transport.pruning: {exc}") from exc
 
     preprocessing_dir = inst.config_path.parent / "preprocessing"
     line_inst = line_instance(
@@ -2009,9 +2007,7 @@ def run_experiment(experiment_config_path: Path) -> None:
         demand_file=inst.demand_file,
         preprocessing_dir=preprocessing_dir,
         dm_file=inst.dm_file,
-        line_mod_aggregate_prune=line_mod_aggregate_prune,
-        line_mod_aggregate_prune_cost_coefficient=cost_coefficient,
-        line_mod_aggregate_prune_rejection_cost=rejection_cost_cfg if rejection_cost_cfg > 0 else None,
+        trip_option_pruning=trip_option_pruning,
     )
 
     budget = _parse_optional_budget(exp.get("budget"))
