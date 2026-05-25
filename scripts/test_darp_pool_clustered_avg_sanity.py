@@ -19,6 +19,8 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from lineplanning.instance import line_instance as LineInstance
+
 
 def _load_mod_aware():
     path = Path(__file__).resolve().parent / "MoD-aware_line_selection.py"
@@ -63,6 +65,24 @@ def main() -> None:
     assert mod._pool_id_for_leg(line_inst, pool_df, 0, None, mod.DARP_POOL_LEG_NO_MT) == 0
     assert mod._pool_id_for_leg(line_inst, pool_df, 0, 0, mod.DARP_POOL_LEG_FIRST_MILE) == 1
     assert mod._pool_id_for_leg(line_inst, pool_df, 0, 0, mod.DARP_POOL_LEG_LAST_MILE) == 2
+
+    lookup_inst = LineInstance.__new__(LineInstance)
+    lookup_inst.nb_lines = 4
+    lookup_inst._line_position_cache = {}
+    lookup_inst.optimal_trip_options = pd.DataFrame(
+        {
+            "passenger_idx": np.asarray([1, 0, 0], dtype=np.int32),
+            "line_idx": np.asarray([0, 2, 1], dtype=np.int32),
+        }
+    )
+    lookup_inst.optimal_trip_options = lookup_inst._sort_trip_options_for_lookup(
+        lookup_inst.optimal_trip_options
+    )
+    lookup_inst._rebuild_trip_option_index()
+    assert lookup_inst.trip_option_position(0, 1) == 0
+    assert lookup_inst.trip_option_position(0, 2) == 1
+    assert lookup_inst.has_trip_option_on_line(1, 0)
+    assert lookup_inst.trip_options_for_passenger(0)["line_idx"].tolist() == [1, 2]
 
     class FakePoolLineInstance(FakeLineInstance):
         nb_pass = 1

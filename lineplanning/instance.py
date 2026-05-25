@@ -506,6 +506,14 @@ class line_instance:
                 columns[column] = np.asarray([], dtype=self._PREPROCESSING_CSV_DTYPES[column])
         return pd.DataFrame(columns, columns=self._PREPROCESSING_CSV_COLUMNS)
 
+    def _sort_trip_options_for_lookup(self, trip_options: pd.DataFrame) -> pd.DataFrame:
+        if trip_options.empty:
+            return trip_options.copy()
+        return trip_options.sort_values(
+            ["passenger_idx", "line_idx"],
+            kind="mergesort",
+        ).reset_index(drop=True)
+
     def _rebuild_trip_option_index(self) -> None:
         self._line_position_cache = {}
         if self.optimal_trip_options.empty:
@@ -515,7 +523,8 @@ class line_instance:
         lines = self.optimal_trip_options["line_idx"].to_numpy(dtype=np.int64, copy=False)
         self._trip_option_keys = passengers * int(self.nb_lines) + lines
 
-    def _trip_option_row_position(self, passenger_idx: int, line_idx: int) -> Optional[int]:
+    def trip_option_position(self, passenger_idx: int, line_idx: int) -> Optional[int]:
+        """Zero-based row position of the feasible trip option in ``optimal_trip_options``."""
         if self._trip_option_keys.size == 0:
             return None
         key = int(passenger_idx) * int(self.nb_lines) + int(line_idx)
@@ -525,15 +534,11 @@ class line_instance:
         return pos
 
     def has_trip_option_on_line(self, passenger_idx: int, line_idx: int) -> bool:
-        return self._trip_option_row_position(passenger_idx, line_idx) is not None
-
-    def trip_option_position(self, passenger_idx: int, line_idx: int) -> Optional[int]:
-        """Zero-based row position of the feasible trip option in ``optimal_trip_options``."""
-        return self._trip_option_row_position(passenger_idx, line_idx)
+        return self.trip_option_position(passenger_idx, line_idx) is not None
 
     def trip_option_row(self, passenger_idx: int, line_idx: int) -> Optional[pd.Series]:
         """Feasible mass-transit option row for (passenger, candidate line), or None."""
-        pos = self._trip_option_row_position(passenger_idx, line_idx)
+        pos = self.trip_option_position(passenger_idx, line_idx)
         if pos is None:
             return None
         return self.optimal_trip_options.iloc[pos]
@@ -571,13 +576,13 @@ class line_instance:
             df.iat[p, df.columns.get_loc("mt_cost")] = float(mt_cost)
 
     def trip_value_on_line(self, passenger_idx: int, line_idx: int) -> float:
-        pos = self._trip_option_row_position(passenger_idx, line_idx)
+        pos = self.trip_option_position(passenger_idx, line_idx)
         if pos is None:
             return 0.0
         return float(self.optimal_trip_options.iat[pos, self.optimal_trip_options.columns.get_loc("value")])
 
     def trip_mod_cost_on_line(self, passenger_idx: int, line_idx: int) -> float:
-        pos = self._trip_option_row_position(passenger_idx, line_idx)
+        pos = self.trip_option_position(passenger_idx, line_idx)
         if pos is None:
             return 0.0
         df = self.optimal_trip_options
@@ -586,7 +591,7 @@ class line_instance:
         )
 
     def trip_costs_on_line(self, passenger_idx: int, line_idx: int) -> Tuple[float, float, float]:
-        pos = self._trip_option_row_position(passenger_idx, line_idx)
+        pos = self.trip_option_position(passenger_idx, line_idx)
         if pos is None:
             raise KeyError(f"No trip option for passenger_idx={passenger_idx}, line_idx={line_idx}")
         df = self.optimal_trip_options
@@ -597,7 +602,7 @@ class line_instance:
         )
 
     def trip_pickup_dropoff_on_line(self, passenger_idx: int, line_idx: int) -> Tuple[int, int]:
-        pos = self._trip_option_row_position(passenger_idx, line_idx)
+        pos = self.trip_option_position(passenger_idx, line_idx)
         if pos is None:
             raise KeyError(f"No trip option for passenger_idx={passenger_idx}, line_idx={line_idx}")
         df = self.optimal_trip_options
@@ -607,7 +612,7 @@ class line_instance:
         )
 
     def trip_line_edge_indices(self, passenger_idx: int, line_idx: int) -> Tuple[int, int]:
-        pos = self._trip_option_row_position(passenger_idx, line_idx)
+        pos = self.trip_option_position(passenger_idx, line_idx)
         if pos is None:
             raise KeyError(f"No trip option for passenger_idx={passenger_idx}, line_idx={line_idx}")
         df = self.optimal_trip_options
@@ -633,7 +638,7 @@ class line_instance:
         last_mile_cost: float,
         mt_cost: Optional[float] = None,
     ) -> None:
-        pos = self._trip_option_row_position(passenger_idx, line_idx)
+        pos = self.trip_option_position(passenger_idx, line_idx)
         if pos is None:
             raise KeyError(f"No trip option for passenger_idx={passenger_idx}, line_idx={line_idx}")
         df = self.optimal_trip_options
@@ -803,7 +808,7 @@ class line_instance:
                     logging.info("Line-mod-aggregate pruned routes: %s", removed_routes)
             else:
                 raise AssertionError(f"Unexpected pruning method {method!r}")
-        return optimal_trip_options
+        return self._sort_trip_options_for_lookup(optimal_trip_options)
 
     def manhattan_instance(self, maximum_detour) -> Tuple[
         pd.DataFrame,
@@ -976,7 +981,9 @@ class line_instance:
                 maximum_detour,
             )
 
-        optimal_trip_options = self._trip_options_df_from_column_buffers(optimal_trip_option_buffers)
+        optimal_trip_options = self._sort_trip_options_for_lookup(
+            self._trip_options_df_from_column_buffers(optimal_trip_option_buffers)
+        )
 
         direct_trip_options = self._direct_trip_options_df_from_distances(passengers, distances)
 
