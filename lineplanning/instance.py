@@ -48,6 +48,12 @@ def _strict_numeric_column(
         raise ValueError(f"Column {column!r} in {demand_file} contains NaN or infinite values")
     if integral and not np.equal(numeric, np.trunc(numeric)).all():
         raise ValueError(f"Column {column!r} in {demand_file} must contain integer values")
+    if np.issubdtype(np.dtype(dtype), np.integer):
+        info = np.iinfo(dtype)
+        if ((numeric < info.min) | (numeric > info.max)).any():
+            raise ValueError(
+                f"Column {column!r} in {demand_file} must be in [{info.min}, {info.max}] for {dtype}"
+            )
     try:
         return values.astype(dtype, copy=False)
     except (TypeError, ValueError) as exc:
@@ -90,7 +96,7 @@ def _load_demand_from_csv(demand_file: Path) -> pd.DataFrame:
         {
             "origin": _strict_numeric_column(df, "origin", np.int32, demand_file, integral=True),
             "destination": _strict_numeric_column(df, "destination", np.int32, demand_file, integral=True),
-            "time": _strict_numeric_column(df, "time", np.float32, demand_file),
+            "time": _strict_numeric_column(df, "time", np.uint32, demand_file, integral=True),
         },
         index=df.index,
     )
@@ -843,13 +849,22 @@ class line_instance:
                             f"Demand text file {self.demand_file} line {line_no} must contain "
                             "origin, destination and time"
                         )
+                    time_value = float(parts[2].strip())
+                    if not np.isfinite(time_value) or time_value != np.trunc(time_value):
+                        raise ValueError(
+                            f"Demand text file {self.demand_file} line {line_no} time must be an integer"
+                        )
+                    if time_value < 0 or time_value > np.iinfo(np.uint32).max:
+                        raise ValueError(
+                            f"Demand text file {self.demand_file} line {line_no} time must fit uint32"
+                        )
                     rows.append([int(float(parts[0].strip())), int(float(parts[1].strip()))])
-                    time_list.append(float(parts[2].strip()))
+                    time_list.append(int(time_value))
             demand = pd.DataFrame(
                 {
                     "origin": np.asarray([row[0] for row in rows], dtype=np.int32),
                     "destination": np.asarray([row[1] for row in rows], dtype=np.int32),
-                    "time": np.asarray(time_list, dtype=np.float32),
+                    "time": np.asarray(time_list, dtype=np.uint32),
                 }
             )
         else:

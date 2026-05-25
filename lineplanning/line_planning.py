@@ -1951,7 +1951,29 @@ def _parse_max_travel_time_delay_seconds(raw: Dict[str, Any], experiment_config_
                 f"{experiment_config_path}: max_travel_time_delay.seconds is required when "
                 "max_travel_time_delay is set."
             )
-        return int(sec_raw)
+        if isinstance(sec_raw, bool):
+            raise ValueError(
+                f"{experiment_config_path}: max_travel_time_delay.seconds must be an unsigned integer, "
+                f"got {sec_raw!r}."
+            )
+        try:
+            numeric = float(sec_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{experiment_config_path}: max_travel_time_delay.seconds must be an unsigned integer, "
+                f"got {sec_raw!r}."
+            ) from exc
+        if not np.isfinite(numeric) or numeric != np.trunc(numeric):
+            raise ValueError(
+                f"{experiment_config_path}: max_travel_time_delay.seconds must be an unsigned integer, "
+                f"got {sec_raw!r}."
+            )
+        if numeric < 0 or numeric > np.iinfo(np.uint16).max:
+            raise ValueError(
+                f"{experiment_config_path}: max_travel_time_delay.seconds must fit uint16, "
+                f"got {sec_raw!r}."
+            )
+        return int(numeric)
     return 300
 
 

@@ -260,7 +260,7 @@ DARP_POOL_DTYPES = {
     "leg_kind": np.int8,
     "origin": np.int32,
     "destination": np.int32,
-    "time": np.float32,
+    "time": np.uint32,
 }
 
 
@@ -295,6 +295,67 @@ def _normalize_pool_df(pool_df: pd.DataFrame) -> pd.DataFrame:
 
 def _pool_option_count(pool_df: pd.DataFrame, nb_pass: int) -> int:
     return (len(pool_df) - int(nb_pass)) // 2
+
+
+def _ensure_uint32_seconds(values, label: str):
+    arr = np.asarray(values)
+    if ((arr < 0) | (arr > np.iinfo(np.uint32).max)).any():
+        raise ValueError(f"{label} must fit uint32 seconds")
+    return arr.astype(np.uint32, copy=False)
+
+
+def _uint32_second(value, label: str) -> int:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be an integer second value") from exc
+    if not np.isfinite(numeric) or numeric != np.trunc(numeric):
+        raise ValueError(f"{label} must be an integer second value")
+    if numeric < 0 or numeric > np.iinfo(np.uint32).max:
+        raise ValueError(f"{label} must fit uint32 seconds")
+    return int(numeric)
+
+
+def _uint16_delay_seconds(value, label: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be an unsigned integer delay in seconds")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be an unsigned integer delay in seconds") from exc
+    if not np.isfinite(numeric) or numeric != np.trunc(numeric):
+        raise ValueError(f"{label} must be an unsigned integer delay in seconds")
+    if numeric < 0 or numeric > np.iinfo(np.uint16).max:
+        raise ValueError(f"{label} must fit uint16 seconds")
+    return int(numeric)
+
+
+def _ceil_proportional_segment_times(
+    route_total_times,
+    segment_edges,
+    line_lengths,
+) -> np.ndarray:
+    route_total_times = np.asarray(route_total_times, dtype=np.uint64)
+    segment_edges = np.asarray(segment_edges, dtype=np.uint64)
+    line_lengths = np.asarray(line_lengths, dtype=np.uint64)
+    out = np.zeros(segment_edges.shape, dtype=np.uint64)
+    positive = line_lengths > 0
+    out[positive] = (
+        route_total_times[positive] * segment_edges[positive] + line_lengths[positive] - 1
+    ) // line_lengths[positive]
+    return out
+
+
+def _ceil_proportional_segment_time(
+    route_total_time,
+    segment_edges: int,
+    line_length: int,
+) -> int:
+    if line_length <= 0:
+        return 0
+    total = int(route_total_time)
+    edges = max(0, int(segment_edges))
+    return int((total * edges + int(line_length) - 1) // int(line_length))
 
 
 def _pool_id_for_leg(
@@ -362,7 +423,7 @@ def build_darp_request_pool(
         raise ValueError(
             f"line_instance.demand has {len(demand_df)} rows, expected nb_pass={nb_pass}"
         )
-    demand_times = demand_df["time"].to_numpy(dtype=np.float32, copy=False)
+    demand_times = demand_df["time"].to_numpy(dtype=np.uint32, copy=False)
     lengths_travel_times = line_instance.lengths_travel_times
 
     options_df = line_instance.optimal_trip_options
@@ -374,7 +435,7 @@ def build_darp_request_pool(
     leg_kind = np.empty(total_rows, dtype=np.int8)
     origin = np.empty(total_rows, dtype=np.int32)
     destination = np.empty(total_rows, dtype=np.int32)
-    time_values = np.empty(total_rows, dtype=np.float32)
+    time_values = np.empty(total_rows, dtype=np.uint32)
 
     requests_od = np.asarray(requests_od, dtype=np.int32)
 
@@ -391,8 +452,8 @@ def build_darp_request_pool(
         opt_routes = options_df["line_idx"].to_numpy(dtype=np.int32, copy=False)
         pickup_nodes = options_df["mt_pickup_node"].to_numpy(dtype=np.int32, copy=False)
         drop_off_nodes = options_df["mt_drop_off_node"].to_numpy(dtype=np.int32, copy=False)
-        pickup_edges = options_df["mt_pickup_line_edge_index"].to_numpy(dtype=np.float32, copy=False)
-        drop_off_edges = options_df["mt_drop_off_line_edge_index"].to_numpy(dtype=np.float32, copy=False)
+        pickup_edges = options_df["mt_pickup_line_edge_index"].to_numpy(dtype=np.int64, copy=False)
+        drop_off_edges = options_df["mt_drop_off_line_edge_index"].to_numpy(dtype=np.int64, copy=False)
         request_origins = requests_od[opt_passengers, 0]
         request_destinations = requests_od[opt_passengers, 1]
         option_times = demand_times[opt_passengers]
@@ -412,21 +473,26 @@ def build_darp_request_pool(
         origin[last] = drop_off_nodes
         destination[last] = request_destinations
 
-        first_mile_time = np.asarray(dm[request_origins, pickup_nodes], dtype=np.float32)
+        first_mile_time = np.asarray(dm[request_origins, pickup_nodes], dtype=np.uint64)
         route_lengths = np.asarray(
             [line_instance.line_length(rho) for rho in range(line_instance.nb_lines)],
-            dtype=np.float32,
+            dtype=np.uint64,
         )
-        route_total_times = np.asarray(lengths_travel_times, dtype=np.float32)
+        route_total_times = np.asarray(lengths_travel_times, dtype=np.uint64)
         line_lengths = route_lengths[opt_routes]
-        segment_edges = np.maximum(0.0, drop_off_edges - pickup_edges)
-        segment_time = np.divide(
-            route_total_times[opt_routes] * segment_edges,
+        segment_edges = np.maximum(0, drop_off_edges - pickup_edges).astype(np.uint64, copy=False)
+        segment_time = _ceil_proportional_segment_times(
+            route_total_times[opt_routes],
+            segment_edges,
             line_lengths,
-            out=np.zeros(n_options, dtype=np.float32),
-            where=line_lengths > 0,
         )
-        time_values[last] = option_times + first_mile_time + transfer_delay + segment_time
+        time_values[last] = _ensure_uint32_seconds(
+            option_times.astype(np.uint64, copy=False)
+            + first_mile_time
+            + int(transfer_delay)
+            + segment_time,
+            "DARP pool last-mile time",
+        )
 
     return pd.DataFrame(
         {
@@ -543,13 +609,16 @@ def fit_hex_od_pool_cluster_labels(
 
     Labels are contiguous integers assigned in sorted order of (h3_origin, h3_dest) pairs.
     """
+    logging.info("Fitting origin and destination nodes to H3 cells")
     n_samples = len(pool_df)
     if n_samples == 0:
         return np.zeros(0, dtype=int)
     res = int(hex_resolution)
     origins = pool_df["origin"].to_numpy(dtype=np.int64, copy=False)
     destinations = pool_df["destination"].to_numpy(dtype=np.int64, copy=False)
-    unique_nodes, encoded_nodes = np.unique(
+
+    logging.info("Computing unique nodes among all origins and destinations")
+    unique_nodes, origin_destination_node_indices = np.unique(
         np.concatenate([origins, destinations]),
         return_inverse=True,
     )
@@ -568,12 +637,13 @@ def fit_hex_od_pool_cluster_labels(
         lat, lng = node_id_to_latlng[int(node_id)]
         node_h3[i] = _h3_cell_uint(lat, lng, res)
 
-    origin_h3 = node_h3[encoded_nodes[:n_samples]]
-    destination_h3 = node_h3[encoded_nodes[n_samples:]]
+    origin_h3 = node_h3[origin_destination_node_indices[:n_samples]]
+    destination_h3 = node_h3[origin_destination_node_indices[n_samples:]]
     pairs = np.empty(n_samples, dtype=[("origin_h3", np.uint64), ("destination_h3", np.uint64)])
     pairs["origin_h3"] = origin_h3
     pairs["destination_h3"] = destination_h3
-    logging.info("Computing H3 OD present in the demand")
+
+    logging.info("Computing H3 OD pairs present in the demand")
     unique_pairs, inverse = np.unique(pairs, return_inverse=True)
 
     hexagonal_clusters_used = len(np.unique(np.concatenate([origin_h3, destination_h3])))
@@ -700,7 +770,7 @@ def _sanity_check_pool_export_matches_solution_to_darp(
         transfer_delay=transfer_delay,
     )
 
-    def norm_rows(rows: List[dict]) -> List[Tuple[Any, ...]]:
+    def norm_rows(rows: List[dict]) -> List[Tuple[int, int, int, int]]:
         out = []
         for row in rows:
             out.append(
@@ -708,7 +778,7 @@ def _sanity_check_pool_export_matches_solution_to_darp(
                     int(row["original_request_id"]),
                     int(row["origin"]),
                     int(row["destination"]),
-                    float(row["time"]),
+                    int(row["time"]),
                 )
             )
         return out
@@ -748,7 +818,10 @@ def _parse_darp_vehicles_and_max_delay(
                 f"{experiment_yaml_path}: max_travel_time_delay.seconds is required when "
                 "max_travel_time_delay is set."
             )
-        max_travel_time_delay_seconds = int(sec_raw)
+        max_travel_time_delay_seconds = _uint16_delay_seconds(
+            sec_raw,
+            f"{experiment_yaml_path}: max_travel_time_delay.seconds",
+        )
     else:
         max_travel_time_delay_seconds = 300
 
@@ -968,13 +1041,10 @@ def build_mod_aware_line_selection_config(
         else:
             darp_benchmark_executable = darp_benchmark_executable.resolve()
 
-    transfer_delay_raw = darp.get("transfer_delay", 0)
-    if isinstance(transfer_delay_raw, bool) or not isinstance(transfer_delay_raw, int):
-        raise ValueError(
-            f"{experiment_yaml_path}: darp.transfer_delay must be an integer, "
-            f"got {transfer_delay_raw!r}."
-        )
-    transfer_delay = transfer_delay_raw
+    transfer_delay = _uint16_delay_seconds(
+        darp.get("transfer_delay", 0),
+        f"{experiment_yaml_path}: darp.transfer_delay",
+    )
 
     darp_vehicle_capacity, max_travel_time_delay_seconds = _parse_darp_vehicles_and_max_delay(
         raw,
@@ -1167,7 +1237,7 @@ def solution_to_darp_requests(
         raise ValueError(
             f"line_instance.demand has {len(demand_df)} rows, expected nb_pass={nb_pass}"
         )
-    demand_times = demand_df["time"].to_numpy(dtype=np.float32, copy=False)
+    demand_times = demand_df["time"].to_numpy(dtype=np.uint32, copy=False)
 
     dm = line_instance.dm
     requests_od = line_instance.requests
@@ -1179,7 +1249,7 @@ def solution_to_darp_requests(
     for r in range(nb_pass):
         o_r = requests_od[r][0]
         d_r = requests_od[r][1]
-        t_r = float(demand_times[r])
+        t_r = int(demand_times[r])
 
         kind, line_idx = request_assignments[r]
         if kind == "rejected":
@@ -1213,7 +1283,7 @@ def solution_to_darp_requests(
         request_id += 1
 
         # t_board ≈ t_r + ftt(o_r, s^b) + δ_transfer (equation 10; using dm as travel time)
-        first_mile_time = float(dm[o_r][sb])
+        first_mile_time = int(dm[o_r][sb])
         t_board = t_r + first_mile_time + transfer_delay
 
         # Segment travel time on line (boarding to unboarding)
@@ -1221,10 +1291,14 @@ def solution_to_darp_requests(
         if line_length > 0 and lengths_travel_times is not None:
             pickup_edge, drop_off_edge = line_instance.trip_line_edge_indices(r, route)
             segment_edges = max(0, drop_off_edge - pickup_edge)
-            segment_time = lengths_travel_times[route] * (segment_edges / line_length)
+            segment_time = _ceil_proportional_segment_time(
+                lengths_travel_times[route],
+                segment_edges,
+                line_length,
+            )
         else:
-            segment_time = 0.0
-        t_unboard = t_board + segment_time
+            segment_time = 0
+        t_unboard = int(_ensure_uint32_seconds(t_board + segment_time, "DARP last-mile request time"))
 
         # Last-mile request: (s^u_ℓr, d_r, t_unboard_r)
         darp_requests.append({
@@ -1256,7 +1330,7 @@ def line_planning_original_requests_as_mod_darp_requests(
         raise ValueError(
             f"line_instance.demand has {len(demand_df)} rows, expected nb_pass={nb_pass}"
         )
-    demand_times = demand_df["time"].to_numpy(dtype=np.float32, copy=False)
+    demand_times = demand_df["time"].to_numpy(dtype=np.uint32, copy=False)
 
     requests_od = line_instance.requests
     darp_requests: List[dict] = []
@@ -1264,7 +1338,7 @@ def line_planning_original_requests_as_mod_darp_requests(
     for r in range(nb_pass):
         o_r = requests_od[r][0]
         d_r = requests_od[r][1]
-        t_r = float(demand_times[r])
+        t_r = int(demand_times[r])
         darp_requests.append(
             {
                 "id": request_id,
@@ -1294,7 +1368,7 @@ def load_darp_requests_csv(path: Union[Path, str]) -> List[dict]:
                 "original_request_id": int(row["original_request_id"]),
                 "origin": int(row["origin"]),
                 "destination": int(row["destination"]),
-                "time": float(row["time"]),
+                "time": _uint32_second(row["time"], f"{path} row time"),
             })
     return darp_requests
 
@@ -1357,7 +1431,9 @@ def write_darp_requests_csv(
             row = {
                 "origin": req["origin"],
                 "destination": req["destination"],
-                "time": req["time"] if time_format == "seconds" else req.get("time_datetime", req["time"]),
+                "time": _uint32_second(req["time"], "DARP request time")
+                if time_format == "seconds"
+                else req.get("time_datetime", req["time"]),
                 "id": req["id"],
                 "original_request_id": req["original_request_id"],
             }
@@ -1391,7 +1467,9 @@ def write_darp_vehicles_csv(
                 "id": req["id"],
                 "position": req["origin"],
                 "capacity": capacity,
-                "operation_start": req["time"] if time_format == "seconds" else req.get("time_datetime", req["time"]),
+                "operation_start": _uint32_second(req["time"], "DARP vehicle operation_start")
+                if time_format == "seconds"
+                else req.get("time_datetime", req["time"]),
             }
             w.writerow(row)
 
@@ -1420,6 +1498,10 @@ def write_darp_config_yaml(
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    max_travel_time_delay_seconds = _uint16_delay_seconds(
+        max_travel_time_delay_seconds,
+        "max_travel_time_delay.seconds",
+    )
 
     instance_config = {
         "demand": {
@@ -2381,7 +2463,7 @@ def main() -> None:
                 write_darp_config_yaml(
                     output_dir=results_dir_path_per_iteration,
                     dm_filepath=dm_file,
-                    max_travel_time_delay_seconds=cfg.max_travel_time_delay_seconds / 2,
+                    max_travel_time_delay_seconds=cfg.max_travel_time_delay_seconds // 2,
                     vehicle_capacity=cfg.darp_vehicle_capacity,
                     darp_method=cfg.darp_benchmark_method,
                     darp_experiment_parameters=cfg.darp_benchmark_experiment_parameters,

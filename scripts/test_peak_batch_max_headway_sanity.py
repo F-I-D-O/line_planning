@@ -9,7 +9,11 @@ from pathlib import Path
 
 import pandas as pd
 
-from lineplanning.line_planning import LinePlanningSolver, NoAssignmentHandling
+from lineplanning.line_planning import (
+    LinePlanningSolver,
+    NoAssignmentHandling,
+    _parse_max_travel_time_delay_seconds,
+)
 
 
 class FakeVar:
@@ -149,6 +153,25 @@ def test_loader_rejects_dropped_assignment_value():
             raise AssertionError("Expected Dropped assignment to raise")
 
 
+def test_line_planning_delay_parser_requires_uint16_integer():
+    cfg_path = Path("experiment.yaml")
+    assert _parse_max_travel_time_delay_seconds({}, cfg_path) == 300
+    assert _parse_max_travel_time_delay_seconds(
+        {"max_travel_time_delay": {"mode": "absolute", "seconds": 301}},
+        cfg_path,
+    ) == 301
+    for invalid in (301.5, -1, 65536, True):
+        try:
+            _parse_max_travel_time_delay_seconds(
+                {"max_travel_time_delay": {"mode": "absolute", "seconds": invalid}},
+                cfg_path,
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid max_travel_time_delay.seconds should raise: {invalid!r}")
+
+
 if __name__ == "__main__":
     test_peak_batch_tie_breaks_to_earliest_batch()
     test_non_peak_assignment_uses_cheapest_selected_route_or_direct_mod()
@@ -156,4 +179,5 @@ if __name__ == "__main__":
     test_variable_assignment_extraction_supports_encoded_line_indices()
     test_shared_assignment_resolution_modes_and_export()
     test_loader_rejects_dropped_assignment_value()
+    test_line_planning_delay_parser_requires_uint16_integer()
     print("peak-batch max-headway sanity checks passed")
