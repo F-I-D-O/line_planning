@@ -872,41 +872,10 @@ class line_instance:
         logging.info('Travel times computed')
 
         cache_path = self._get_preprocessing_cache_path(maximum_detour)
-        cached_preprocessing = self._load_preprocessing_cache(
-            cache_path,
-            passengers,
-            distances,
-            nb_pass,
-            nb_lines,
-        )
-
-        if cached_preprocessing is not None:
-            (
-                optimal_trip_options,
-                direct_trip_options,
-            ) = cached_preprocessing
-        else:
-            (
-                optimal_trip_options,
-                direct_trip_options,
-            ) = self.preprocessing(
-                candidate_set_of_lines,
-                passengers,
-                travel_times_on_lines,
-                distances,
-                maximum_detour,
-                nb_pass,
-            )
-            self._save_preprocessing_cache(cache_path, optimal_trip_options)
-
-        lengths_travel_times = [
-            travel_times_on_lines[l][0][len(candidate_set_of_lines[l]) - 1]
-            for l in range(len(candidate_set_of_lines))
-        ]
-
+        loaded_from_pruned_cache = False
+        prune_path = None
         if self.trip_option_pruning:
             prune_path = trip_option_pruning_csv_path(cache_path, self.trip_option_pruning)
-            pruned_bundle = None
             if prune_path.exists():
                 pruned_bundle = self._load_preprocessing_cache(
                     prune_path,
@@ -915,33 +884,67 @@ class line_instance:
                     nb_pass,
                     nb_lines,
                 )
-                if pruned_bundle is None:
-                    logging.warning(
-                        "Failed to load trip-option pruning cache %s; recomputing pruning",
-                        prune_path,
-                    )
-                else:
+                if pruned_bundle is not None:
                     (
                         optimal_trip_options,
                         direct_trip_options,
                     ) = pruned_bundle
+                    loaded_from_pruned_cache = True
                     logging.info(
-                        "Loaded pruned trip options from %s",
+                        "Loaded pruned trip options from %s; skipped base preprocessing cache",
                         prune_path,
                     )
-            if pruned_bundle is None:
-                optimal_trip_options = self._apply_trip_option_pruning(
+                else:
+                    logging.warning(
+                        "Failed to load trip-option pruning cache %s; falling back to base cache",
+                        prune_path,
+                    )
+
+        if not loaded_from_pruned_cache:
+            cached_preprocessing = self._load_preprocessing_cache(
+                cache_path,
+                passengers,
+                distances,
+                nb_pass,
+                nb_lines,
+            )
+            if cached_preprocessing is not None:
+                (
                     optimal_trip_options,
                     direct_trip_options,
-                    lengths_travel_times,
-                    nb_lines,
+                ) = cached_preprocessing
+            else:
+                (
+                    optimal_trip_options,
+                    direct_trip_options,
+                ) = self.preprocessing(
+                    candidate_set_of_lines,
+                    passengers,
+                    travel_times_on_lines,
+                    distances,
+                    maximum_detour,
+                    nb_pass,
                 )
-                logging.info(
-                    "Saving pruned trip options after %s pruning steps to %s",
-                    len(self.trip_option_pruning),
-                    prune_path,
-                )
-                self._save_preprocessing_cache(prune_path, optimal_trip_options)
+                self._save_preprocessing_cache(cache_path, optimal_trip_options)
+
+        lengths_travel_times = [
+            travel_times_on_lines[l][0][len(candidate_set_of_lines[l]) - 1]
+            for l in range(len(candidate_set_of_lines))
+        ]
+
+        if self.trip_option_pruning and not loaded_from_pruned_cache:
+            optimal_trip_options = self._apply_trip_option_pruning(
+                optimal_trip_options,
+                direct_trip_options,
+                lengths_travel_times,
+                nb_lines,
+            )
+            logging.info(
+                "Saving pruned trip options after %s pruning steps to %s",
+                len(self.trip_option_pruning),
+                prune_path,
+            )
+            self._save_preprocessing_cache(prune_path, optimal_trip_options)
 
         return (
             optimal_trip_options,

@@ -1305,14 +1305,14 @@ class LinePlanningSolver:
         route_travel_times = [
             float(self.line_instance.lengths_travel_times[rho]) for rho in range(nb_lines)
         ]
-        for rho, p in potential_line_passenger_combinations:
+        for rho, p in tqdm(potential_line_passenger_combinations, desc="Generating max headway constraints"):
             nu_rho = route_travel_times[rho] / max_wait_time
             master.addConstr(
                 frequency_vars[rho] >= nu_rho * passenger_vars[rho, p],
                 name=f"max_headway[{rho},{p}]",
             )
 
-        for rho in range(nb_lines):
+        for rho in tqdm(range(nb_lines), desc="Generating capacity constraints"):
             length = self.line_instance.line_length(rho)
             for k in range(length):
                 vars_list = []
@@ -1337,6 +1337,7 @@ class LinePlanningSolver:
             master.Params.LogFile = str(gurobi_log_path)
 
         if export_model:
+            logging.info("Exporting model to %s", output_dir_path / "Peak_batch_max_headway_ILP.lp")
             master.write(str(output_dir_path / "Peak_batch_max_headway_ILP.lp"))
 
         t0 = time.time()
@@ -1347,6 +1348,7 @@ class LinePlanningSolver:
         logging.info("Final solution (peak-batch total cost): %s", master.ObjVal)
 
         if export_solution:
+            logging.info("Exporting solution to %s", output_dir_path / "Peak_batch_max_headway_ILP.sol")
             master.write(str(output_dir_path / "Peak_batch_max_headway_ILP.sol"))
 
         selected_lines = [

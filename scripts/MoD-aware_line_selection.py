@@ -304,14 +304,13 @@ def _pool_id_for_leg(
     route_idx: Optional[int],
     leg_kind: int,
 ) -> int:
-    p = int(passenger_idx)
     if leg_kind == DARP_POOL_LEG_NO_MT:
-        return p
+        return passenger_idx
     if route_idx is None:
         raise ValueError("route_idx is required for line-based pool legs")
-    pos = line_instance.trip_option_position(p, int(route_idx))
+    pos = line_instance.trip_option_position(passenger_idx, route_idx)
     if pos is None:
-        raise KeyError(f"No trip option for passenger_idx={p}, line_idx={int(route_idx)}")
+        raise KeyError(f"No trip option for passenger_idx={passenger_idx}, line_idx={route_idx}")
     nb_pass = int(line_instance.nb_pass)
     n_options = _pool_option_count(pool_df, nb_pass)
     if leg_kind == DARP_POOL_LEG_FIRST_MILE:
