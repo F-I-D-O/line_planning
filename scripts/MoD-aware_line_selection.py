@@ -574,6 +574,7 @@ def fit_hex_od_pool_cluster_labels(
     pairs = np.empty(n_samples, dtype=[("origin_h3", np.uint64), ("destination_h3", np.uint64)])
     pairs["origin_h3"] = origin_h3
     pairs["destination_h3"] = destination_h3
+    logging.info("Computing H3 OD present in the demand")
     unique_pairs, inverse = np.unique(pairs, return_inverse=True)
 
     hexagonal_clusters_used = len(np.unique(np.concatenate([origin_h3, destination_h3])))
@@ -2138,6 +2139,7 @@ def export_mod_costs_csv(
     geometry and ``value`` stay in preprocessing.
     """
     path = Path(path)
+    logging.info("Exporting MoD costs CSV to %s", path)
     path.parent.mkdir(parents=True, exist_ok=True)
     frames = [
         line_inst.direct_trip_options.loc[:, _MOD_COST_CSV_FIELDNAMES],

@@ -32,6 +32,14 @@ import lineplanning.log
 EPS = 1.e-5
 
 
+def _all_trip_option_pairs(line_instance: Any) -> List[Tuple[int, int]]:
+    rows = line_instance.optimal_trip_options.loc[
+        :,
+        ["line_idx", "passenger_idx"],
+    ].itertuples(index=False)
+    return [(int(row.line_idx), int(row.passenger_idx)) for row in rows]
+
+
 class NoAssignmentHandling(Enum):
     NO_MT = "no_mt"
     REJECT = "reject"
@@ -122,7 +130,7 @@ class LinePlanningSolver:
 
     def __init__(
         self,
-        line_instance,
+        line_instance: line_instance,
         time_limit: float = 3600 * 24,
         cost_coefficient: float = 1.0,
         max_frequency: int = 1,
@@ -854,9 +862,9 @@ class LinePlanningSolver:
         ]
         line_costs_expression = frequency_vars.prod(per_route_mt_cost_coeff)
 
-        # Binary assignment x_{ρp}; omit pairs with zero trip value on the route.
+        # Binary assignment x_{ρp} for all preprocessed request-line trip options.
         logging.info("Computing potential line-passenger combinations")
-        potential_line_passenger_combinations = self.line_instance.positive_trip_value_pairs()
+        potential_line_passenger_combinations = _all_trip_option_pairs(self.line_instance)
         passenger_vars = master.addVars(
             potential_line_passenger_combinations,
             vtype=GRB.BINARY,
@@ -1058,7 +1066,7 @@ class LinePlanningSolver:
             name="y",
         )
 
-        potential_line_passenger_combinations = self.line_instance.positive_trip_value_pairs()
+        potential_line_passenger_combinations = _all_trip_option_pairs(self.line_instance)
 
         logging.info("Computing total mod costs for each trip option")
         mod_costs_line = {
@@ -1262,7 +1270,7 @@ class LinePlanningSolver:
 
         potential_line_passenger_combinations = [
             (rho, p)
-            for (rho, p) in self.line_instance.positive_trip_value_pairs()
+            for (rho, p) in _all_trip_option_pairs(self.line_instance)
             if p in peak_request_set
         ]
         passenger_vars = master.addVars(
@@ -1621,9 +1629,8 @@ class LinePlanningSolver:
         # binary variables indicating if line l is opened
         line_vars = master.addVars(self.line_count_total, vtype=GRB.BINARY, name="y")
 
-        # binary variables indicating if passenger p is assigned to line l. If first mile + last mile costs are
-        # higher than the no_MT MoD cost, the line-passenger combination is not considered at all
-        route_passenger_pairs = self.line_instance.positive_trip_value_pairs()
+        # binary variables indicating if passenger p is assigned to line l.
+        route_passenger_pairs = _all_trip_option_pairs(self.line_instance)
         potential_line_passenger_combinations = [
             (rho * self.max_frequency + f, p)
             for rho, p in route_passenger_pairs

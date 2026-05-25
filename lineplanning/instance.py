@@ -101,9 +101,33 @@ def _load_demand_from_csv(demand_file: Path) -> pd.DataFrame:
     return demand
 
 
+# Above this size, demand-file cache keys use byte length only (content MD5 otherwise).
+_DEMAND_CONTENT_HASH_MAX_BYTES = 1 << 30
+
+
+def _demand_file_cache_token(demand_file_path: Path) -> str:
+    stat = demand_file_path.stat()
+    if stat.st_size > _DEMAND_CONTENT_HASH_MAX_BYTES:
+        return f"size:{stat.st_size}"
+    digest = hashlib.md5()
+    with open(demand_file_path, "rb") as demand_file:
+        while True:
+            chunk = demand_file.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return f"md5:{digest.hexdigest()}"
+
+
+def _demand_file_cache_label(demand_token: str) -> str:
+    if demand_token.startswith("md5:"):
+        return f"dem_{demand_token[4:12]}"
+    return demand_token.replace(":", "_")
+
+
 def preprocessing_csv_path(
     preprocessing_dir: Path,
-    demand_file: Optional[Path],
+    demand_file: Path,
     candidate_lines_file: Path,
     maximum_detour: Optional[int],
 ) -> Path:
@@ -111,18 +135,21 @@ def preprocessing_csv_path(
     Path to the preprocessing CSV cache for the given demand file, candidate lines file,
     maximum detour, and ``preprocessing_dir`` (directory that will hold ``*.csv`` caches,
     typically ``<instance_folder>/preprocessing``).
+
+    The cache filename hash incorporates demand file content (MD5 of bytes, or file size
+    when larger than 1 GiB), resolved candidate-lines path, and maximum detour.
     """
-    demand_file_path = Path(demand_file).resolve() if demand_file is not None else None
+    demand_file_path = Path(demand_file).resolve()
     candidate_line_file_path = Path(candidate_lines_file).resolve()
 
-    demand_file_str = str(demand_file_path) if demand_file_path is not None else "none"
+    demand_token = _demand_file_cache_token(demand_file_path)
     candidate_line_file_str = str(candidate_line_file_path)
     maximum_detour_str = str(maximum_detour) if maximum_detour is not None else "none"
 
-    cache_key = f"{demand_file_str}|{candidate_line_file_str}|{maximum_detour_str}"
+    cache_key = f"{demand_token}|{candidate_line_file_str}|{maximum_detour_str}"
     cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:12]
 
-    demand_name = demand_file_path.stem if demand_file_path is not None else "none"
+    demand_name = _demand_file_cache_label(demand_token)
     candidate_line_name = candidate_line_file_path.stem
     detour_suffix = maximum_detour if maximum_detour is not None else "none"
 
@@ -293,8 +320,8 @@ class line_instance:
         self,
         candidate_lines_file,
         capacity,
+        demand_file,
         maximum_detour=None,
-        demand_file=None,
         preprocessing_dir=None,
         dm_file=None,
         trip_option_pruning: Optional[List[Dict[str, Any]]] = None,
@@ -303,7 +330,7 @@ class line_instance:
         self.candidate_set_of_lines = None  # candidate_set_of_lines[l] contains the nodes served by line l (only useful when building instance from real network)
         self.lengths_travel_times = None  # used only for the manhattan instance
         self.capacity = capacity
-        self.demand_file = demand_file
+        self.demand_file = Path(demand_file).resolve()
         self.optimal_trip_options: pd.DataFrame = self._empty_trip_options_df()
         self._trip_option_keys = np.asarray([], dtype=np.int64)
         self._line_position_cache = {}
@@ -312,10 +339,8 @@ class line_instance:
         self.demand: pd.DataFrame = pd.DataFrame(columns=list(_REQUESTS_CSV_REQUIRED_COLUMNS))
         if preprocessing_dir is not None:
             self.preprocessing_dir = Path(preprocessing_dir)
-        elif demand_file is not None:
-            self.preprocessing_dir = Path(demand_file).parent / "preprocessing"
         else:
-            self.preprocessing_dir = Path(candidate_lines_file).parent / "preprocessing"
+            self.preprocessing_dir = self.demand_file.parent / "preprocessing"
         self.dm_file = Path(dm_file) if dm_file is not None else Path("dm.h5")
         self.nb_pass: Optional[int] = None
         self.trip_option_pruning = normalize_trip_option_pruning_specs(trip_option_pruning)
@@ -344,11 +369,9 @@ class line_instance:
         self._rebuild_trip_option_index()
 
     def _get_instance_size_label(self, date: Optional[str]) -> str:
-        if self.demand_file:
-            demand_file_name = Path(self.demand_file).name
-            match = re.search(r"(\d+)_percent", demand_file_name)
-            if match:
-                return f"{match.group(1)}_percent"
+        match = re.search(r"(\d+)_percent", self.demand_file.name)
+        if match:
+            return f"{match.group(1)}_percent"
         return "100_percent"
 
     _PREPROCESSING_CSV_COLUMNS = [
@@ -638,15 +661,6 @@ class line_instance:
             for line_idx in self.optimal_trip_options["line_idx"].iloc[int(lo):int(hi)].to_numpy(copy=False)
         ]
 
-    def positive_trip_value_pairs(self) -> List[Tuple[int, int]]:
-        if self.optimal_trip_options.empty:
-            return []
-        rows = self.optimal_trip_options.loc[
-            self.optimal_trip_options["value"] > 0,
-            ["line_idx", "passenger_idx"],
-        ].itertuples(index=False)
-        return [(int(row.line_idx), int(row.passenger_idx)) for row in rows]
-
     def line_length(self, line_idx: int) -> int:
         return len(self.candidate_set_of_lines[int(line_idx)]) - 1
 
@@ -697,12 +711,11 @@ class line_instance:
         maximum_detour: Optional[int],
     ) -> Path:
         """
-        Generate cache path based on demand file, candidate line file, and maximum detour.
-        Uses hash of file paths to ensure uniqueness.
+        Generate cache path from demand content, candidate line file, and maximum detour.
         """
         return preprocessing_csv_path(
             self.preprocessing_dir,
-            Path(self.demand_file) if self.demand_file is not None else None,
+            self.demand_file,
             self.candidate_line_file,
             maximum_detour,
         )
