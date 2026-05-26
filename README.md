@@ -21,7 +21,7 @@ Both results and instance configurations are `yaml` files, with same structure a
 Candidate lines files are text files where each line represents a single candidate line. The line is a sequence of node IDs of bus stops that form a potential transit route.
 
 ### Preprocessing cache
-Computed trip-option preprocessing (CSV) is stored under a ``preprocessing`` folder next to the instance ``config.yaml`` (i.e. ``<instance_directory>/preprocessing/``). The same cache is reused when demand file content (MD5 of bytes, or file size for files over 1 GiB), candidate-lines path, and detour match.
+Computed trip-option preprocessing is stored under a ``preprocessing`` folder next to the instance ``config.yaml`` (i.e. ``<instance_directory>/preprocessing/``). The same cache is reused when demand file content (MD5 of bytes, or file size for files over 1 GiB), candidate-lines path, and detour match. CSV is the default cache format; set ``mass_transport.preprocessing_cache_format: npz`` to use a binary NumPy column-array cache instead.
 
 
 ## Experiment Files

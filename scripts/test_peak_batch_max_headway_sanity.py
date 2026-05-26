@@ -12,6 +12,7 @@ import pandas as pd
 from lineplanning.line_planning import (
     LinePlanningSolver,
     NoAssignmentHandling,
+    _peak_batch_mt_cost_coefficients,
     _parse_max_travel_time_delay_seconds,
 )
 
@@ -54,6 +55,14 @@ def _solver_with_fake_instance():
 def test_peak_batch_tie_breaks_to_earliest_batch():
     solver = _solver_with_fake_instance()
     assert solver._peak_batch_request_indices(300) == ([0, 1], 0)
+
+
+def test_peak_batch_mt_cost_uses_batch_duration_not_route_length():
+    assert _peak_batch_mt_cost_coefficients(
+        cost_coefficient=2.0,
+        batch_duration=300,
+        nb_lines=3,
+    ) == [600.0, 600.0, 600.0]
 
 
 def test_non_peak_assignment_uses_cheapest_selected_route_or_direct_mod():
@@ -174,6 +183,7 @@ def test_line_planning_delay_parser_requires_uint16_integer():
 
 if __name__ == "__main__":
     test_peak_batch_tie_breaks_to_earliest_batch()
+    test_peak_batch_mt_cost_uses_batch_duration_not_route_length()
     test_non_peak_assignment_uses_cheapest_selected_route_or_direct_mod()
     test_variable_assignment_extraction_supports_route_agg_and_rejection()
     test_variable_assignment_extraction_supports_encoded_line_indices()

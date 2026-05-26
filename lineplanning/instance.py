@@ -131,15 +131,30 @@ def _demand_file_cache_label(demand_token: str) -> str:
     return demand_token.replace(":", "_")
 
 
-def preprocessing_csv_path(
+PREPROCESSING_CACHE_FORMATS = frozenset({"csv", "npz"})
+
+
+def normalize_preprocessing_cache_format(cache_format: Optional[str]) -> str:
+    if cache_format is None:
+        return "csv"
+    if not isinstance(cache_format, str) or not cache_format.strip():
+        raise ValueError("preprocessing_cache_format must be one of 'csv' or 'npz'")
+    normalized = cache_format.strip().lower()
+    if normalized not in PREPROCESSING_CACHE_FORMATS:
+        raise ValueError(f"preprocessing_cache_format must be one of 'csv' or 'npz', got {cache_format!r}")
+    return normalized
+
+
+def preprocessing_cache_path(
     preprocessing_dir: Path,
     demand_file: Path,
     candidate_lines_file: Path,
     maximum_detour: Optional[int],
+    cache_format: Optional[str] = "csv",
 ) -> Path:
     """
-    Path to the preprocessing CSV cache for the given demand file, candidate lines file,
-    maximum detour, and ``preprocessing_dir`` (directory that will hold ``*.csv`` caches,
+    Path to the preprocessing cache for the given demand file, candidate lines file,
+    maximum detour, and ``preprocessing_dir`` (directory that will hold cache files,
     typically ``<instance_folder>/preprocessing``).
 
     The cache filename hash incorporates demand file content (MD5 of bytes, or file size
@@ -158,20 +173,48 @@ def preprocessing_csv_path(
     demand_name = _demand_file_cache_label(demand_token)
     candidate_line_name = candidate_line_file_path.stem
     detour_suffix = maximum_detour if maximum_detour is not None else "none"
+    extension = normalize_preprocessing_cache_format(cache_format)
 
     cache_dir = Path(preprocessing_dir)
-    filename = f"{demand_name}_{candidate_line_name}_detour_{detour_suffix}_{cache_hash}.csv"
+    filename = f"{demand_name}_{candidate_line_name}_detour_{detour_suffix}_{cache_hash}.{extension}"
     return cache_dir / filename
+
+
+def preprocessing_csv_path(
+    preprocessing_dir: Path,
+    demand_file: Path,
+    candidate_lines_file: Path,
+    maximum_detour: Optional[int],
+) -> Path:
+    """Compatibility wrapper returning the CSV preprocessing cache path."""
+    return preprocessing_cache_path(
+        preprocessing_dir,
+        demand_file,
+        candidate_lines_file,
+        maximum_detour,
+        cache_format="csv",
+    )
+
+
+def trip_option_pruning_cache_path(
+    base_preprocessing_cache: Path,
+    pruning_specs: List[Dict[str, Any]],
+) -> Path:
+    base = Path(base_preprocessing_cache).resolve()
+    key = json.dumps(pruning_specs, sort_keys=True, separators=(",", ":"))
+    short_hash = hashlib.md5(f"{base}|trip_option_pruning_v1|{key}".encode()).hexdigest()[:12]
+    return base.with_name(f"{base.stem}_pruned_{short_hash}{base.suffix}")
 
 
 def trip_option_pruning_csv_path(
     base_preprocessing_csv: Path,
     pruning_specs: List[Dict[str, Any]],
 ) -> Path:
-    base = Path(base_preprocessing_csv).resolve()
-    key = json.dumps(pruning_specs, sort_keys=True, separators=(",", ":"))
-    short_hash = hashlib.md5(f"{base}|trip_option_pruning_v1|{key}".encode()).hexdigest()[:12]
-    return base.with_name(f"{base.stem}_pruned_{short_hash}.csv")
+    """Compatibility wrapper returning a CSV pruning cache path."""
+    base = Path(base_preprocessing_csv)
+    if base.suffix != ".csv":
+        base = base.with_suffix(".csv")
+    return trip_option_pruning_cache_path(base, pruning_specs)
 
 
 def normalize_trip_option_pruning_specs(
@@ -331,6 +374,7 @@ class line_instance:
         preprocessing_dir=None,
         dm_file=None,
         trip_option_pruning: Optional[List[Dict[str, Any]]] = None,
+        preprocessing_cache_format: str = "csv",
     ):
         self.B = None
         self.candidate_set_of_lines = None  # candidate_set_of_lines[l] contains the nodes served by line l (only useful when building instance from real network)
@@ -350,6 +394,7 @@ class line_instance:
         self.dm_file = Path(dm_file) if dm_file is not None else Path("dm.h5")
         self.nb_pass: Optional[int] = None
         self.trip_option_pruning = normalize_trip_option_pruning_specs(trip_option_pruning)
+        self.preprocessing_cache_format = normalize_preprocessing_cache_format(preprocessing_cache_format)
 
         # Store candidate line file path
         self.candidate_line_file = Path(candidate_lines_file)
@@ -724,11 +769,12 @@ class line_instance:
         """
         Generate cache path from demand content, candidate line file, and maximum detour.
         """
-        return preprocessing_csv_path(
+        return preprocessing_cache_path(
             self.preprocessing_dir,
             self.demand_file,
             self.candidate_line_file,
             maximum_detour,
+            self.preprocessing_cache_format,
         )
 
     def _load_preprocessing_cache(
@@ -742,7 +788,29 @@ class line_instance:
         if cache_path.exists():
             logging.info("Loading preprocessing cache from %s", cache_path)
             try:
-                df = pd.read_csv(cache_path, dtype=self._PREPROCESSING_CSV_DTYPES)
+                if cache_path.suffix == ".csv":
+                    df = pd.read_csv(cache_path, dtype=self._PREPROCESSING_CSV_DTYPES)
+                elif cache_path.suffix == ".npz":
+                    with np.load(cache_path) as loaded:
+                        missing = [
+                            column
+                            for column in self._PREPROCESSING_CSV_COLUMNS
+                            if column not in loaded.files
+                        ]
+                        if missing:
+                            raise ValueError(f"missing columns {missing}")
+                        df = pd.DataFrame(
+                            {
+                                column: loaded[column].astype(
+                                    self._PREPROCESSING_CSV_DTYPES[column],
+                                    copy=False,
+                                )
+                                for column in self._PREPROCESSING_CSV_COLUMNS
+                            },
+                            columns=self._PREPROCESSING_CSV_COLUMNS,
+                        )
+                else:
+                    raise ValueError(f"unsupported preprocessing cache suffix {cache_path.suffix!r}")
             except (OSError, ValueError) as exc:
                 logging.warning("Failed to read preprocessing cache %s: %s", cache_path, exc)
                 return None
@@ -765,8 +833,21 @@ class line_instance:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         logging.info("Saving preprocessing cache to %s", cache_path)
         try:
-            optimal_trip_options.to_csv(cache_path, index=False)
-        except OSError as exc:
+            if cache_path.suffix == ".csv":
+                optimal_trip_options.to_csv(cache_path, index=False)
+            elif cache_path.suffix == ".npz":
+                arrays = {
+                    column: optimal_trip_options[column].to_numpy(
+                        dtype=self._PREPROCESSING_CSV_DTYPES[column],
+                        copy=False,
+                    )
+                    for column in self._PREPROCESSING_CSV_COLUMNS
+                }
+                with cache_path.open("wb") as f:
+                    np.savez(f, **arrays)
+            else:
+                raise ValueError(f"unsupported preprocessing cache suffix {cache_path.suffix!r}")
+        except (OSError, ValueError) as exc:
             logging.warning("Failed to write preprocessing cache %s: %s", cache_path, exc)
             return
         logging.info("Stored preprocessing data to cache %s", cache_path)
@@ -895,7 +976,7 @@ class line_instance:
         loaded_from_pruned_cache = False
         prune_path = None
         if self.trip_option_pruning:
-            prune_path = trip_option_pruning_csv_path(cache_path, self.trip_option_pruning)
+            prune_path = trip_option_pruning_cache_path(cache_path, self.trip_option_pruning)
             if prune_path.exists():
                 pruned_bundle = self._load_preprocessing_cache(
                     prune_path,

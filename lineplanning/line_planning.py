@@ -40,6 +40,14 @@ def _all_trip_option_pairs(line_instance: Any) -> List[Tuple[int, int]]:
     return [(int(row.line_idx), int(row.passenger_idx)) for row in rows]
 
 
+def _peak_batch_mt_cost_coefficients(
+    cost_coefficient: float,
+    batch_duration: float,
+    nb_lines: int,
+) -> List[float]:
+    return [float(cost_coefficient) * float(batch_duration) for _rho in range(nb_lines)]
+
+
 class NoAssignmentHandling(Enum):
     NO_MT = "no_mt"
     REJECT = "reject"
@@ -1054,9 +1062,11 @@ class LinePlanningSolver:
 
         master.Params.timeLimit = self.time_limit
 
-        per_route_mt_cost_coeff = [
-            self.cost_coefficient * self.line_instance.lengths_travel_times[rho] for rho in range(nb_lines)
-        ]
+        per_route_mt_cost_coeff = _peak_batch_mt_cost_coefficients(
+            self.cost_coefficient,
+            max_wait_time,
+            nb_lines,
+        )
 
         frequency_vars = master.addVars(
             nb_lines,
@@ -2029,6 +2039,12 @@ def run_experiment(experiment_config_path: Path) -> None:
         trip_option_pruning = lineplanning.instance.normalize_trip_option_pruning_specs(mt.get("pruning"))
     except ValueError as exc:
         raise ValueError(f"{experiment_config_path}: invalid mass_transport.pruning: {exc}") from exc
+    try:
+        preprocessing_cache_format = normalize_preprocessing_cache_format(
+            mt.get("preprocessing_cache_format", "csv")
+        )
+    except ValueError as exc:
+        raise ValueError(f"{experiment_config_path}: invalid mass_transport.preprocessing_cache_format: {exc}") from exc
 
     preprocessing_dir = inst.config_path.parent / "preprocessing"
     line_inst = line_instance(
@@ -2039,6 +2055,7 @@ def run_experiment(experiment_config_path: Path) -> None:
         preprocessing_dir=preprocessing_dir,
         dm_file=inst.dm_file,
         trip_option_pruning=trip_option_pruning,
+        preprocessing_cache_format=preprocessing_cache_format,
     )
 
     budget = _parse_optional_budget(exp.get("budget"))

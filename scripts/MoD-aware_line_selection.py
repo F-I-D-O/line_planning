@@ -901,6 +901,7 @@ class ModAwareLineSelectionConfig:
     capacity: int
     maximum_detour: Any
     trip_option_pruning: List[Dict[str, Any]]
+    preprocessing_cache_format: str
     darp_benchmark_executable: Path
     transfer_delay: int
     darp_vehicle_capacity: int
@@ -1029,6 +1030,14 @@ def build_mod_aware_line_selection_config(
         trip_option_pruning = lineplanning.instance.normalize_trip_option_pruning_specs(mt.get("pruning"))
     except ValueError as exc:
         raise ValueError(f"{experiment_yaml_path}: invalid mass_transport.pruning: {exc}") from exc
+    try:
+        preprocessing_cache_format = lineplanning.instance.normalize_preprocessing_cache_format(
+            mt.get("preprocessing_cache_format", "csv")
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"{experiment_yaml_path}: invalid mass_transport.preprocessing_cache_format: {exc}"
+        ) from exc
 
     darp_exe = darp.get("benchmark_executable")
     if darp_exe is None or (isinstance(darp_exe, str) and not str(darp_exe).strip()):
@@ -1135,6 +1144,7 @@ def build_mod_aware_line_selection_config(
         capacity=capacity,
         maximum_detour=maximum_detour,
         trip_option_pruning=trip_option_pruning,
+        preprocessing_cache_format=preprocessing_cache_format,
         darp_benchmark_executable=darp_benchmark_executable,
         transfer_delay=transfer_delay,
         darp_vehicle_capacity=darp_vehicle_capacity,
@@ -2263,6 +2273,7 @@ def main() -> None:
         preprocessing_dir=preprocessing_dir,
         dm_file=dm_file,
         trip_option_pruning=cfg.trip_option_pruning,
+        preprocessing_cache_format=cfg.preprocessing_cache_format,
     )
 
     if cfg.initial_mod_cost_scale != 1.0:
@@ -2347,7 +2358,7 @@ def main() -> None:
 
     instance_size_label = lineplanning.line_planning.get_instance_size_label(str(demand_file))
 
-    export_mod_costs_csv(line_inst, results_dir_path / MOD_COST_INITIAL_FILENAME)
+    # export_mod_costs_csv(line_inst, results_dir_path / MOD_COST_INITIAL_FILENAME)
 
     recompute_strategy = MOD_COST_RECOMPUTATION_STRATEGIES.get(cfg.mod_cost_recomputation_strategy)
     if recompute_strategy is None:

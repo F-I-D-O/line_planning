@@ -19,7 +19,12 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from lineplanning.instance import line_instance as LineInstance
+from lineplanning.instance import (
+    line_instance as LineInstance,
+    normalize_preprocessing_cache_format,
+    preprocessing_cache_path,
+    trip_option_pruning_cache_path,
+)
 
 
 def _load_mod_aware():
@@ -34,6 +39,60 @@ def _load_mod_aware():
 
 def main() -> None:
     mod = _load_mod_aware()
+    assert normalize_preprocessing_cache_format(None) == "csv"
+    assert normalize_preprocessing_cache_format("npz") == "npz"
+    try:
+        normalize_preprocessing_cache_format("hdf")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("invalid preprocessing cache format should raise")
+
+    cache_inst = LineInstance.__new__(LineInstance)
+    sample_options = pd.DataFrame(
+        {
+            "passenger_idx": np.asarray([0, 1], dtype=np.int32),
+            "line_idx": np.asarray([2, 3], dtype=np.int32),
+            "value": np.asarray([4, 5], dtype=np.float32),
+            "mt_pickup_node": np.asarray([10, 11], dtype=np.int32),
+            "mt_drop_off_node": np.asarray([20, 21], dtype=np.int32),
+            "mt_pickup_line_edge_index": np.asarray([0, 1], dtype=np.int16),
+            "mt_drop_off_line_edge_index": np.asarray([1, 2], dtype=np.int16),
+            "first_mile_cost": np.asarray([6, 7], dtype=np.float32),
+            "last_mile_cost": np.asarray([8, 9], dtype=np.float32),
+            "mt_cost": np.asarray([10, 11], dtype=np.float32),
+        },
+        columns=LineInstance._PREPROCESSING_CSV_COLUMNS,
+    )
+    passengers = np.asarray([[0, 1], [1, 2]], dtype=np.int32)
+    distances = np.arange(9, dtype=np.uint16).reshape(3, 3)
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        demand_path = tmp_path / "requests.csv"
+        demand_path.write_text("origin,destination,time\n0,1,0\n", encoding="utf-8")
+        lines_path = tmp_path / "lines.txt"
+        lines_path.write_text("0 1\n", encoding="utf-8")
+        csv_path = preprocessing_cache_path(tmp_path, demand_path, lines_path, 3, "csv")
+        npz_path = preprocessing_cache_path(tmp_path, demand_path, lines_path, 3, "npz")
+        assert csv_path.suffix == ".csv"
+        assert npz_path.suffix == ".npz"
+        assert trip_option_pruning_cache_path(npz_path, [{"method": "mt_time_share", "min_share": 0.5}]).suffix == ".npz"
+        for path in (csv_path, npz_path):
+            cache_inst._save_preprocessing_cache(path, sample_options)
+            loaded = cache_inst._load_preprocessing_cache(path, passengers, distances, 2, 4)
+            assert loaded is not None
+            loaded_options, loaded_direct = loaded
+            assert list(loaded_options.columns) == LineInstance._PREPROCESSING_CSV_COLUMNS
+            assert loaded_direct["first_mile_cost"].tolist() == [1, 5]
+            for column, dtype in LineInstance._PREPROCESSING_CSV_DTYPES.items():
+                assert loaded_options[column].dtype == np.dtype(dtype)
+            assert loaded_options.to_dict("list") == sample_options.to_dict("list")
+            empty_path = path.with_name(f"empty{path.suffix}")
+            cache_inst._save_preprocessing_cache(empty_path, cache_inst._empty_trip_options_df())
+            loaded_empty = cache_inst._load_preprocessing_cache(empty_path, passengers, distances, 2, 4)
+            assert loaded_empty is not None
+            assert loaded_empty[0].empty
+
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp)
         mod.write_darp_config_yaml(
