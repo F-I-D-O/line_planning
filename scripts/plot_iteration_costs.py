@@ -51,7 +51,7 @@ def _ensure_plot_iteration_costs_debug_logging() -> None:
 
 # MoD-aware results folder containing iteration_1, iteration_2, ...
 RESULTS_DIR = Path(
-    r"C:\Google Drive AIC\My Drive\AIC Experiment Data\Line Planning\Results\manhattan-2_h-50_percent\instance_01\mod-aware-budget"
+    r"C:\Google Drive AIC\My Drive\AIC Experiment Data\Line Planning\Results\LODES"
 )
 
 # If set, write interactive HTML here; if None, no file is written
